@@ -46,6 +46,8 @@ def problem() -> ProblemRecord:
         cf_index="A",
         cf_tags=("greedy",),
         source_split="validation",
+        public_tests=(sample_case("public-1"),),
+        hidden_tests=(sample_case("hidden-1"),),
         generated_tests=(sample_case("generated-1"),),
         content_hash="a" * 64,
     )
@@ -143,6 +145,17 @@ def manifest() -> RunManifest:
         code_revision="c74ce98",
         container_image_digest="sha256:" + "e" * 64,
     )
+
+
+def mark_contract_versions(value: object, version: str) -> None:
+    if isinstance(value, dict):
+        if "schema_version" in value:
+            value["schema_version"] = version
+        for nested_value in value.values():
+            mark_contract_versions(nested_value, version)
+    elif isinstance(value, list):
+        for nested_value in value:
+            mark_contract_versions(nested_value, version)
 
 
 def test_schema_v1_2_enums_and_problem_provenance_are_frozen() -> None:
@@ -262,9 +275,7 @@ def test_step_reviews_link_material_errors_to_reviewer_candidates() -> None:
             confidence=0.8,
         )
     with pytest.raises(ValidationError, match="material erroneous"):
-        ReviewerVerdict.model_validate(
-            {**verdict.model_dump(), "first_error_step_id": "missing"}
-        )
+        ReviewerVerdict.model_validate({**verdict.model_dump(), "first_error_step_id": "missing"})
 
 
 def test_non_material_reviewer_verdict_rejects_material_erroneous_step_review() -> None:
@@ -419,7 +430,7 @@ def test_v1_1_audit_migration_validates_nested_v1_2_contracts(
     mutation: str, expected_error: str
 ) -> None:
     payload = audit_report().model_dump(mode="json")
-    payload["schema_version"] = "1.1"
+    mark_contract_versions(payload, "1.1")
     nested_verdict = payload["reviewer_verdicts"][0]
     if mutation == "missing_per_step_reviews":
         del nested_verdict["per_step_reviews"]
@@ -432,21 +443,68 @@ def test_v1_1_audit_migration_validates_nested_v1_2_contracts(
         migrate_v1_1_to_v1_2(payload, artifact_type="audit_report")
 
 
+@pytest.mark.parametrize(
+    ("artifact_type", "artifact_factory"),
+    [
+        ("problem_record", problem),
+        ("solution_trace", trace),
+        ("reviewer_verdict", reviewer_verdict),
+        ("audit_report", audit_report),
+    ],
+)
+def test_v1_1_migration_retags_every_known_nested_contract(
+    artifact_type: str, artifact_factory: object
+) -> None:
+    artifact = artifact_factory()
+    expected = artifact.model_dump(mode="json")
+    payload = artifact.model_dump(mode="json")
+    mark_contract_versions(payload, "1.1")
+
+    migrated = migrate_v1_1_to_v1_2(payload, artifact_type=artifact_type)
+
+    assert migrated == expected
+
+
+@pytest.mark.parametrize(
+    ("artifact_type", "artifact_factory", "nested_contract_path", "nested_version"),
+    [
+        ("audit_report", audit_report, ("judge_evidence",), "1.2"),
+        ("solution_trace", trace, ("steps", 0), "9.9"),
+    ],
+)
+def test_v1_1_migration_rejects_mixed_or_unknown_nested_contract_versions(
+    artifact_type: str,
+    artifact_factory: object,
+    nested_contract_path: tuple[str | int, ...],
+    nested_version: str,
+) -> None:
+    payload = artifact_factory().model_dump(mode="json")
+    mark_contract_versions(payload, "1.1")
+    nested_contract = payload
+    for path_component in nested_contract_path:
+        nested_contract = nested_contract[path_component]
+    nested_contract["schema_version"] = nested_version
+
+    with pytest.raises(ValueError, match=r"cannot safely migrate.*nested contract schema version"):
+        migrate_v1_1_to_v1_2(payload, artifact_type=artifact_type)
+
+
 def test_v1_1_migration_returns_validated_canonical_json_data() -> None:
     payload = manifest().model_dump()
     payload["schema_version"] = "1.1"
+    payload["model_parameters"]["schema_version"] = "1.1"
 
     migrated = migrate_v1_1_to_v1_2(payload, artifact_type="run_manifest")
 
-    assert migrated == manifest().model_dump(mode="json")
+    expected = manifest().model_dump(mode="json")
+    expected["model_parameters"]["schema_version"] = "1.1"
+    assert migrated == expected
     assert json.loads(json.dumps(migrated)) == migrated
 
 
 def test_v1_1_migration_rejects_unknown_artifact_types() -> None:
     with pytest.raises(ValueError, match="unsupported artifact type"):
-        migrate_v1_1_to_v1_2(
-            {"schema_version": "1.1"}, artifact_type="unrecognized_artifact"
-        )
+        migrate_v1_1_to_v1_2({"schema_version": "1.1"}, artifact_type="unrecognized_artifact")
 
 
 def test_v1_1_migration_refuses_non_inferable_nested_step_numbers() -> None:
@@ -479,9 +537,7 @@ def test_run_manifest_rejects_duplicate_problem_ids() -> None:
     run = manifest()
 
     with pytest.raises(ValidationError, match="problem IDs must be unique"):
-        RunManifest.model_validate(
-            {**run.model_dump(), "problem_ids": ["cf-1000-a", "cf-1000-a"]}
-        )
+        RunManifest.model_validate({**run.model_dump(), "problem_ids": ["cf-1000-a", "cf-1000-a"]})
 
 
 @pytest.mark.parametrize("timestamp_field", ["created_at", "updated_at"])
@@ -491,9 +547,7 @@ def test_run_manifest_rejects_naive_timestamps_with_actual_field_name(
     run = manifest()
 
     with pytest.raises(ValidationError, match=rf"{timestamp_field} must include a timezone"):
-        RunManifest.model_validate(
-            {**run.model_dump(), timestamp_field: datetime(2026, 8, 21)}
-        )
+        RunManifest.model_validate({**run.model_dump(), timestamp_field: datetime(2026, 8, 21)})
 
 
 def test_contracts_remain_deeply_immutable_after_validation() -> None:

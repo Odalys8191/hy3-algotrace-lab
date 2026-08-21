@@ -333,8 +333,7 @@ class AuditReport(ContractModel):
     @model_validator(mode="after")
     def validate_process_error_semantics(self) -> Self:
         has_error_evidence = (
-            self.final_error_taxonomy is not None
-            and self.first_material_error_step_id is not None
+            self.final_error_taxonomy is not None and self.first_material_error_step_id is not None
         )
         if self.process_valid and (
             self.final_error_taxonomy is not None or self.first_material_error_step_id
@@ -475,9 +474,66 @@ V1_2_ARTIFACT_MODELS: Mapping[str, type[ContractModel]] = MappingProxyType(
 )
 
 
-def migrate_v1_1_to_v1_2(
-    payload: Mapping[str, Any], *, artifact_type: str
+def _retag_nested_contract(
+    value: Any, *, path: str, nested_fields: Mapping[str, Mapping[str, Any]]
 ) -> dict[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{path} must be a versioned mapping")
+    if value.get("schema_version") != "1.1":
+        raise ValueError(f"{path} nested contract schema version must be 1.1")
+    retagged = dict(value)
+    retagged["schema_version"] = SCHEMA_VERSION
+    _retag_known_fields(retagged, path=path, nested_fields=nested_fields)
+    return retagged
+
+
+def _retag_known_fields(
+    payload: dict[str, Any], *, path: str, nested_fields: Mapping[str, Mapping[str, Any]]
+) -> None:
+    for field_name, child_fields in nested_fields.items():
+        value = payload.get(field_name)
+        if value is None:
+            continue
+        field_path = f"{path}.{field_name}"
+        if isinstance(value, (list, tuple)):
+            payload[field_name] = [
+                _retag_nested_contract(
+                    item,
+                    path=f"{field_path}[{index}]",
+                    nested_fields=child_fields,
+                )
+                for index, item in enumerate(value)
+            ]
+        else:
+            payload[field_name] = _retag_nested_contract(
+                value, path=field_path, nested_fields=child_fields
+            )
+
+
+V1_1_NESTED_CONTRACT_FIELDS: Mapping[str, Mapping[str, Mapping[str, Any]]] = MappingProxyType(
+    {
+        "problem_record": MappingProxyType(
+            {
+                "public_tests": MappingProxyType({}),
+                "hidden_tests": MappingProxyType({}),
+                "generated_tests": MappingProxyType({}),
+            }
+        ),
+        "problem_oracle": MappingProxyType({}),
+        "solution_trace": MappingProxyType({"steps": MappingProxyType({})}),
+        "reviewer_verdict": MappingProxyType({"per_step_reviews": MappingProxyType({})}),
+        "audit_report": MappingProxyType(
+            {
+                "judge_evidence": MappingProxyType({"tests": MappingProxyType({})}),
+                "reviewer_verdicts": MappingProxyType({"per_step_reviews": MappingProxyType({})}),
+            }
+        ),
+        "run_manifest": MappingProxyType({}),
+    }
+)
+
+
+def migrate_v1_1_to_v1_2(payload: Mapping[str, Any], *, artifact_type: str) -> dict[str, Any]:
     """Upgrade an already-complete 1.1 mapping without inventing audit semantics."""
 
     try:
@@ -500,9 +556,14 @@ def migrate_v1_1_to_v1_2(
             f"cannot safely migrate {artifact_type}: "
             f"required 1.2 fields lack inferable values: {fields}"
         )
-    migrated = dict(payload)
-    migrated["schema_version"] = SCHEMA_VERSION
     try:
+        migrated = dict(payload)
+        migrated["schema_version"] = SCHEMA_VERSION
+        _retag_known_fields(
+            migrated,
+            path=artifact_type,
+            nested_fields=V1_1_NESTED_CONTRACT_FIELDS[artifact_type],
+        )
         validated = artifact_model.model_validate(migrated)
     except ValueError as error:
         details = " ".join(str(error).splitlines())
