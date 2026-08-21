@@ -1,0 +1,1 @@
+{"kind":"project_authored_test_fixture","formal_selection_eligible":false,"problem_id":"pilot-reverse-text","statement_en":"Reverse one whitespace-free word.","public_tests":[{"input":"abc\n","output":"cba\n"}],"hidden_tests":[{"input":"z\n","output":"z\n"}]}
