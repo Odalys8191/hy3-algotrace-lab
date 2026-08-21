@@ -43,7 +43,7 @@ def problem() -> ProblemRecord:
 def test_problem_record_accepts_only_formal_topic_rating_bands_and_cpp17() -> None:
     record = problem()
 
-    assert record.schema_version == "1.0"
+    assert record.schema_version == "1.1"
     assert record.topic.value == "greedy"
     assert record.language == "cpp17"
     assert record.rating_band.value == "1200-1500"
@@ -82,7 +82,7 @@ def test_solution_trace_rejects_duplicate_unknown_and_cyclic_step_dependencies()
         code="int main() {}",
     )
 
-    assert trace.schema_version == "1.0"
+    assert trace.schema_version == "1.1"
     assert trace.steps[1].depends_on == ("understand",)
 
     with pytest.raises(ValidationError, match="unique"):
@@ -193,7 +193,7 @@ def test_frozen_contracts_round_trip_judge_oracle_report_and_manifest() -> None:
         },
     )
 
-    assert oracle.schema_version == report.schema_version == manifest.schema_version == "1.0"
+    assert oracle.schema_version == report.schema_version == manifest.schema_version == "1.1"
     assert report.judge_evidence.verdict is JudgeStatus.AC
     assert manifest.model_validate_json(manifest.model_dump_json()) == manifest
 
@@ -273,3 +273,34 @@ def test_run_manifest_tracks_immutable_per_artifact_hashes_and_validates_metadat
         RunManifest.model_validate(
             {**manifest.model_dump(), "created_at": datetime(2026, 8, 21)}
         )
+
+
+def test_contract_version_1_1_rejects_pre_release_1_0_report_and_manifest_payloads() -> None:
+    evidence = JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
+    report = AuditReport(
+        run_id="run-1",
+        problem_id="cf-1000-a",
+        trace_id="trace-1",
+        judge_evidence=evidence,
+        reviewer_verdicts=[],
+        process_valid=True,
+    )
+    manifest = RunManifest(
+        run_id="run-1",
+        status=RunStatus.COMPLETED,
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        config_hash="b" * 64,
+        problem_ids=["cf-1000-a"],
+        artifact_hash="c" * 64,
+        artifact_hashes={"audit/run-1.json": "2" * 64},
+    )
+    pre_release_report = report.model_dump(exclude={"process_valid"}) | {"schema_version": "1.0"}
+    pre_release_manifest = manifest.model_dump(exclude={"artifact_hashes"}) | {
+        "schema_version": "1.0"
+    }
+
+    assert report.schema_version == manifest.schema_version == "1.1"
+    with pytest.raises(ValidationError, match="unsupported schema version"):
+        AuditReport.model_validate(pre_release_report)
+    with pytest.raises(ValidationError, match="unsupported schema version"):
+        RunManifest.model_validate(pre_release_manifest)

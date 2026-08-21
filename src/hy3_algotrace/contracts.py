@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
-from typing import Literal, Self
+from typing import Any, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -17,8 +17,8 @@ from pydantic import (
     model_validator,
 )
 
-type SchemaVersion = Literal["1.0"]
-SCHEMA_VERSION: SchemaVersion = "1.0"
+type SchemaVersion = Literal["1.1"]
+SCHEMA_VERSION: SchemaVersion = "1.1"
 SHA256_HEX_LENGTH = 64
 
 
@@ -26,6 +26,15 @@ class ContractModel(BaseModel):
     """Base configuration for JSON artifacts crossing application boundaries."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, validate_assignment=True)
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_schema_version(cls, value: Any) -> Any:
+        if isinstance(value, Mapping) and (
+            value.get("schema_version", SCHEMA_VERSION) != SCHEMA_VERSION
+        ):
+            raise ValueError(f"unsupported schema version; expected {SCHEMA_VERSION}")
+        return value
 
 
 class Topic(StrEnum):
