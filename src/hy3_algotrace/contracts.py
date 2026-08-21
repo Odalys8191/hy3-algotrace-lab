@@ -17,8 +17,9 @@ from pydantic import (
     model_validator,
 )
 
-type SchemaVersion = Literal["1.1"]
-SCHEMA_VERSION: SchemaVersion = "1.1"
+type SchemaVersion = Literal["1.2"]
+type ModelParameter = str | int | float | bool | None
+SCHEMA_VERSION: SchemaVersion = "1.2"
 SHA256_HEX_LENGTH = 64
 
 
@@ -57,27 +58,26 @@ class ReasoningStage(StrEnum):
     CORRECTNESS_ARGUMENT = "correctness_argument"
     COMPLEXITY_ANALYSIS = "complexity_analysis"
     IMPLEMENTATION = "implementation"
-    TESTING = "testing"
+    EDGE_CASES = "edge_cases"
 
 
 class StepStatus(StrEnum):
-    PENDING = "pending"
-    SUPPORTED = "supported"
+    CORRECT = "correct"
+    ACCEPTABLE_OMISSION = "acceptable_omission"
     UNSUPPORTED = "unsupported"
-    CONTRADICTED = "contradicted"
-    NOT_APPLICABLE = "not_applicable"
+    INCORRECT = "incorrect"
 
 
 class ErrorTaxonomy(StrEnum):
-    MISREAD_PROBLEM = "misread_problem"
-    CONCEPT_ERROR = "concept_error"
-    ALGORITHM_ERROR = "algorithm_error"
-    PROOF_GAP = "proof_gap"
+    PROBLEM_MISREAD = "problem_misread"
+    CONSTRAINT_OMISSION = "constraint_omission"
+    ALGORITHM_LOGIC = "algorithm_logic"
+    PROOF_GAP_CIRCULARITY = "proof_gap_circularity"
     COMPLEXITY_ERROR = "complexity_error"
-    BOUNDARY_OMISSION = "boundary_omission"
+    BOUNDARY_ERROR = "boundary_error"
     IMPLEMENTATION_ERROR = "implementation_error"
+    HALLUCINATION = "hallucination"
     FORMAT_SCHEMA = "format_schema"
-    INFRASTRUCTURE = "infrastructure"
 
 
 class RunStatus(StrEnum):
@@ -113,6 +113,14 @@ class ProblemRecord(ContractModel):
     statement_en: str = Field(min_length=1)
     source_url: str = Field(min_length=1)
     attribution: str = Field(min_length=1)
+    source: Literal["codeforces"] = "codeforces"
+    cf_contest_id: int = Field(gt=0)
+    cf_index: str = Field(min_length=1)
+    cf_tags: tuple[str, ...] = Field(min_length=1)
+    source_split: Literal["validation", "test"]
+    is_description_translated: Literal[False] = False
+    input_file: Literal[""] = ""
+    output_file: Literal[""] = ""
     topic: Topic
     rating: int
     language: Literal["cpp17"] = "cpp17"
@@ -120,6 +128,8 @@ class ProblemRecord(ContractModel):
     memory_limit_mb: int = Field(gt=0)
     public_tests: tuple[TestCase, ...] = ()
     hidden_tests: tuple[TestCase, ...] = ()
+    generated_tests: tuple[TestCase, ...] = ()
+    content_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
 
     @field_validator("rating")
     @classmethod
@@ -128,6 +138,13 @@ class ProblemRecord(ContractModel):
         if not any(lower <= rating <= upper for lower, upper in rating_bands):
             raise ValueError("rating must fall in a formal rating band")
         return rating
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: str) -> str:
+        if not _is_sha256(value):
+            raise ValueError("content_hash must be a lowercase SHA-256 hex digest")
+        return value
 
     @property
     def rating_band(self) -> RatingBand:
@@ -141,6 +158,11 @@ class ProblemRecord(ContractModel):
 class ProblemOracle(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     problem_id: str = Field(min_length=1)
+    accepted_algorithm_families: tuple[str, ...] = Field(min_length=1)
+    key_invariants: tuple[str, ...] = Field(min_length=1)
+    complexity_ceiling: str = Field(min_length=1)
+    known_traps: tuple[str, ...] = Field(min_length=1)
+    adversarial_cases: tuple[str, ...] = Field(min_length=1)
     decisive_facts: tuple[str, ...] = Field(min_length=1)
     reference_solution_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
 
@@ -155,11 +177,12 @@ class ProblemOracle(ContractModel):
 class ReasoningStep(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     step_id: str = Field(min_length=1)
+    step_number: int = Field(gt=0)
     stage: ReasoningStage
     claim: str = Field(min_length=1)
     rationale: str = Field(min_length=1)
     depends_on: tuple[str, ...] = ()
-    status: StepStatus = StepStatus.PENDING
+    status: StepStatus = StepStatus.CORRECT
 
 
 class SolutionTrace(ContractModel):
@@ -168,9 +191,12 @@ class SolutionTrace(ContractModel):
     problem_id: str = Field(min_length=1)
     language: Literal["cpp17"] = "cpp17"
     steps: tuple[ReasoningStep, ...] = Field(min_length=1)
+    problem_understanding: str = Field(min_length=1)
     algorithm: str = Field(min_length=1)
+    correctness_argument: str = Field(min_length=1)
     time_complexity: str = Field(min_length=1)
     space_complexity: str = Field(min_length=1)
+    edge_cases: tuple[str, ...] = Field(min_length=1)
     code: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -178,6 +204,9 @@ class SolutionTrace(ContractModel):
         step_ids = [step.step_id for step in self.steps]
         if len(step_ids) != len(set(step_ids)):
             raise ValueError("step IDs must be unique")
+        step_numbers = [step.step_number for step in self.steps]
+        if len(step_numbers) != len(set(step_numbers)):
+            raise ValueError("step numbers must be unique")
         known_steps = set(step_ids)
         for step in self.steps:
             unknown_dependencies = set(step.depends_on) - known_steps
@@ -222,6 +251,25 @@ class JudgeEvidence(ContractModel):
     first_counterexample_input: str | None = None
 
 
+class StepReview(ContractModel):
+    schema_version: SchemaVersion = SCHEMA_VERSION
+    step_id: str = Field(min_length=1)
+    status: StepStatus
+    material: bool
+    taxonomy: ErrorTaxonomy | None = None
+    evidence: str = Field(min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def validate_error_semantics(self) -> Self:
+        erroneous_statuses = {StepStatus.UNSUPPORTED, StepStatus.INCORRECT}
+        if self.material and self.status in erroneous_statuses and self.taxonomy is None:
+            raise ValueError("material unsupported or incorrect reviews require a taxonomy")
+        if self.status in {StepStatus.CORRECT, StepStatus.ACCEPTABLE_OMISSION} and self.taxonomy:
+            raise ValueError("correct or acceptable reviews cannot claim an error taxonomy")
+        return self
+
+
 class ReviewerVerdict(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     reviewer_id: str = Field(min_length=1)
@@ -230,13 +278,21 @@ class ReviewerVerdict(ContractModel):
     error_taxonomy: ErrorTaxonomy | None = None
     first_error_step_id: str | None = Field(default=None, min_length=1)
     explanation: str = Field(min_length=1)
+    per_step_reviews: tuple[StepReview, ...] = Field(min_length=1)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
     def validate_material_error_semantics(self) -> Self:
         has_evidence = self.error_taxonomy is not None and self.first_error_step_id is not None
+        material_erroneous_steps = {
+            review.step_id
+            for review in self.per_step_reviews
+            if review.material and review.status in {StepStatus.UNSUPPORTED, StepStatus.INCORRECT}
+        }
         if self.material_error and not has_evidence:
             raise ValueError("a material error requires taxonomy and first error step evidence")
+        if self.material_error and self.first_error_step_id not in material_erroneous_steps:
+            raise ValueError("first error step must reference a material erroneous step review")
         if not self.material_error and (
             self.error_taxonomy is not None or self.first_error_step_id is not None
         ):
@@ -252,7 +308,9 @@ class AuditReport(ContractModel):
     problem_id: str = Field(min_length=1)
     trace_id: str = Field(min_length=1)
     judge_evidence: JudgeEvidence
-    reviewer_verdicts: tuple[ReviewerVerdict, ...]
+    reviewer_verdicts: tuple[ReviewerVerdict, ...] = Field(min_length=1)
+    final_correct: bool
+    process_score: float = Field(ge=0.0, le=100.0)
     process_valid: bool
     final_error_taxonomy: ErrorTaxonomy | None = None
     first_material_error_step_id: str | None = Field(default=None, min_length=1)
@@ -270,6 +328,8 @@ class AuditReport(ContractModel):
             raise ValueError("process_valid reports cannot identify a material error")
         if not self.process_valid and not has_error_evidence:
             raise ValueError("process_valid=False requires taxonomy and first material error step")
+        if self.final_correct != (self.judge_evidence.verdict is JudgeStatus.AC):
+            raise ValueError("final_correct must match JudgeEvidence verdict == AC")
         return self
 
 
@@ -278,12 +338,19 @@ class RunManifest(ContractModel):
     run_id: str = Field(min_length=1)
     status: RunStatus
     created_at: datetime
+    updated_at: datetime
     config_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
     problem_ids: tuple[str, ...] = Field(min_length=1)
     artifact_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
     artifact_hashes: Mapping[str, str] = Field(min_length=1)
+    model_name: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1)
+    model_parameters: Mapping[str, ModelParameter]
+    input_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
+    code_revision: str = Field(min_length=1)
+    container_image_digest: str = Field(min_length=SHA256_HEX_LENGTH + 7)
 
-    @field_validator("config_hash", "artifact_hash")
+    @field_validator("config_hash", "artifact_hash", "input_hash")
     @classmethod
     def validate_hash(cls, value: str) -> str:
         if not _is_sha256(value):
@@ -299,9 +366,20 @@ class RunManifest(ContractModel):
             raise ValueError("artifact hash values must be lowercase SHA-256 hex digests")
         return MappingProxyType(dict(sorted(artifact_hashes.items())))
 
-    @field_serializer("artifact_hashes")
-    def serialize_artifact_hashes(self, artifact_hashes: Mapping[str, str]) -> dict[str, str]:
-        return dict(artifact_hashes)
+    @field_validator("model_parameters")
+    @classmethod
+    def validate_model_parameters(
+        cls, model_parameters: Mapping[str, ModelParameter]
+    ) -> Mapping[str, ModelParameter]:
+        if any(not parameter_name for parameter_name in model_parameters):
+            raise ValueError("model parameter names must be non-empty")
+        return MappingProxyType(dict(sorted(model_parameters.items())))
+
+    @field_serializer("artifact_hashes", "model_parameters")
+    def serialize_mappings(
+        self, value: Mapping[str, str] | Mapping[str, ModelParameter]
+    ) -> dict[str, ModelParameter]:
+        return dict(value)
 
     @field_validator("problem_ids")
     @classmethod
@@ -310,7 +388,14 @@ class RunManifest(ContractModel):
             raise ValueError("problem IDs must be unique in a run manifest")
         return problem_ids
 
-    @field_validator("created_at")
+    @field_validator("container_image_digest")
+    @classmethod
+    def validate_container_image_digest(cls, value: str) -> str:
+        if not value.startswith("sha256:") or not _is_sha256(value.removeprefix("sha256:")):
+            raise ValueError("container_image_digest must be a sha256 digest")
+        return value
+
+    @field_validator("created_at", "updated_at")
     @classmethod
     def validate_created_at(cls, value: datetime) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
@@ -322,3 +407,73 @@ def _is_sha256(value: str) -> bool:
     return len(value) == SHA256_HEX_LENGTH and all(
         character in "0123456789abcdef" for character in value
     )
+
+
+V1_2_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType(
+    {
+        "problem_record": frozenset(
+            {
+                "cf_contest_id",
+                "cf_index",
+                "cf_tags",
+                "source_split",
+                "generated_tests",
+                "content_hash",
+            }
+        ),
+        "problem_oracle": frozenset(
+            {
+                "accepted_algorithm_families",
+                "key_invariants",
+                "complexity_ceiling",
+                "known_traps",
+                "adversarial_cases",
+            }
+        ),
+        "solution_trace": frozenset(
+            {"problem_understanding", "correctness_argument", "edge_cases"}
+        ),
+        "reviewer_verdict": frozenset({"per_step_reviews"}),
+        "audit_report": frozenset({"final_correct", "process_score"}),
+        "run_manifest": frozenset(
+            {
+                "updated_at",
+                "model_name",
+                "prompt_version",
+                "model_parameters",
+                "input_hash",
+                "code_revision",
+                "container_image_digest",
+            }
+        ),
+    }
+)
+
+
+def migrate_v1_1_to_v1_2(
+    payload: Mapping[str, Any], *, artifact_type: str
+) -> dict[str, Any]:
+    """Upgrade an already-complete 1.1 mapping without inventing audit semantics."""
+
+    if payload.get("schema_version") != "1.1":
+        raise ValueError("migration accepts only schema version 1.1 payloads")
+    try:
+        required_fields = V1_2_REQUIRED_FIELDS[artifact_type]
+    except KeyError as error:
+        raise ValueError(f"unsupported artifact type for migration: {artifact_type}") from error
+    missing_fields = {field for field in required_fields if field not in payload}
+    if artifact_type == "solution_trace":
+        steps = payload.get("steps")
+        if not isinstance(steps, (list, tuple)) or any(
+            not isinstance(step, Mapping) or "step_number" not in step for step in steps
+        ):
+            missing_fields.add("steps[].step_number")
+    if missing_fields:
+        fields = ", ".join(sorted(missing_fields))
+        raise ValueError(
+            f"cannot safely migrate {artifact_type}: "
+            f"required 1.2 fields lack inferable values: {fields}"
+        )
+    migrated = dict(payload)
+    migrated["schema_version"] = SCHEMA_VERSION
+    return migrated
