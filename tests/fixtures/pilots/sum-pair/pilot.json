@@ -1,0 +1,1 @@
+{"kind":"project_authored_test_fixture","formal_selection_eligible":false,"problem_id":"pilot-sum-pair","statement_en":"Print the sum of two integers.","public_tests":[{"input":"1 2\n","output":"3\n"}],"hidden_tests":[{"input":"-5 4\n","output":"-1\n"}]}

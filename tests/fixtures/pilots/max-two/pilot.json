@@ -1,0 +1,1 @@
+{"kind":"project_authored_test_fixture","formal_selection_eligible":false,"problem_id":"pilot-max-two","statement_en":"Print the larger of two integers.","public_tests":[{"input":"1 2\n","output":"2\n"}],"hidden_tests":[{"input":"5 -1\n","output":"5\n"}]}

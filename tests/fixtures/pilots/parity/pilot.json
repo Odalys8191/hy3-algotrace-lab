@@ -1,0 +1,1 @@
+{"kind":"project_authored_test_fixture","formal_selection_eligible":false,"problem_id":"pilot-parity","statement_en":"Print EVEN or ODD for one integer.","public_tests":[{"input":"4\n","output":"EVEN\n"}],"hidden_tests":[{"input":"-3\n","output":"ODD\n"}]}

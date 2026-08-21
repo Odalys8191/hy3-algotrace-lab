@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.2",
+  "kind": "project_authored_test_fixture_pilots",
+  "formal_selection_eligible": false,
+  "formal_metrics_eligible": false,
+  "notice": "These five synthetic fixtures exercise catalog wiring only. They are not CodeContests records and have no Codeforces provenance or attribution.",
+  "bundles": [
+    "max-two",
+    "sum-pair",
+    "parity",
+    "reverse-text",
+    "count-positive"
+  ]
+}
