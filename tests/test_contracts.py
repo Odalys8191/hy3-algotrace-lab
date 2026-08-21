@@ -21,6 +21,9 @@ from hy3_algotrace.contracts import (
     SolutionTrace,
     StepStatus,
 )
+from hy3_algotrace.contracts import (
+    TestCase as ContractTestCase,
+)
 
 
 def problem() -> ProblemRecord:
@@ -80,7 +83,7 @@ def test_solution_trace_rejects_duplicate_unknown_and_cyclic_step_dependencies()
     )
 
     assert trace.schema_version == "1.0"
-    assert trace.steps[1].depends_on == ["understand"]
+    assert trace.steps[1].depends_on == ("understand",)
 
     with pytest.raises(ValidationError, match="unique"):
         SolutionTrace.model_validate(
@@ -123,6 +126,15 @@ def test_reviewer_material_error_requires_taxonomy_and_first_error_step() -> Non
             material_error=True,
             explanation="A material error needs evidence.",
         )
+    with pytest.raises(ValidationError, match="first_error_step_id"):
+        ReviewerVerdict(
+            reviewer_id="reviewer-a",
+            trace_id="trace-1",
+            material_error=True,
+            error_taxonomy=ErrorTaxonomy.ALGORITHM_ERROR,
+            first_error_step_id="",
+            explanation="An empty error step cannot locate a material error.",
+        )
     with pytest.raises(ValidationError, match="non-material"):
         ReviewerVerdict(
             reviewer_id="reviewer-a",
@@ -160,6 +172,7 @@ def test_frozen_contracts_round_trip_judge_oracle_report_and_manifest() -> None:
         trace_id="trace-1",
         judge_evidence=evidence,
         reviewer_verdicts=[],
+        process_valid=True,
         final_error_taxonomy=None,
         first_material_error_step_id=None,
         needs_human_review=False,
@@ -171,8 +184,92 @@ def test_frozen_contracts_round_trip_judge_oracle_report_and_manifest() -> None:
         config_hash="b" * 64,
         problem_ids=["cf-1000-a"],
         artifact_hash="c" * 64,
+        artifact_hashes={
+            "problem/cf-1000-a.json": "d" * 64,
+            "oracle/cf-1000-a.json": "e" * 64,
+            "trace/trace-1.json": "f" * 64,
+            "judge/run-1.json": "1" * 64,
+            "audit/run-1.json": "2" * 64,
+        },
     )
 
     assert oracle.schema_version == report.schema_version == manifest.schema_version == "1.0"
     assert report.judge_evidence.verdict is JudgeStatus.AC
     assert manifest.model_validate_json(manifest.model_dump_json()) == manifest
+
+
+def test_contracts_are_deeply_immutable_after_validation() -> None:
+    record = problem()
+    test_case = PerTestEvidence(test_id="public-1", status=JudgeStatus.AC)
+
+    with pytest.raises(ValidationError):
+        record.rating = 1550
+    with pytest.raises(AttributeError):
+        record.public_tests.append(
+            ContractTestCase(test_id="public-1", input_data="1 2", expected_output="2")
+        )
+    with pytest.raises(ValidationError):
+        test_case.test_id = "mutated"
+
+
+def test_audit_report_requires_taxonomy_and_first_step_to_match_process_valid() -> None:
+    evidence = JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
+    valid_kwargs = {
+        "run_id": "run-1",
+        "problem_id": "cf-1000-a",
+        "trace_id": "trace-1",
+        "judge_evidence": evidence,
+        "reviewer_verdicts": [],
+        "needs_human_review": False,
+    }
+
+    with pytest.raises(ValidationError, match="process_valid"):
+        AuditReport(
+            **valid_kwargs,
+            process_valid=True,
+            final_error_taxonomy=ErrorTaxonomy.ALGORITHM_ERROR,
+            first_material_error_step_id=None,
+        )
+    with pytest.raises(ValidationError, match="process_valid"):
+        AuditReport(
+            **valid_kwargs,
+            process_valid=False,
+            final_error_taxonomy=None,
+            first_material_error_step_id="algorithm",
+        )
+    with pytest.raises(ValidationError, match="first_material_error_step_id"):
+        AuditReport(
+            **valid_kwargs,
+            process_valid=False,
+            final_error_taxonomy=ErrorTaxonomy.ALGORITHM_ERROR,
+            first_material_error_step_id="",
+        )
+
+
+def test_run_manifest_tracks_immutable_per_artifact_hashes_and_validates_metadata() -> None:
+    manifest = RunManifest(
+        run_id="run-1",
+        status=RunStatus.COMPLETED,
+        created_at=datetime(2026, 8, 21, tzinfo=UTC),
+        config_hash="b" * 64,
+        problem_ids=["cf-1000-a"],
+        artifact_hash="c" * 64,
+        artifact_hashes={
+            "trace/trace-1.json": "f" * 64,
+            "audit/run-1.json": "2" * 64,
+        },
+    )
+
+    assert list(manifest.artifact_hashes) == ["audit/run-1.json", "trace/trace-1.json"]
+    with pytest.raises(TypeError):
+        manifest.artifact_hashes["audit/run-1.json"] = "0" * 64
+    with pytest.raises(ValidationError, match="hash"):
+        RunManifest.model_validate({**manifest.model_dump(), "artifact_hash": "not-a-hash"})
+    with pytest.raises(ValidationError, match="unique"):
+        RunManifest.model_validate(
+            {**manifest.model_dump(), "problem_ids": ["cf-1000-a", "cf-1000-a"]}
+        )
+    with pytest.raises(ValidationError, match="timezone"):
+        RunManifest.model_validate(
+            {**manifest.model_dump(), "created_at": datetime(2026, 8, 21)}
+        )

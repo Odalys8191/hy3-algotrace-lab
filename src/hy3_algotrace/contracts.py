@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
+from types import MappingProxyType
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_serializer,
+    field_validator,
+    model_validator,
+)
 
 type SchemaVersion = Literal["1.0"]
 SCHEMA_VERSION: SchemaVersion = "1.0"
@@ -16,7 +25,7 @@ SHA256_HEX_LENGTH = 64
 class ContractModel(BaseModel):
     """Base configuration for JSON artifacts crossing application boundaries."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True, validate_assignment=True)
 
 
 class Topic(StrEnum):
@@ -100,8 +109,8 @@ class ProblemRecord(ContractModel):
     language: Literal["cpp17"] = "cpp17"
     time_limit_ms: int = Field(gt=0)
     memory_limit_mb: int = Field(gt=0)
-    public_tests: list[TestCase] = Field(default_factory=list)
-    hidden_tests: list[TestCase] = Field(default_factory=list)
+    public_tests: tuple[TestCase, ...] = ()
+    hidden_tests: tuple[TestCase, ...] = ()
 
     @field_validator("rating")
     @classmethod
@@ -123,7 +132,7 @@ class ProblemRecord(ContractModel):
 class ProblemOracle(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     problem_id: str = Field(min_length=1)
-    decisive_facts: list[str] = Field(min_length=1)
+    decisive_facts: tuple[str, ...] = Field(min_length=1)
     reference_solution_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
 
     @field_validator("reference_solution_hash")
@@ -140,7 +149,7 @@ class ReasoningStep(ContractModel):
     stage: ReasoningStage
     claim: str = Field(min_length=1)
     rationale: str = Field(min_length=1)
-    depends_on: list[str] = Field(default_factory=list)
+    depends_on: tuple[str, ...] = ()
     status: StepStatus = StepStatus.PENDING
 
 
@@ -149,7 +158,7 @@ class SolutionTrace(ContractModel):
     trace_id: str = Field(min_length=1)
     problem_id: str = Field(min_length=1)
     language: Literal["cpp17"] = "cpp17"
-    steps: list[ReasoningStep] = Field(min_length=1)
+    steps: tuple[ReasoningStep, ...] = Field(min_length=1)
     algorithm: str = Field(min_length=1)
     time_complexity: str = Field(min_length=1)
     space_complexity: str = Field(min_length=1)
@@ -199,7 +208,7 @@ class JudgeEvidence(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     compile_status: JudgeStatus
     verdict: JudgeStatus
-    tests: list[PerTestEvidence] = Field(default_factory=list)
+    tests: tuple[PerTestEvidence, ...] = ()
     diagnostics: str = ""
     first_counterexample_input: str | None = None
 
@@ -210,7 +219,7 @@ class ReviewerVerdict(ContractModel):
     trace_id: str = Field(min_length=1)
     material_error: bool
     error_taxonomy: ErrorTaxonomy | None = None
-    first_error_step_id: str | None = None
+    first_error_step_id: str | None = Field(default=None, min_length=1)
     explanation: str = Field(min_length=1)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
 
@@ -234,10 +243,25 @@ class AuditReport(ContractModel):
     problem_id: str = Field(min_length=1)
     trace_id: str = Field(min_length=1)
     judge_evidence: JudgeEvidence
-    reviewer_verdicts: list[ReviewerVerdict]
+    reviewer_verdicts: tuple[ReviewerVerdict, ...]
+    process_valid: bool
     final_error_taxonomy: ErrorTaxonomy | None = None
-    first_material_error_step_id: str | None = None
+    first_material_error_step_id: str | None = Field(default=None, min_length=1)
     needs_human_review: bool = False
+
+    @model_validator(mode="after")
+    def validate_process_error_semantics(self) -> Self:
+        has_error_evidence = (
+            self.final_error_taxonomy is not None
+            and self.first_material_error_step_id is not None
+        )
+        if self.process_valid and (
+            self.final_error_taxonomy is not None or self.first_material_error_step_id
+        ):
+            raise ValueError("process_valid reports cannot identify a material error")
+        if not self.process_valid and not has_error_evidence:
+            raise ValueError("process_valid=False requires taxonomy and first material error step")
+        return self
 
 
 class RunManifest(ContractModel):
@@ -246,8 +270,9 @@ class RunManifest(ContractModel):
     status: RunStatus
     created_at: datetime
     config_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
-    problem_ids: list[str] = Field(min_length=1)
+    problem_ids: tuple[str, ...] = Field(min_length=1)
     artifact_hash: str = Field(min_length=SHA256_HEX_LENGTH, max_length=SHA256_HEX_LENGTH)
+    artifact_hashes: Mapping[str, str] = Field(min_length=1)
 
     @field_validator("config_hash", "artifact_hash")
     @classmethod
@@ -256,9 +281,22 @@ class RunManifest(ContractModel):
             raise ValueError("hash values must be lowercase SHA-256 hex digests")
         return value
 
+    @field_validator("artifact_hashes")
+    @classmethod
+    def validate_artifact_hashes(cls, artifact_hashes: Mapping[str, str]) -> Mapping[str, str]:
+        if any(not artifact_id for artifact_id in artifact_hashes):
+            raise ValueError("artifact hash IDs must be non-empty")
+        if any(not _is_sha256(content_hash) for content_hash in artifact_hashes.values()):
+            raise ValueError("artifact hash values must be lowercase SHA-256 hex digests")
+        return MappingProxyType(dict(sorted(artifact_hashes.items())))
+
+    @field_serializer("artifact_hashes")
+    def serialize_artifact_hashes(self, artifact_hashes: Mapping[str, str]) -> dict[str, str]:
+        return dict(artifact_hashes)
+
     @field_validator("problem_ids")
     @classmethod
-    def validate_problem_ids(cls, problem_ids: list[str]) -> list[str]:
+    def validate_problem_ids(cls, problem_ids: tuple[str, ...]) -> tuple[str, ...]:
         if len(problem_ids) != len(set(problem_ids)):
             raise ValueError("problem IDs must be unique in a run manifest")
         return problem_ids
