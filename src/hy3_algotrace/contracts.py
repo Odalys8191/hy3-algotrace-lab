@@ -12,6 +12,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -284,15 +285,28 @@ class ReviewerVerdict(ContractModel):
     @model_validator(mode="after")
     def validate_material_error_semantics(self) -> Self:
         has_evidence = self.error_taxonomy is not None and self.first_error_step_id is not None
-        material_erroneous_steps = {
-            review.step_id
+        material_erroneous_reviews = tuple(
+            review
             for review in self.per_step_reviews
             if review.material and review.status in {StepStatus.UNSUPPORTED, StepStatus.INCORRECT}
-        }
+        )
         if self.material_error and not has_evidence:
             raise ValueError("a material error requires taxonomy and first error step evidence")
-        if self.material_error and self.first_error_step_id not in material_erroneous_steps:
+        if not self.material_error and material_erroneous_reviews:
+            raise ValueError(
+                "a non-material verdict cannot contain a material erroneous step review"
+            )
+        if self.material_error and self.first_error_step_id not in {
+            review.step_id for review in material_erroneous_reviews
+        }:
             raise ValueError("first error step must reference a material erroneous step review")
+        if (
+            self.material_error
+            and self.first_error_step_id != material_erroneous_reviews[0].step_id
+        ):
+            raise ValueError("first error step must be the first material erroneous step review")
+        if self.material_error and self.error_taxonomy != material_erroneous_reviews[0].taxonomy:
+            raise ValueError("verdict taxonomy must match the linked step review taxonomy")
         if not self.material_error and (
             self.error_taxonomy is not None or self.first_error_step_id is not None
         ):
@@ -397,9 +411,9 @@ class RunManifest(ContractModel):
 
     @field_validator("created_at", "updated_at")
     @classmethod
-    def validate_created_at(cls, value: datetime) -> datetime:
+    def validate_timestamp(cls, value: datetime, info: ValidationInfo) -> datetime:
         if value.tzinfo is None or value.utcoffset() is None:
-            raise ValueError("created_at must include a timezone")
+            raise ValueError(f"{info.field_name} must include a timezone")
         return value
 
 
@@ -449,18 +463,30 @@ V1_2_REQUIRED_FIELDS: Mapping[str, frozenset[str]] = MappingProxyType(
     }
 )
 
+V1_2_ARTIFACT_MODELS: Mapping[str, type[ContractModel]] = MappingProxyType(
+    {
+        "problem_record": ProblemRecord,
+        "problem_oracle": ProblemOracle,
+        "solution_trace": SolutionTrace,
+        "reviewer_verdict": ReviewerVerdict,
+        "audit_report": AuditReport,
+        "run_manifest": RunManifest,
+    }
+)
+
 
 def migrate_v1_1_to_v1_2(
     payload: Mapping[str, Any], *, artifact_type: str
 ) -> dict[str, Any]:
     """Upgrade an already-complete 1.1 mapping without inventing audit semantics."""
 
-    if payload.get("schema_version") != "1.1":
-        raise ValueError("migration accepts only schema version 1.1 payloads")
     try:
-        required_fields = V1_2_REQUIRED_FIELDS[artifact_type]
+        artifact_model = V1_2_ARTIFACT_MODELS[artifact_type]
     except KeyError as error:
         raise ValueError(f"unsupported artifact type for migration: {artifact_type}") from error
+    if payload.get("schema_version") != "1.1":
+        raise ValueError("migration accepts only schema version 1.1 payloads")
+    required_fields = V1_2_REQUIRED_FIELDS[artifact_type]
     missing_fields = {field for field in required_fields if field not in payload}
     if artifact_type == "solution_trace":
         steps = payload.get("steps")
@@ -476,4 +502,9 @@ def migrate_v1_1_to_v1_2(
         )
     migrated = dict(payload)
     migrated["schema_version"] = SCHEMA_VERSION
-    return migrated
+    try:
+        validated = artifact_model.model_validate(migrated)
+    except ValueError as error:
+        details = " ".join(str(error).splitlines())
+        raise ValueError(f"cannot safely migrate {artifact_type}: {details}") from error
+    return validated.model_dump(mode="json")

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -110,6 +111,21 @@ def reviewer_verdict() -> ReviewerVerdict:
     )
 
 
+def audit_report() -> AuditReport:
+    return AuditReport(
+        run_id="run-1",
+        problem_id="cf-1000-a",
+        trace_id="trace-1",
+        judge_evidence=judge_evidence(),
+        reviewer_verdicts=(reviewer_verdict(),),
+        final_correct=True,
+        process_score=72,
+        process_valid=False,
+        final_error_taxonomy=ErrorTaxonomy.ALGORITHM_LOGIC,
+        first_material_error_step_id="algorithm",
+    )
+
+
 def manifest() -> RunManifest:
     return RunManifest(
         run_id="run-1",
@@ -197,6 +213,33 @@ def test_trace_requires_numbered_steps_and_user_visible_explanation_sections() -
         SolutionTrace.model_validate({**solution.model_dump(), "correctness_argument": ""})
 
 
+def test_solution_trace_rejects_duplicate_step_ids_unknown_dependencies_and_cycles() -> None:
+    solution = trace()
+    first, second = (step.model_dump(mode="json") for step in solution.steps)
+
+    with pytest.raises(ValidationError, match="step IDs must be unique"):
+        SolutionTrace.model_validate(
+            {
+                **solution.model_dump(mode="json"),
+                "steps": [first, {**second, "step_id": first["step_id"]}],
+            }
+        )
+    with pytest.raises(ValidationError, match="unknown step IDs"):
+        SolutionTrace.model_validate(
+            {
+                **solution.model_dump(mode="json"),
+                "steps": [first, {**second, "depends_on": ["missing"]}],
+            }
+        )
+    with pytest.raises(ValidationError, match="acyclic"):
+        SolutionTrace.model_validate(
+            {
+                **solution.model_dump(mode="json"),
+                "steps": [{**first, "depends_on": [second["step_id"]]}, second],
+            }
+        )
+
+
 def test_step_reviews_link_material_errors_to_reviewer_candidates() -> None:
     verdict = reviewer_verdict()
 
@@ -224,20 +267,57 @@ def test_step_reviews_link_material_errors_to_reviewer_candidates() -> None:
         )
 
 
-def test_audit_requires_reviewer_evidence_and_matches_execution_correctness() -> None:
+def test_non_material_reviewer_verdict_rejects_material_erroneous_step_review() -> None:
     verdict = reviewer_verdict()
-    report = AuditReport(
-        run_id="run-1",
-        problem_id="cf-1000-a",
-        trace_id="trace-1",
-        judge_evidence=judge_evidence(),
-        reviewer_verdicts=(verdict,),
-        final_correct=True,
-        process_score=72,
-        process_valid=False,
-        final_error_taxonomy=ErrorTaxonomy.ALGORITHM_LOGIC,
-        first_material_error_step_id="algorithm",
+
+    with pytest.raises(ValidationError, match="non-material verdict"):
+        ReviewerVerdict.model_validate(
+            {
+                **verdict.model_dump(mode="json"),
+                "material_error": False,
+                "error_taxonomy": None,
+                "first_error_step_id": None,
+            }
+        )
+
+
+def test_reviewer_verdict_taxonomy_matches_linked_step_review() -> None:
+    verdict = reviewer_verdict()
+
+    with pytest.raises(ValidationError, match="taxonomy must match"):
+        ReviewerVerdict.model_validate(
+            {
+                **verdict.model_dump(mode="json"),
+                "error_taxonomy": ErrorTaxonomy.BOUNDARY_ERROR,
+            }
+        )
+
+
+def test_reviewer_verdict_links_first_material_error_in_evidence_order() -> None:
+    verdict = reviewer_verdict()
+    earlier_review = StepReview(
+        step_id="understand",
+        status=StepStatus.UNSUPPORTED,
+        material=True,
+        taxonomy=ErrorTaxonomy.PROBLEM_MISREAD,
+        evidence="The input interpretation is not supported by the statement.",
+        confidence=0.95,
     )
+
+    with pytest.raises(ValidationError, match="first material erroneous step review"):
+        ReviewerVerdict.model_validate(
+            {
+                **verdict.model_dump(mode="json"),
+                "per_step_reviews": [
+                    earlier_review.model_dump(mode="json"),
+                    verdict.per_step_reviews[0].model_dump(mode="json"),
+                ],
+            }
+        )
+
+
+def test_audit_requires_reviewer_evidence_and_matches_execution_correctness() -> None:
+    report = audit_report()
 
     assert report.process_score == 72
     with pytest.raises(ValidationError, match="final_correct"):
@@ -254,6 +334,35 @@ def test_audit_requires_reviewer_evidence_and_matches_execution_correctness() ->
                 "final_error_taxonomy": ErrorTaxonomy.ALGORITHM_LOGIC,
             }
         )
+
+
+def test_audit_report_enforces_both_sides_of_taxonomy_first_step_pairing() -> None:
+    report = audit_report()
+    payload = report.model_dump(mode="json")
+
+    for invalid_valid_process in (
+        {
+            **payload,
+            "process_valid": True,
+            "final_error_taxonomy": ErrorTaxonomy.ALGORITHM_LOGIC,
+            "first_material_error_step_id": None,
+        },
+        {
+            **payload,
+            "process_valid": True,
+            "final_error_taxonomy": None,
+            "first_material_error_step_id": "algorithm",
+        },
+    ):
+        with pytest.raises(ValidationError, match="process_valid"):
+            AuditReport.model_validate(invalid_valid_process)
+
+    for invalid_invalid_process in (
+        {**payload, "final_error_taxonomy": None},
+        {**payload, "first_material_error_step_id": None},
+    ):
+        with pytest.raises(ValidationError, match="process_valid=False"):
+            AuditReport.model_validate(invalid_invalid_process)
 
 
 def test_oracle_manifest_provenance_reexports_and_v1_1_migration_strategy() -> None:
@@ -298,6 +407,48 @@ def test_oracle_manifest_provenance_reexports_and_v1_1_migration_strategy() -> N
         migrate_v1_1_to_v1_2(v1_1_problem, artifact_type="problem_record")
 
 
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ("missing_per_step_reviews", "per_step_reviews"),
+        ("old_step_status", "supported"),
+        ("old_taxonomy", "algorithm_error"),
+    ],
+)
+def test_v1_1_audit_migration_validates_nested_v1_2_contracts(
+    mutation: str, expected_error: str
+) -> None:
+    payload = audit_report().model_dump(mode="json")
+    payload["schema_version"] = "1.1"
+    nested_verdict = payload["reviewer_verdicts"][0]
+    if mutation == "missing_per_step_reviews":
+        del nested_verdict["per_step_reviews"]
+    elif mutation == "old_step_status":
+        nested_verdict["per_step_reviews"][0]["status"] = "supported"
+    else:
+        nested_verdict["per_step_reviews"][0]["taxonomy"] = "algorithm_error"
+
+    with pytest.raises(ValueError, match=rf"cannot safely migrate.*{expected_error}"):
+        migrate_v1_1_to_v1_2(payload, artifact_type="audit_report")
+
+
+def test_v1_1_migration_returns_validated_canonical_json_data() -> None:
+    payload = manifest().model_dump()
+    payload["schema_version"] = "1.1"
+
+    migrated = migrate_v1_1_to_v1_2(payload, artifact_type="run_manifest")
+
+    assert migrated == manifest().model_dump(mode="json")
+    assert json.loads(json.dumps(migrated)) == migrated
+
+
+def test_v1_1_migration_rejects_unknown_artifact_types() -> None:
+    with pytest.raises(ValueError, match="unsupported artifact type"):
+        migrate_v1_1_to_v1_2(
+            {"schema_version": "1.1"}, artifact_type="unrecognized_artifact"
+        )
+
+
 def test_v1_1_migration_refuses_non_inferable_nested_step_numbers() -> None:
     v1_1_trace = {
         "schema_version": "1.1",
@@ -309,3 +460,52 @@ def test_v1_1_migration_refuses_non_inferable_nested_step_numbers() -> None:
 
     with pytest.raises(ValueError, match=r"steps\[\].step_number"):
         migrate_v1_1_to_v1_2(v1_1_trace, artifact_type="solution_trace")
+
+
+@pytest.mark.parametrize("hash_field", ["config_hash", "artifact_hash", "input_hash"])
+def test_run_manifest_rejects_malformed_run_hashes(hash_field: str) -> None:
+    run = manifest()
+
+    with pytest.raises(ValidationError, match="SHA-256"):
+        RunManifest.model_validate({**run.model_dump(), hash_field: "g" * 64})
+
+    with pytest.raises(ValidationError, match="SHA-256"):
+        RunManifest.model_validate(
+            {**run.model_dump(), "artifact_hashes": {"audit/run-1.json": "not-a-hash"}}
+        )
+
+
+def test_run_manifest_rejects_duplicate_problem_ids() -> None:
+    run = manifest()
+
+    with pytest.raises(ValidationError, match="problem IDs must be unique"):
+        RunManifest.model_validate(
+            {**run.model_dump(), "problem_ids": ["cf-1000-a", "cf-1000-a"]}
+        )
+
+
+@pytest.mark.parametrize("timestamp_field", ["created_at", "updated_at"])
+def test_run_manifest_rejects_naive_timestamps_with_actual_field_name(
+    timestamp_field: str,
+) -> None:
+    run = manifest()
+
+    with pytest.raises(ValidationError, match=rf"{timestamp_field} must include a timezone"):
+        RunManifest.model_validate(
+            {**run.model_dump(), timestamp_field: datetime(2026, 8, 21)}
+        )
+
+
+def test_contracts_remain_deeply_immutable_after_validation() -> None:
+    record = problem()
+    solution = trace()
+    run = manifest()
+
+    with pytest.raises(ValidationError):
+        record.generated_tests[0].test_id = "mutated"
+    with pytest.raises(AttributeError):
+        solution.steps.append(solution.steps[0])
+    with pytest.raises(TypeError):
+        run.artifact_hashes["audit/run-1.json"] = "0" * 64
+    with pytest.raises(TypeError):
+        run.model_parameters["temperature"] = 0.9
