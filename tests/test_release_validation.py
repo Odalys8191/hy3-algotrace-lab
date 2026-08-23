@@ -83,13 +83,13 @@ def test_release_validation_detects_generic_credential_assignment() -> None:
         )
 
 
-def test_release_validation_fixture_allowlist_requires_exact_path_and_identifier() -> None:
-    """The sole redaction fixture cannot become a broad test-directory exemption."""
+def test_release_validation_fixture_allowlist_requires_exact_path_identifier_and_value() -> None:
+    """The sole fixture is pinned, so a changed secret cannot hide behind its name."""
 
     safe_files = {
         "README.md": "个人活动实战作品，非腾讯官方发布\n",
         "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
-        "tests/test_run_service.py": 'raw_secret = "fixture-only-value"\n',
+        "tests/test_run_service.py": 'raw_secret = "background-secret-HY3_API_KEY"\n',
     }
     assert validate_release_files(safe_files).secret_findings == ()
 
@@ -104,6 +104,38 @@ def test_release_validation_fixture_allowlist_requires_exact_path_and_identifier
                     path: f'{name} = "not-an-allowed-fixture"\n',
                 }
             )
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                **safe_files,
+                "tests/test_run_service.py": 'raw_secret = "changed-fixture-value"\n',
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "api_key=live-value-not-a-placeholder",
+        "token=live-value-not-a-placeholder",
+        "secret=live-value-not-a-placeholder",
+        "password=live-value-not-a-placeholder",
+        "private_key=live-value-not-a-placeholder",
+        "credential=live-value-not-a-placeholder",
+    ),
+)
+def test_release_validation_rejects_lowercase_bare_secret_names(assignment: str) -> None:
+    """Lowercase bare names cannot bypass the checked-in secret scanner."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": assignment + "\n",
+            }
+        )
 
 
 @pytest.mark.parametrize(

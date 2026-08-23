@@ -9,6 +9,7 @@ permissions:
 
 jobs:
   unit:
+    name: Unit and static checks (non-release development dependencies)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -19,11 +20,10 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: python -m ruff format --check src/hy3_algotrace/release_validation.py src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py docker/verify-runtime-lock.py tests/test_release_validation.py tests/test_demo_cli.py tests/test_local_release_wiring.py
+      - run: python -m ruff format --check src/hy3_algotrace/release_validation.py src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py src/hy3_algotrace/ci_stub_app.py docker/verify-runtime-lock.py tests/test_release_validation.py tests/test_demo_cli.py tests/test_local_release_wiring.py tests/test_runtime_lock.py tests/test_docker_judge_integration.py
       - run: python -m ruff check .
       - run: python -m mypy src
-      - run: python -m pytest -q
-      - run: python -m pytest -q tests/test_api.py
+      - run: python -m pytest -q -m "not docker_integration"
       - run: python -m hy3_algotrace.release_validation --root .
       - name: Report formal-data readiness honestly
         run: |
@@ -31,6 +31,15 @@ jobs:
           scripts/formal-readiness.sh
           result=$?
           test "$result" -eq 3
+
+  formal-release:
+    name: Formal release gate (blocked until Task 7 evidence replay)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - run: scripts/formal-release-gate.sh
 
   docker:
     if: >-
@@ -56,6 +65,8 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
+      - name: Exercise the real Docker Judge verdict matrix
+        run: python -m pytest -q -m docker_integration
       - name: Build both pinned images and run local-only Compose/API smoke checks
         run: scripts/docker-smoke.sh
 
@@ -82,3 +93,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
+      - name: Fail closed if the pinned action cannot provide a full-history scanner
+        run: |
+          scanner="$(find "$RUNNER_TEMP" -type f -name gitleaks -perm -u+x -print -quit)"
+          test -n "$scanner"
+          "$scanner" detect --source . --log-opts="--full-history --all --diff-filter=tuxdb" --redact --config .gitleaks.toml --no-banner

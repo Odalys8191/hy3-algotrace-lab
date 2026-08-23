@@ -2,6 +2,9 @@
   "schema_version": 1,
   "lock_kind": "immutable_runtime_image",
   "python": "3.12",
+  "runtime_image_identity": "registry.invalid/hy3-algotrace/runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "docker_cli_package": "docker.io=UNATTESTED",
+  "content_sha256": "2d6bea88060149363a5546347461aade3d748aa71672f4a9066f0b5f336b022d",
   "distributions": {
     "altair": "6.2.2",
     "annotated-doc": "0.0.5",

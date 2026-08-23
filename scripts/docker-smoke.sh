@@ -1,5 +1,5 @@
 #!/bin/sh
-# CI-only smoke test: use repository Variables containing immutable public image metadata.
+# CI-only Docker integration test: no real Hy3 request is allowed to leave the runner.
 set -eu
 
 require_value() {
@@ -42,13 +42,15 @@ export HY3_DOCKER_SOCKET_PATH=/var/run/docker.sock
 export HY3_API_PORT=8000
 export HY3_UI_PORT=8501
 
-docker compose --profile ui config --format json > /tmp/hy3-compose.json
+compose_args='-f compose.yaml -f docker/ci/compose.stub.yaml'
+docker compose $compose_args config --format json > /tmp/hy3-compose.json
 python -m hy3_algotrace.release_validation --root . --rendered-compose /tmp/hy3-compose.json
 
-docker build --file docker/app/Dockerfile --tag hy3-algotrace-local:ci .
-docker run --rm hy3-algotrace-local:ci python -c \
-    'import fastapi, streamlit, uvicorn; import hy3_algotrace.local_app'
-docker run --rm hy3-algotrace-local:ci streamlit --version
+docker build \
+    --file docker/app/Dockerfile \
+    --build-arg "HY3_APP_RUNTIME_IMAGE=$HY3_APP_RUNTIME_IMAGE" \
+    --build-arg "HY3_DOCKER_CLI_PACKAGE=$HY3_DOCKER_CLI_PACKAGE" \
+    --tag hy3-algotrace-local:ci .
 
 validator_repository=${HY3_JUDGE_VALIDATOR_IMAGE%@sha256:*}
 validator_digest=${HY3_JUDGE_VALIDATOR_IMAGE#*@sha256:}
@@ -59,3 +61,31 @@ docker build --file docker/judge/Dockerfile --tag hy3-algotrace-judge:ci \
     --build-arg "JUDGE_TIME_PACKAGE=$HY3_JUDGE_TIME_PACKAGE" \
     --build-arg "JUDGE_UTIL_LINUX_PACKAGE=$HY3_JUDGE_UTIL_LINUX_PACKAGE" \
     docker/judge
+
+cleanup() {
+    docker compose $compose_args down --volumes --remove-orphans >/dev/null 2>&1 || true
+    rm -f /tmp/hy3-compose.json /tmp/hy3-run.json
+}
+trap cleanup EXIT INT TERM
+
+# The override runs ci_stub_app: it creates a deterministic fixture catalog and in-process
+# generator/reviewer/Judge.  It exercises normal public HTTP routes but never reads HY3_BASE_URL
+# or sends a credential.  It is not a formal data, model, or Judge-success claim.
+docker compose $compose_args up --detach --no-build api
+attempt=0
+until curl --fail --silent --show-error http://127.0.0.1:8000/api/v1/problems >/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 30 ]; then
+        docker compose $compose_args logs api >&2 || true
+        exit 1
+    fi
+    sleep 1
+done
+
+curl --fail --silent --show-error \
+    -H 'content-type: application/json' \
+    --data '{"schema_version":"1.2","mode":"solve_and_audit","problem_id":"cf-123-a"}' \
+    http://127.0.0.1:8000/api/v1/runs > /tmp/hy3-run.json
+run_id=$(python -c 'import json; print(json.load(open("/tmp/hy3-run.json"))["run_id"])')
+curl --fail --silent --show-error "http://127.0.0.1:8000/api/v1/runs/$run_id" > /tmp/hy3-run.json
+python -c 'import json; payload=json.load(open("/tmp/hy3-run.json")); assert payload["status"] == "completed"; assert payload["report"]["audit"]["final_correct"] is True'

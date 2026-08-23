@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -28,9 +29,10 @@ REQUIRED_RELEASE_FILES = (
     "docs/results-report-template.md",
     "docs/audit-record-template.md",
 )
-_SECRET_NAME = r"(?:API(?:_|)?KEY|TOKEN|SECRET|PASSWORD|PRIVATE(?:_|)?KEY|CREDENTIAL)"
+_SECRET_NAME = r"(?:API(?:_)?KEY|TOKEN|SECRET|PASSWORD|PRIVATE(?:_)?KEY|CREDENTIAL)"
 _SECRET_ASSIGNMENT = re.compile(
-    rf"(?mi)^\s*(?:export\s+)?([A-Z][A-Z0-9_]*{_SECRET_NAME})\s*(?:=|:)\s*"
+    rf"(?mi)^\s*(?:export\s+)?((?:[A-Z][A-Z0-9_]*_)?{_SECRET_NAME})\s*"
+    r"(?:=|:(?!\s*[A-Za-z_][A-Za-z0-9_]*\s*=))\s*"
     r"[\"']?([^\s#\"']+)"
 )
 _AUTHORIZATION_VALUE = re.compile(r"(?mi)^\s*authorization\s*[:=]\s*bearer\s+([^\s#]+)")
@@ -40,9 +42,33 @@ _RUNTIME_LOCK_REQUIRED_DISTRIBUTIONS = frozenset(
     {"fastapi", "hatchling", "httpx", "pydantic", "streamlit", "uvicorn"}
 )
 _PINNED_VERSION = re.compile(r"\d+(?:[A-Za-z0-9.+!_-]*\d)?\Z")
+_IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$")
+_DOCKER_CLI_PACKAGE = re.compile(r"^docker\.io=[A-Za-z0-9][A-Za-z0-9.+:~_-]*$")
 # A deliberate redaction fixture proves that an asynchronous exception cannot publish a raw
-# secret. It is the only static source fixture exemption: both path and identifier must match.
-_CONTROLLED_TEST_SECRET_IDENTIFIERS = frozenset({("tests/test_run_service.py", "raw_secret")})
+# secret. It is the only static source fixture exemption: the exact path, identifier, and
+# SHA-256 of the literal must all match.  Keeping only a hash here prevents normal validation
+# output and checked-in configuration from carrying an additional credential-shaped value.
+_CONTROLLED_TEST_SECRET_FIXTURE_HASHES: Mapping[tuple[str, str], frozenset[str]] = {
+    ("tests/test_run_service.py", "raw_secret"): frozenset(
+        {"3026b4e31874bdeedee136f3218c8b01d582b3c5c3441abc5428abfe282a5357"}
+    ),
+    ("tests/test_hy3_client.py", "api_key"): frozenset(
+        {"62af8704764faf8ea82fc61ce9c4c3908b6cb97d463a634e9e587d7c885db0ef"}
+    ),
+    ("tests/test_hy3_client.py", "secret"): frozenset(
+        {
+            "ee0170808afdf2a667f3e398d32e0b1170cbb3cce1b59a612ceb319d3b4c58c1",
+            "462c923f754985d48d981dd2e96f80f1b52fc63d559e85d3d8ff46359fbba1d8",
+            "5e994cd14ad42b4a145d22333f9f11fa39c043cfd9dd8d29f4dfa81d120cbb0f",
+            "47b8168debb21e0c4dcfa23a637b64c383dfdd1182a266f08b8a3ec1c5a17a81",
+            "6dc32f71c439adef3bc4fdabcaa9655091066f74b24e962f57a8dc059b34540c",
+            "46eb33edd4e1008196a452ecd4868c9740e9578f8ccae364150b4765dbc51455",
+        }
+    ),
+    ("tests/test_run_redaction.py", "api_key"): frozenset(
+        {"8f88b76143815f0072152c06866f69b2ba7c49fd655987ea9a7b98d710bfd503"}
+    ),
+}
 
 
 class ReleaseValidationError(ValueError):
@@ -226,10 +252,18 @@ def _validate_runtime_lock(text: str) -> None:
     if not isinstance(payload, Mapping):
         raise ReleaseValidationError("runtime lock is invalid")
     distributions = payload.get("distributions")
+    expected_hash = payload.get("content_sha256")
     if (
         payload.get("schema_version") != 1
         or payload.get("lock_kind") != "immutable_runtime_image"
         or payload.get("python") != "3.12"
+        or not isinstance(payload.get("runtime_image_identity"), str)
+        or _IMAGE_REFERENCE.fullmatch(payload["runtime_image_identity"]) is None
+        or not isinstance(payload.get("docker_cli_package"), str)
+        or _DOCKER_CLI_PACKAGE.fullmatch(payload["docker_cli_package"]) is None
+        or not isinstance(expected_hash, str)
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_hash)
+        or expected_hash != _runtime_lock_hash(payload)
         or not isinstance(distributions, Mapping)
         or len(distributions) < 40
         or not _RUNTIME_LOCK_REQUIRED_DISTRIBUTIONS.issubset(distributions)
@@ -243,11 +277,24 @@ def _validate_runtime_lock(text: str) -> None:
         raise ReleaseValidationError("runtime lock is invalid")
 
 
+def _runtime_lock_hash(payload: Mapping[object, object]) -> str:
+    body = {key: value for key, value in payload.items() if key != "content_sha256"}
+    encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _find_secret_assignments(files: Mapping[str, str]) -> tuple[str, ...]:
     findings: set[str] = set()
     for path, text in files.items():
         for name, value in _SECRET_ASSIGNMENT.findall(text):
-            if (path, name.casefold()) in _CONTROLLED_TEST_SECRET_IDENTIFIERS:
+            expected_hash = _CONTROLLED_TEST_SECRET_FIXTURE_HASHES.get((path, name.casefold()))
+            if expected_hash is not None and (
+                hashlib.sha256(value.encode("utf-8")).hexdigest() in expected_hash
+            ):
+                continue
+            if _is_nonliteral_assignment(value):
                 continue
             if not _is_placeholder(value):
                 findings.add(f"secret-like value in {path} ({name})")
@@ -266,6 +313,12 @@ def _is_placeholder(value: str) -> bool:
         or normalized.startswith("<")
         or normalized.startswith("${")
     )
+
+
+def _is_nonliteral_assignment(value: str) -> bool:
+    """Do not mistake a source expression which fetches a secret for a literal secret."""
+
+    return value.startswith(("os.", "field(", "getenv(", "environ["))
 
 
 def _release_files(root: Path) -> tuple[Path, ...]:

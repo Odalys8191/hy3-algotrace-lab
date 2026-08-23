@@ -31,3 +31,12 @@ Persistent dataset and run artifacts are versioned JSON, serialized deterministi
 Shared contracts are versioned. Additive, backwards-compatible fields require a task-card decision and consumer review. Breaking changes require a new schema version, migration or reader strategy, focused compatibility tests, and sign-off from affected task owners. Historical artifacts remain readable according to their recorded schema version.
 
 The unpersisted pre-release `1.0` draft has no migration obligation. The reviewed `1.1` contract is superseded by frozen `1.2`: use `migrate_v1_1_to_v1_2` only when every new required field is already present in a versioned JSON mapping. The migration intentionally fails rather than inventing provenance, reviewer evidence, scores, or other semantics that cannot be inferred. After the `1.2` freeze, every breaking change requires a new version and an explicit reader or migration path before implementation.
+
+## Cross-task local UI contract
+
+Compose supplies the Streamlit client only `HY3_API_BASE_URL=http://api:8000`. The Task 6 client
+must read that variable as its editable default, reject credentials/userinfo/query/fragment, and
+fall back safely for malformed values. Task 5 confirmed that behavior on its branch; Task 8 does
+not claim the UI image/profile works until the combined tree contains
+`hy3_algotrace.streamlit_app`. The Streamlit container receives neither model credentials nor
+Docker socket, catalog, artifact, oracle, or hidden-test mounts.

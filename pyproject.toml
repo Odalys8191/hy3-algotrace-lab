@@ -29,6 +29,9 @@ packages = ["src/hy3_algotrace"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "docker_integration: requires a real Docker daemon and immutable Judge build inputs",
+]
 
 [tool.ruff]
 target-version = "py312"

@@ -21,6 +21,8 @@ from hy3_algotrace.docker_judge import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 IMAGE_CONTEXT = PROJECT_ROOT / "docker" / "judge"
 
+pytestmark = pytest.mark.docker_integration
+
 
 def _docker_daemon_unavailable_reason() -> str | None:
     try:
@@ -96,12 +98,8 @@ def _problem(*, time_limit_ms: int = 500) -> ProblemRecord:
         rating=1200,
         time_limit_ms=time_limit_ms,
         memory_limit_mb=128,
-        public_tests=(
-            ContractTestCase(test_id="public", input_data="1\n", expected_output="2\n"),
-        ),
-        hidden_tests=(
-            ContractTestCase(test_id="hidden", input_data="3\n", expected_output="6\n"),
-        ),
+        public_tests=(ContractTestCase(test_id="public", input_data="1\n", expected_output="2\n"),),
+        hidden_tests=(ContractTestCase(test_id="hidden", input_data="3\n", expected_output="6\n"),),
         generated_tests=(
             ContractTestCase(test_id="generated", input_data="5\n", expected_output="10\n"),
         ),
@@ -134,7 +132,7 @@ def _problem(*, time_limit_ms: int = 500) -> ProblemRecord:
             JudgeStatus.RUNTIME_ERROR,
         ),
         (
-            "#include <iostream>\nint main(){for(;;)std::cout<<\"xxxxxxxxxxxxxxxx\";}",
+            '#include <iostream>\nint main(){for(;;)std::cout<<"xxxxxxxxxxxxxxxx";}',
             JudgeStatus.AC,
             JudgeStatus.OUTPUT_LIMIT,
         ),
@@ -152,12 +150,8 @@ def test_real_docker_judge_verdict_matrix(
     expected_compile: JudgeStatus,
     expected_verdict: JudgeStatus,
 ) -> None:
-    backend = DockerCliBackend(
-        command_factory=DockerCommandFactory(image=docker_judge_image)
-    )
-    evidence = DockerJudge(backend=backend, output_limit_bytes=4096).judge(
-        _problem(), source
-    )
+    backend = DockerCliBackend(command_factory=DockerCommandFactory(image=docker_judge_image))
+    evidence = DockerJudge(backend=backend, output_limit_bytes=4096).judge(_problem(), source)
 
     assert evidence.compile_status is expected_compile
     assert evidence.verdict is expected_verdict
@@ -254,9 +248,7 @@ def test_direct_docker_build_cannot_bypass_pinned_inputs(
         )
 
 
-def test_created_container_disables_daemon_logging(
-    docker_judge_image: str, tmp_path: Path
-) -> None:
+def test_created_container_disables_daemon_logging(docker_judge_image: str, tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "main.cpp").write_text("int main() {}", encoding="utf-8")

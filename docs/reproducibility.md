@@ -5,8 +5,11 @@
 This branch does not establish that Task 7's 30-problem/165-sample data is complete. After that
 layer is independently integrated, `scripts/data-lint.sh` validates acquired validation/test
 bytes against their frozen manifest, and `scripts/formal-readiness.sh` replays acquisition,
-selection, bundle, and corpus lint gates. Either script exits `3` for an absent integration or
-missing input, which is explicitly **not ready**.
+selection, bundle, corpus, **and persisted/raw formal Judge evidence**. The final replay must
+derive its capability in memory from the complete hash-bound chain and prove exactly 30 gold,
+60 mutant, and 15 paradox cases. A persisted receipt cannot rehydrate eligibility; a
+`CorpusAuditReport` with pending evidence exits `3`. `scripts/formal-release-gate.sh` turns
+that not-ready signal into a release-blocking failure.
 
 Only original-English Codeforces records with standard stdin/stdout, source attribution,
 acquisition hashes, conversion/reviewer linkage, and 15-cell quota evidence can progress. The
@@ -26,9 +29,12 @@ Before one formal run, create an immutable configuration that binds, at minimum:
 - seed, bootstrap replicate count, and a reserved-call ledger with a hard limit of 500;
 - blind-export, reviewer assignment, replay, and delayed 20% re-review configuration.
 
-For Docker reproduction, bind the `docker/release-runtime-lock.json` content hash to the
-digest-pinned runtime image used by the app build, along with the exact Docker CLI package and
-Judge build arguments. A changed lock, runtime digest, package version, or Judge input creates a
+For Docker reproduction, bind the `docker/release-runtime-lock.json` canonical content hash to
+the digest-pinned runtime image used by the app build, along with the exact Docker CLI package
+and Judge build arguments. The verification compares the whole distribution set, so an extra
+package also invalidates the runtime. This branch carries only a `registry.invalid` sentinel:
+there is no obtainable attested runtime image yet, and that is a release blocker rather than a
+reproducibility claim. A changed lock, runtime digest, package version, or Judge input creates a
 new configuration; it never replaces a prior result.
 
 Reserve every remote model attempt before sending it; record transport failure and response

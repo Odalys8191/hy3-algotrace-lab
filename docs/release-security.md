@@ -9,10 +9,13 @@ The model boundary reads only `HY3_BASE_URL`, `HY3_API_KEY`, and `HY3_MODEL` at 
 runtime. The key is never a Docker build argument or artifact field. `.env.example` contains
 placeholders only; a real local `.env` remains ignored and is excluded from Docker build context.
 App runtime and Judge input images must use `repository@sha256` identities.
-`docker/release-runtime-lock.json` lists the complete Python 3.12 dependency closure; the
-immutable runtime image is verified against it and app installation uses `pip --no-deps`, so no
-mutable transitive resolution occurs in the app build. The image also requires an exact
-`docker.io=VERSION` package because the existing Judge backend invokes Docker by argv.
+`docker/release-runtime-lock.json` lists the complete Python 3.12 dependency closure; a future
+attested runtime image must include that exact closure **and Docker CLI**. The app build verifies
+the bound image identity, lock hash, Docker CLI package attestation, and rejects any missing,
+changed, or extra distribution before `pip --no-deps` installs this package. It performs no apt
+operation, so mutable distro transitives cannot slip in. The checked-in `registry.invalid`
+identity is intentionally not a runnable base image: release remains blocked until an
+obtainable attested runtime recipe/image is supplied.
 
 `docker compose up --build` is intentionally fail-closed if any required local runtime value,
 formal catalog, immutable Judge image, or socket path is absent. Run the checks below; both
@@ -57,6 +60,7 @@ decision—it is not resolved merely by deleting the current file.
 For a workstation with Gitleaks installed, run `scripts/security-scan.sh`; it scans `--all`
 history with redacted output and fails closed (`69`) if Gitleaks is absent.
 
-The Python release scanner has one separate, path-and-identifier allowlist entry:
-`tests/test_run_service.py:raw_secret`. That fixture tests secret redaction in an asynchronous
-failure path; the exception does not match a value pattern, a directory, or any other variable.
+The Python release scanner rejects bare lowercase and uppercase `api_key`, `token`, `secret`,
+`password`, `private_key`, and `credential` assignments as well as prefixed variants. Its test
+fixture exceptions are bound to exact file path, identifier, **and SHA-256 of the expected test
+literal**; changing a literal cannot reuse the exception.

@@ -6,7 +6,13 @@ import os
 import subprocess
 from pathlib import Path
 
-from hy3_algotrace.local_app import create_app
+import pytest
+from fastapi.testclient import TestClient
+from test_run_service import CleanReviews, FakeGenerator, FakeJudge, formal_bundle
+
+from hy3_algotrace.catalog import ProblemCatalog
+from hy3_algotrace.executor import SynchronousExecutor
+from hy3_algotrace.local_app import _judge_image_digest, create_app
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -19,6 +25,82 @@ def test_zero_argument_composition_factory_is_real_uvicorn_target() -> None:
     assert "hy3_algotrace.local_app:create_app" in compose
     for name in ("HY3_BASE_URL", "HY3_API_KEY", "HY3_MODEL"):
         assert f"{name}: ${{{name}:?" in compose
+
+
+@pytest.mark.parametrize(
+    ("image_reference", "expected"),
+    (
+        ("registry.example/hy3/judge@sha256:" + "a" * 64, "sha256:" + "a" * 64),
+        ("docker.io/acme/judge@sha256:" + "B" * 64, "sha256:" + "b" * 64),
+    ),
+)
+def test_judge_image_reference_is_reduced_to_a_bare_manifest_digest(
+    image_reference: str, expected: str
+) -> None:
+    """Run manifests never receive a repository-qualified image reference."""
+
+    assert _judge_image_digest(image_reference) == expected
+
+
+@pytest.mark.parametrize(
+    "image_reference",
+    ("", "latest", "sha256:" + "a" * 64, "repo:tag", "repo@sha256:not-a-digest"),
+)
+def test_judge_image_reference_requires_a_repository_digest(image_reference: str) -> None:
+    """A mutable or malformed Judge selection stops before any request exists."""
+
+    with pytest.raises(ValueError, match="HY3_JUDGE_IMAGE"):
+        _judge_image_digest(image_reference)
+
+
+def test_zero_argument_factory_accepts_real_post_without_partial_500(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The full Docker ref drives Docker while the persisted manifest stores its digest."""
+
+    image_reference = "registry.example/hy3/judge@sha256:" + "c" * 64
+    bundle = formal_bundle()
+    monkeypatch.setenv("HY3_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setenv("HY3_CATALOG_ROOT", str(tmp_path / "catalog"))
+    monkeypatch.setenv("HY3_BASE_URL", "https://hy3.example.test/v1")
+    monkeypatch.setenv("HY3_API_KEY", "YOUR_HY3_API_KEY")
+    monkeypatch.setenv("HY3_MODEL", "hy3-test")
+    monkeypatch.setenv("HY3_JUDGE_IMAGE", image_reference)
+    monkeypatch.setattr(
+        ProblemCatalog,
+        "from_directory",
+        staticmethod(lambda _directory: ProblemCatalog((bundle,))),
+    )
+    monkeypatch.setattr(
+        "hy3_algotrace.local_app.Hy3Client",
+        lambda *_args, **_kwargs: FakeGenerator(bundle.gold_trace),
+    )
+    monkeypatch.setattr("hy3_algotrace.local_app.DockerJudge", FakeJudge)
+    monkeypatch.setattr(
+        "hy3_algotrace.local_app.ReviewOrchestrator", lambda _client: CleanReviews()
+    )
+    monkeypatch.setattr(
+        "hy3_algotrace.local_app.InProcessBackgroundExecutor",
+        lambda **_kwargs: SynchronousExecutor(),
+    )
+
+    client = TestClient(create_app())
+    created = client.post(
+        "/api/v1/runs",
+        json={
+            "schema_version": "1.2",
+            "mode": "solve_and_audit",
+            "problem_id": bundle.record.problem_id,
+        },
+    )
+
+    assert created.status_code == 202
+    fetched = client.get(f"/api/v1/runs/{created.json()['run_id']}")
+    assert fetched.status_code == 200
+    transitions = tuple((tmp_path / "artifacts" / "runs").rglob("*.json"))
+    serialized = "\n".join(path.read_text(encoding="utf-8") for path in transitions)
+    assert image_reference not in serialized
+    assert "sha256:" + "c" * 64 in serialized
 
 
 def test_compose_only_publishes_loopback_and_requires_controlled_socket() -> None:
@@ -44,6 +126,59 @@ def test_docker_smoke_fails_closed_without_pinned_ci_inputs() -> None:
 
     assert result.returncode == 64
     assert "missing pinned Docker CI variable" in result.stderr
+
+
+def test_docker_integration_runs_built_api_with_controlled_http_fixture() -> None:
+    """The CI script must build both app args and exercise an actual Compose API POST."""
+
+    script = (REPOSITORY_ROOT / "scripts/docker-smoke.sh").read_text(encoding="utf-8")
+    assert '--build-arg "HY3_APP_RUNTIME_IMAGE=$HY3_APP_RUNTIME_IMAGE"' in script
+    assert '--build-arg "HY3_DOCKER_CLI_PACKAGE=$HY3_DOCKER_CLI_PACKAGE"' in script
+    assert "docker compose $compose_args up --detach --no-build api" in script
+    assert "ci_stub_app" in script
+    assert "http://127.0.0.1:8000/api/v1/problems" in script
+    assert "http://127.0.0.1:8000/api/v1/runs" in script
+
+
+def test_formal_readiness_stays_pending_without_task7_judge_replay() -> None:
+    """Selection/corpus lint alone can never convert a missing Judge replay into green."""
+
+    result = subprocess.run(
+        ["sh", "scripts/formal-readiness.sh"],
+        cwd=REPOSITORY_ROOT,
+        env={"PATH": os.environ["PATH"]},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 3
+    assert "dataset CLI" in result.stderr
+
+
+def test_task7_combined_tree_contract_uses_current_secure_selection_commands() -> None:
+    """Task 8 may use Task 7's secure receipt, but cannot mistake it for eligibility."""
+
+    script = (REPOSITORY_ROOT / "scripts/formal-readiness.sh").read_text(encoding="utf-8")
+    assert "validate-selection-preliminary" in script
+    assert "verify-selection-chain" in script
+    assert "capability_persisted=false" in script
+    assert "validate_persisted_formal_judge_evidence" in script
+    assert "formal_judge_cli" not in script
+    data_lint = (REPOSITORY_ROOT / "scripts/data-lint.sh").read_text(encoding="utf-8")
+    assert "validate-acquisition" in data_lint
+    assert "--validation-id" not in data_lint
+
+
+def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates() -> None:
+    """A missing daemon or pending formal evidence cannot be silently called CI success."""
+
+    workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert 'python -m pytest -q -m "not docker_integration"' in workflow
+    assert "python -m pytest -q -m docker_integration" in workflow
+    assert "scripts/formal-release-gate.sh" in workflow
+    assert "docker-release-not-ready" in workflow
+    assert "--full-history --all --diff-filter=tuxdb" in workflow
 
 
 def test_app_image_uses_a_complete_immutable_runtime_lock() -> None:

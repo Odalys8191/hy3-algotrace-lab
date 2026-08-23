@@ -1,0 +1,5 @@
+# Docker CI only: removes all external-model traffic while exercising the real public API routes.
+services:
+  api:
+    command:
+      ["python", "-m", "uvicorn", "hy3_algotrace.ci_stub_app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]

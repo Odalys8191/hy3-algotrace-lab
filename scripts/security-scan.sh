@@ -7,4 +7,6 @@ if ! command -v gitleaks >/dev/null 2>&1; then
     exit 69
 fi
 
-exec gitleaks detect --source . --log-opts="--all" --redact --config .gitleaks.toml --no-banner
+exec gitleaks detect --source . \
+    --log-opts="--full-history --all --diff-filter=tuxdb" \
+    --redact --config .gitleaks.toml --no-banner

@@ -48,7 +48,7 @@ python3.12 -m venv .venv
 . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e '.[dev]'
-python -m pytest -q
+python -m pytest -q -m "not docker_integration"
 python -m ruff format --check src/hy3_algotrace/release_validation.py \
   src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py \
   docker/verify-runtime-lock.py tests/test_release_validation.py \
@@ -57,7 +57,8 @@ python -m ruff check .
 python -m mypy src
 python -m hy3_algotrace.release_validation --root .
 scripts/security-scan.sh
-scripts/formal-readiness.sh
+scripts/formal-readiness.sh # exits 3 while the persisted Task 7 Judge replay is absent
+scripts/formal-release-gate.sh # turns that pending state into a release-blocking failure
 ```
 
 The last command exits `3` while the Task 7 data layer or its frozen inputs are absent. That is
@@ -75,16 +76,20 @@ docker compose config
 docker compose up --build
 ```
 
-`--build` corresponds to `docker/app/Dockerfile`: a digest-pinned Python 3.12 runtime image
-already contains the complete transitive dependency set in
-`docker/release-runtime-lock.json`, including Uvicorn and Streamlit. The Dockerfile verifies
-every recorded distribution before installing this package with `--no-deps`, so it does not
-resolve mutable Python transitives during the app build. It also installs an exact distro Docker
-CLI package. The build refuses an unpinned `repository@sha256` runtime image or a non-exact
-Docker package. The API starts through `hy3_algotrace.local_app:create_app --factory`, whose
-composition is zero-arg and uses the existing catalog, artifact store, Hy3 client, Docker Judge,
-reviewer, and background executor. It still fails closed before formal use if the catalog,
-`HY3_BASE_URL`, `HY3_API_KEY`, `HY3_MODEL`, or immutable `HY3_JUDGE_IMAGE` is unavailable.
+`--build` corresponds to `docker/app/Dockerfile`, but this branch deliberately has **no
+attested public runtime-image digest or complete release wheelhouse**. The checked-in runtime
+lock is a `registry.invalid` release-blocker sentinel, so Docker build must fail until a
+maintainer produces and signs an obtainable Python 3.12 runtime image. That image must already
+contain the complete locked Python closure **and Docker CLI**; the app Dockerfile runs no apt or
+pip dependency resolution. It compares the locked runtime identity, canonical lock hash, exact
+Docker CLI package attestation, and the complete installed distribution set (including rejecting
+extras) before installing this package with `--no-deps`.
+
+Once that attestation exists, the API starts through
+`hy3_algotrace.local_app:create_app --factory`, whose composition is zero-arg and uses the
+existing catalog, artifact store, Hy3 client, Docker Judge, reviewer, and background executor.
+It still fails closed before formal use if the catalog, `HY3_BASE_URL`, `HY3_API_KEY`,
+`HY3_MODEL`, or immutable `HY3_JUDGE_IMAGE` is unavailable.
 
 After the Task 6 controller merge supplies the anticipated module, start the client with:
 
@@ -114,9 +119,15 @@ scripts/data-lint.sh
 scripts/formal-readiness.sh
 ```
 
-`data-lint.sh` validates immutable validation/test acquisition bytes and hashes; the readiness
-command replays selection, bundle, and corpus lint gates. It requires paths supplied through
-documented local environment variables and does not create fake data. Only original-English,
+`data-lint.sh` validates immutable validation/test acquisition bytes and hashes. Formal
+readiness additionally requires Task 7's persisted formal Judge evidence plus protected raw
+JudgeEvidence replay, which proves the frozen 30 gold / 60 mutant / 15 paradox chain in-memory.
+A `CorpusAuditReport` saying evidence is pending exits `3`; selection/bundle/corpus lint alone
+can never return formal success. Task 7 currently exposes secure
+`validate-selection-preliminary` and `verify-selection-chain` commands only; its persisted
+selection receipt expressly has `capability_persisted=false`. A combined-tree in-process formal
+Judge replay adapter is still required, so this release remains blocked. It requires paths
+supplied through documented local environment variables and does not create fake data. Only original-English,
 standard-stdin/stdout Codeforces entries with source attribution may be candidates. Project-
 authored references are allowed; raw third-party submitted solutions are not redistributed.
 
@@ -148,10 +159,12 @@ results, and audit templates in `docs/`; they intentionally contain no claimed o
 - Bootstrap intervals are descriptive under their stated IID-row assumption; correlated rows
   and contamination mean model comparisons are relative baselines, not causal claims.
 
-The Docker release CI is deliberately **not green** until seven public, non-secret repository
-Variables provide the locked runtime image, exact Docker CLI package, and immutable Judge build
-inputs documented in `scripts/docker-smoke.sh`. With all seven set, it builds and checks the
-app/Judge images; without them, the named `docker-release-not-ready` job fails explicitly.
+The Docker release CI is deliberately **not green**. Seven public, non-secret repository
+Variables are required to run its actual Compose/API controlled-fixture integration and real
+Judge verdict matrix; absent inputs fail in `docker-release-not-ready`. Even with those inputs,
+the formal-release gate and the deliberately unattested runtime lock prevent a release claim
+until independently provided Task 7 replay evidence and a real runtime-image attestation are
+committed.
 
 Read [release security](docs/release-security.md), [reproducibility](docs/reproducibility.md),
 [attribution](docs/license-and-attribution.md), and the [unrecorded demo checklist](docs/demo.md)
