@@ -80,11 +80,13 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
         update={
             "problem_understanding": (
                 "Keep the input invariant; quoted path is "
-                '"/private/tmp/judge workspace/solution.cpp".'
+                '"/private/tmp/judge workspace/solution.cpp" and config is '
+                '"/etc/passwd".'
             ),
             "algorithm": (
                 "The symbolic token /variable stays; add exactly one to x; "
-                "cache is (/var/lib/judge cache/case file.txt)."
+                "cache is (/var/lib/judge cache/case file.txt) and tools are "
+                "(/usr/local/bin)."
             ),
             "correctness_argument": (
                 "The arithmetic proof remains valid; "
@@ -99,7 +101,10 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
             "code": (
                 '#include <iostream>\n// source="/private/tmp/build dir/main.cpp"\n'
                 "// HY3 API KEY is code-secret\n"
-                "int main(){long long x;std::cin>>x;std::cout<<x+1;}"
+                "// comment stays\n"
+                'const char* url="https://example.com/a/b";\n'
+                "int main(){long long x,variable;std::cin>>x;"
+                "long long ratio=x / variable;std::cout<<x+1;}"
             ),
         }
     )
@@ -133,6 +138,9 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
         "the arithmetic proof remains valid",
         "therefore every output is correct",
         "#include <iostream>",
+        "// comment stays",
+        "https://example.com/a/b",
+        "ratio=x / variable",
         "std::cout<<x+1",
     ):
         assert normal_fragment in serialized
@@ -140,6 +148,8 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
         "/private/tmp",
         "/var/lib",
         "/users/odalys",
+        "/etc/passwd",
+        "/usr/local/bin",
         "judge workspace",
         "judge cache",
         "natural-secret",
