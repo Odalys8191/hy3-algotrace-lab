@@ -1,0 +1,49 @@
+# Local integration template. It deliberately fails until Task 5/Task 6 entry points exist.
+services:
+  api:
+    image: python:3.12-slim
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace:ro
+      - hy3_artifacts:/artifacts
+    environment:
+      HY3_ARTIFACT_ROOT: /artifacts/runs
+      HY3_API_APP_MODULE: ${HY3_API_APP_MODULE:-YOUR_TASK5_APP_FACTORY}
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test "$${HY3_API_APP_MODULE}" != "YOUR_TASK5_APP_FACTORY" || {
+          echo "Task 5 FastAPI factory is required; refusing placeholder startup" >&2; exit 64;
+        }
+        python -m uvicorn "$${HY3_API_APP_MODULE}" --factory --host 0.0.0.0 --port 8000
+    ports:
+      - "127.0.0.1:${HY3_API_PORT:-8000}:8000"
+
+  streamlit:
+    profiles: ["ui"]
+    image: python:3.12-slim
+    working_dir: /workspace
+    volumes:
+      - ./:/workspace:ro
+    environment:
+      HY3_STREAMLIT_APP_PATH: ${HY3_STREAMLIT_APP_PATH:-YOUR_TASK6_STREAMLIT_APP_PATH}
+      HY3_API_BASE_URL: http://api:8000
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test "$${HY3_STREAMLIT_APP_PATH}" != "YOUR_TASK6_STREAMLIT_APP_PATH" || {
+          echo "Task 6 Streamlit app is required; refusing placeholder startup" >&2; exit 64;
+        }
+        test -f "$${HY3_STREAMLIT_APP_PATH}" || {
+          echo "Configured Streamlit app path is absent; refusing startup" >&2; exit 64;
+        }
+        streamlit run "$${HY3_STREAMLIT_APP_PATH}" --server.address 0.0.0.0 --server.port 8501
+    ports:
+      - "127.0.0.1:${HY3_UI_PORT:-8501}:8501"
+    depends_on:
+      - api
+
+volumes:
+  hy3_artifacts:
