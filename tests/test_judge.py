@@ -80,7 +80,10 @@ class _FakeBackend:
         assert output_limit_bytes > 0
         input_data = (input_dir / "input.txt").read_text(encoding="utf-8")
         self.executed_inputs.append(input_data)
-        return self._outcomes[input_data]
+        outcome = self._outcomes[input_data]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
 
 
 class _BrokenBackend:
@@ -100,6 +103,26 @@ class _BrokenRuntimeBackend:
     def execute(self, *, workspace: Path, **kwargs: Any) -> Any:
         del kwargs
         raise OSError(f"runtime docker failed in {workspace}")
+
+
+class _OverflowRuntimeBackend(_BrokenRuntimeBackend):
+    def execute(self, *, workspace: Path, **kwargs: Any) -> Any:
+        del workspace, kwargs
+        raise OverflowError("runtime limit cannot be represented")
+
+
+class _BrokenCaseSetupBackend:
+    def __init__(self, module: Any) -> None:
+        self._module = module
+
+    def compile(self, *, workspace: Path, memory_limit_mb: int) -> Any:
+        del memory_limit_mb
+        (workspace / "case-0000").write_text("blocks case directory", encoding="utf-8")
+        return self._module.CompileOutcome(status=JudgeStatus.AC)
+
+    def execute(self, **kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("execute must not run when case setup fails")
 
 
 def test_judge_runs_only_hidden_and_generated_tests_for_final_verdict(tmp_path: Path) -> None:
@@ -181,6 +204,66 @@ def test_wrong_answer_exposes_safe_input_but_never_hidden_expected_output(tmp_pa
     assert str(tmp_path) not in serialized
     assert "\x1b" not in serialized
     assert "expected output" in evidence.tests[0].diagnostics
+
+
+def test_only_first_failure_exposes_a_counterexample(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = (
+        ContractTestCase(test_id="hidden-1", input_data="SECRET_ONE\n", expected_output="1\n"),
+        ContractTestCase(test_id="hidden-2", input_data="SECRET_TWO\n", expected_output="2\n"),
+    )
+    backend = _FakeBackend(
+        module,
+        outcomes={
+            test.input_data: module.ExecutionOutcome(status=JudgeStatus.AC, stdout="wrong\n")
+            for test in hidden
+        },
+    )
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _problem(hidden_tests=hidden),
+        "int main() {}",
+    )
+    serialized = evidence.model_dump_json()
+
+    assert evidence.first_counterexample_input == "SECRET_ONE\n"
+    assert evidence.tests[0].counterexample_input == "SECRET_ONE\n"
+    assert evidence.tests[1].counterexample_input is None
+    assert "SECRET_TWO" not in serialized
+
+
+def test_runtime_stderr_cannot_exfiltrate_hidden_inputs(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = (
+        ContractTestCase(test_id="hidden-1", input_data="SECRET_ONE\n", expected_output="1\n"),
+        ContractTestCase(test_id="hidden-2", input_data="SECRET_TWO\n", expected_output="2\n"),
+    )
+    backend = _FakeBackend(
+        module,
+        outcomes={
+            "SECRET_ONE\n": module.ExecutionOutcome(
+                status=JudgeStatus.AC,
+                stdout="1\n",
+                diagnostics="EXFIL:SECRET_ONE\n",
+            ),
+            "SECRET_TWO\n": module.ExecutionOutcome(
+                status=JudgeStatus.AC,
+                stdout="2\n",
+                diagnostics="EXFIL:SECRET_TWO\n",
+            ),
+        },
+    )
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _problem(hidden_tests=hidden),
+        "int main() {}",
+    )
+    serialized = evidence.model_dump_json()
+
+    assert evidence.verdict is JudgeStatus.AC
+    assert all(test.diagnostics == "" for test in evidence.tests)
+    assert "SECRET_ONE" not in serialized
+    assert "SECRET_TWO" not in serialized
 
 
 @pytest.mark.parametrize(
@@ -292,3 +375,138 @@ def test_runtime_backend_failure_has_no_false_counterexample(tmp_path: Path) -> 
     assert evidence.tests[0].counterexample_input is None
     assert str(tmp_path) not in evidence.diagnostics
     assert "runtime docker failed" in evidence.diagnostics
+
+
+def test_any_runtime_infrastructure_error_dominates_an_earlier_wa(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = (
+        ContractTestCase(test_id="hidden-1", input_data="1\n", expected_output="2\n"),
+        ContractTestCase(test_id="hidden-2", input_data="2\n", expected_output="4\n"),
+    )
+    backend = _FakeBackend(
+        module,
+        outcomes={
+            "1\n": module.ExecutionOutcome(status=JudgeStatus.AC, stdout="wrong\n"),
+            "2\n": OSError("docker daemon disappeared"),
+        },
+    )
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _problem(hidden_tests=hidden),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.first_counterexample_input is None
+    assert evidence.diagnostics == "docker daemon disappeared"
+
+
+def test_invalid_temp_root_fails_closed_as_infrastructure_evidence(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+    missing_root = tmp_path / "missing"
+
+    evidence = module.DockerJudge(temp_root=missing_root).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.compile_status is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.tests == ()
+    assert str(tmp_path) not in evidence.diagnostics
+
+
+def test_runtime_arithmetic_failure_fails_closed(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+
+    evidence = module.DockerJudge(
+        backend=_OverflowRuntimeBackend(module), temp_root=tmp_path
+    ).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.first_counterexample_input is None
+    assert evidence.diagnostics == "runtime limit cannot be represented"
+
+
+def test_symlink_loop_temp_root_fails_closed(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.symlink_to(second, target_is_directory=True)
+    second.symlink_to(first, target_is_directory=True)
+
+    evidence = module.DockerJudge(temp_root=first).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.tests == ()
+    assert str(tmp_path) not in evidence.diagnostics
+
+
+def test_per_test_workspace_setup_failure_fails_closed(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+
+    evidence = module.DockerJudge(
+        backend=_BrokenCaseSetupBackend(module), temp_root=tmp_path
+    ).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.first_counterexample_input is None
+    assert str(tmp_path) not in evidence.diagnostics
+
+
+def test_pydantic_evidence_validation_failure_is_fixed_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+    backend = _FakeBackend(
+        module,
+        outcomes={
+            "1\n": module.ExecutionOutcome(
+                status=JudgeStatus.AC,
+                stdout="2\n",
+                time_ms=-1,
+                memory_kb=-1,
+            )
+        },
+    )
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.first_counterexample_input is None
+    assert evidence.tests[0].diagnostics == "Trusted runtime metadata is invalid or missing."
+
+
+def test_any_pydantic_judge_construction_failure_is_fixed_infrastructure_error(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="2\n")
+    backend = _FakeBackend(module, compile_status="forged-status")
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _problem(hidden_tests=(hidden,)),
+        "int main() {}",
+    )
+
+    assert evidence.compile_status is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
+    assert evidence.tests == ()
+    assert evidence.diagnostics == "Trusted runtime metadata is invalid or missing."
