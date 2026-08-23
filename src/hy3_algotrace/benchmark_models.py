@@ -438,14 +438,40 @@ class ArtifactHashEntry(BenchmarkModel):
     content_hash: str = Field(min_length=64, max_length=64, strict=True)
 
 
+class FormalIntegrationCandidate(BenchmarkModel):
+    """Untrusted Task-6 output for a future combined Task-7 verifier."""
+
+    schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    kind: Literal["task6_formal_integration_candidate"] = "task6_formal_integration_candidate"
+    benchmark_id: str = Field(min_length=1, strict=True)
+    config_hash: str = Field(min_length=64, max_length=64, strict=True)
+    observation_hashes: tuple[str, ...] = Field(min_length=165, max_length=165)
+    human_label_hashes: tuple[str, ...] = Field(min_length=165, max_length=165)
+    ledger_index_hash: str = Field(min_length=64, max_length=64, strict=True)
+    remote_attempts_used: int = Field(ge=390, le=500, strict=True)
+
+    @model_validator(mode="after")
+    def validate_hashes(self) -> Self:
+        hashes = (
+            self.config_hash,
+            *self.observation_hashes,
+            *self.human_label_hashes,
+            self.ledger_index_hash,
+        )
+        if any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in hashes):
+            raise ValueError("formal candidate hashes must be lowercase SHA-256")
+        return self
+
+
 class BenchmarkRunReport(BenchmarkModel):
     schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
     benchmark_id: str = Field(min_length=1, strict=True)
     execution_kind: BenchmarkExecutionKind
     status: BenchmarkStatus
     complete: bool = Field(strict=True)
-    formal_eligible: bool = Field(strict=True)
-    formal_evidence_verified: bool = Field(strict=True)
+    formal_candidate_complete: bool = Field(strict=True)
+    formal_eligible: Literal[False] = False
+    formal_evidence_verified: Literal[False] = False
     formal_attempt_profile_valid: bool = Field(strict=True)
     completed_sample_ids: tuple[str, ...]
     remote_attempts_used: int = Field(ge=0, strict=True)
@@ -455,14 +481,12 @@ class BenchmarkRunReport(BenchmarkModel):
     def validate_status(self) -> Self:
         if self.complete is not (self.status is BenchmarkStatus.COMPLETE):
             raise ValueError("complete flag must match benchmark status")
-        if self.formal_eligible and (
+        if self.formal_candidate_complete and (
             not self.complete
-            or not self.formal_evidence_verified
             or not self.formal_attempt_profile_valid
+            or self.execution_kind is not BenchmarkExecutionKind.LIVE
         ):
-            raise ValueError("formal eligibility requires complete evidence and attempt profile")
-        if self.formal_evidence_verified and not self.complete:
-            raise ValueError("partial benchmark cannot verify formal evidence")
+            raise ValueError("formal candidate requires a complete live run and attempt profile")
         return self
 
 

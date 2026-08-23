@@ -1,28 +1,22 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import ValidationError
 from test_hy3_client import problem
 from test_metrics import literal_human_labels, literal_rows
-from test_run_service import clean_verdict, valid_trace
 
-from hy3_algotrace.api_models import InternalRunReport, RunMode
+import hy3_algotrace.benchmark as benchmark_module
 from hy3_algotrace.artifacts import ArtifactExistsError, ArtifactStore, sha256_json
 from hy3_algotrace.benchmark import (
     ArtifactAttemptLedger,
     BenchmarkRunner,
     BudgetExceededError,
-    FormalRunArtifacts,
     RemoteAttemptBudget,
-    Task7FormalBenchmarkCapability,
-    _validate_formal_run_binding,
 )
 from hy3_algotrace.benchmark_models import (
     BenchmarkConfig,
@@ -35,14 +29,7 @@ from hy3_algotrace.benchmark_models import (
     SampleKind,
     VerifiedDataEvidence,
 )
-from hy3_algotrace.contracts import (
-    AuditReport,
-    ErrorTaxonomy,
-    JudgeEvidence,
-    JudgeStatus,
-    RatingBand,
-    Topic,
-)
+from hy3_algotrace.contracts import ErrorTaxonomy, RatingBand, Topic
 from hy3_algotrace.hy3_client import Hy3AttemptContext, Hy3Client, Hy3Config
 
 
@@ -199,6 +186,22 @@ def formal_profile(
     )
 
 
+def formal_human_labels(
+    rows: tuple[MetricObservation, ...],
+) -> tuple[HumanConfirmedLabel, ...]:
+    return tuple(
+        HumanConfirmedLabel(
+            sample_id=row.sample_id,
+            final_correct=row.gold_final_correct,
+            process_valid=row.gold_process_valid,
+            first_error_step=row.gold_first_error_step,
+            taxonomy=row.gold_taxonomy,
+        )
+        for row in rows
+        if row.gold_final_correct is not None and row.gold_process_valid is not None
+    )
+
+
 def test_config_freezes_static_lower_bound_and_exact_formal_profile() -> None:
     frozen, _ = formal_profile()
 
@@ -282,7 +285,7 @@ def test_returned_observation_must_match_frozen_problem_kind_and_strata(
         ).run(lambda _sample_id, _observer: wrong)
 
 
-def test_formal_complete_run_needs_external_verified_evidence_gate(
+def test_standalone_task6_cannot_turn_forged_165_sample_390_attempt_run_formal(
     tmp_path: Path,
 ) -> None:
     benchmark_config, rows = formal_profile(benchmark_id="formal-gated")
@@ -290,6 +293,7 @@ def test_formal_complete_run_needs_external_verified_evidence_gate(
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id="formal-gated")
     budget = RemoteAttemptBudget(limit=390, event_sink=ledger.record, benchmark_id="formal-gated")
     by_id = {row.sample_id: row for row in rows}
+    human_labels = formal_human_labels(rows)
 
     def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
         spec = next(item for item in benchmark_config.sample_specs if item.sample_id == sample_id)
@@ -314,15 +318,27 @@ def test_formal_complete_run_needs_external_verified_evidence_gate(
         artifacts=artifacts,
         budget=budget,
         ledger=ledger,
+        human_labels=human_labels,
     ).run(execute)
 
     assert self_authored.complete is True
+    assert self_authored.remote_attempts_used == 390
     assert self_authored.formal_attempt_profile_valid is True
     assert self_authored.formal_evidence_verified is False
     assert self_authored.formal_eligible is False
+    assert self_authored.formal_candidate_complete is True
+    candidate = artifacts.read_json("benchmarks/formal-gated/formal-candidate.json")
+    assert "formal_eligible" not in candidate
+    assert "eligible" not in candidate
+    for forbidden_name in (
+        "_TASK7_BRIDGE_TOKEN",
+        "Task7FormalBenchmarkCapability",
+        "issue_task7_formal_benchmark_capability",
+    ):
+        assert not hasattr(benchmark_module, forbidden_name)
 
 
-def test_zero_observer_calls_and_public_capability_construction_never_become_formal(
+def test_zero_observer_calls_never_become_formal_candidate(
     tmp_path: Path,
 ) -> None:
     benchmark_config, rows = formal_profile(benchmark_id="formal-zero-attempts")
@@ -347,8 +363,7 @@ def test_zero_observer_calls_and_public_capability_construction_never_become_for
     assert report.formal_attempt_profile_valid is False
     assert report.formal_evidence_verified is False
     assert report.formal_eligible is False
-    with pytest.raises(ValueError, match="integrated Task-7 bridge"):
-        Task7FormalBenchmarkCapability(_bridge_token=object())
+    assert report.formal_candidate_complete is False
 
 
 def test_unpersisted_attempt_events_cannot_satisfy_formal_ledger_profile(
@@ -399,89 +414,6 @@ def test_unpersisted_attempt_events_cannot_satisfy_formal_ledger_profile(
         artifacts.read_json("benchmarks/formal-unpersisted-ledger/ledger-index.json")["event_paths"]
         == []
     )
-
-
-def test_formal_run_binding_covers_run_audit_reviewer_and_ui_flag_fields() -> None:
-    trace = valid_trace()
-    trace_bytes = trace.model_dump_json().encode("utf-8")
-    source_bytes = trace.code.encode("utf-8")
-    judge = JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
-    audit = AuditReport(
-        run_id="run-1",
-        problem_id=trace.problem_id,
-        trace_id=trace.trace_id,
-        judge_evidence=judge,
-        reviewer_verdicts=(
-            clean_verdict(trace, "logic-reviewer"),
-            clean_verdict(trace, "adversarial-reviewer"),
-        ),
-        final_correct=True,
-        process_score=100.0,
-        process_valid=True,
-    )
-    internal = InternalRunReport(
-        run_id="run-1",
-        problem_id=trace.problem_id,
-        mode=RunMode.AUDIT,
-        trace=trace,
-        audit_report=audit,
-    )
-    observation = literal_rows()[0].model_copy(
-        update={
-            "problem_id": trace.problem_id,
-            "sample_kind": SampleKind.GOLD,
-        }
-    )
-    sample = SimpleNamespace(
-        sample_id="n1",
-        problem_id=trace.problem_id,
-        trace=SimpleNamespace(sha256=hashlib.sha256(trace_bytes).hexdigest()),
-        cpp_source=SimpleNamespace(sha256=hashlib.sha256(source_bytes).hexdigest()),
-        final_expected_correct=True,
-        primary_error=None,
-        first_error_step_id=None,
-    )
-    binding = FormalRunArtifacts(
-        sample_id="n1",
-        trace_artifact_bytes=trace_bytes,
-        cpp_source_bytes=source_bytes,
-        internal_report=internal,
-        judge_evidence=judge,
-        human_label=HumanConfirmedLabel(sample_id="n1", final_correct=True, process_valid=True),
-    )
-
-    _validate_formal_run_binding(
-        sample=sample,
-        expected_kind=SampleKind.GOLD,
-        binding=binding,
-        observation=observation,
-    )
-    for update in (
-        {"needs_human_review": True},
-        {"primary_review_agreement": False},
-        {"arbitration_used": True},
-    ):
-        with pytest.raises(ValueError, match="run and human evidence"):
-            _validate_formal_run_binding(
-                sample=sample,
-                expected_kind=SampleKind.GOLD,
-                binding=binding,
-                observation=observation.model_copy(update=update),
-            )
-    with pytest.raises(ValueError, match="run and human evidence"):
-        _validate_formal_run_binding(
-            sample=sample,
-            expected_kind=SampleKind.GOLD,
-            binding=FormalRunArtifacts(
-                sample_id=binding.sample_id,
-                trace_artifact_bytes=trace_bytes,
-                cpp_source_bytes=source_bytes,
-                internal_report=internal.model_copy(update={"run_id": "different-run"}),
-                judge_evidence=judge,
-                human_label=binding.human_label,
-            ),
-            observation=observation,
-        )
 
 
 def test_budget_reservation_is_atomic_under_concurrency() -> None:

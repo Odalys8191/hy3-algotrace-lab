@@ -14,7 +14,6 @@ from .benchmark import (
     ArtifactAttemptLedger,
     BenchmarkRunner,
     RemoteAttemptBudget,
-    Task7FormalBenchmarkCapability,
 )
 from .benchmark_models import (
     BenchmarkConfig,
@@ -64,7 +63,6 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     execute: BenchmarkExecute | None = None,
-    formal_capability: Task7FormalBenchmarkCapability | None = None,
     human_labels: tuple[HumanConfirmedLabel, ...] = (),
     output: TextIO | None = None,
 ) -> int:
@@ -121,7 +119,6 @@ def main(
         ledger=ledger,
         execution_kind=execution_kind,
         replay_input=replay_input,
-        formal_capability=formal_capability,
         human_labels=human_labels,
     ).run(execute)
     _emit(

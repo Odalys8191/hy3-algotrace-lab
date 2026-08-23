@@ -176,9 +176,9 @@ def test_metrics_use_frozen_literal_denominators_and_included_ids() -> None:
             4 / 6,
             ("n1", "n2", "n3", "g1", "p1", "c1"),
         ),
-        "invalid_process_detection": (3.0, 4, 3 / 4, ("n2", "n3", "p1", "c1")),
-        "exact_localization": (2.0, 4, 2 / 4, ("n2", "n3", "p1", "c1")),
-        "within_one_localization": (3.0, 4, 3 / 4, ("n2", "n3", "p1", "c1")),
+        "invalid_process_detection": (1.0, 1, 1.0, ("c1",)),
+        "exact_localization": (1.0, 1, 1.0, ("c1",)),
+        "within_one_localization": (1.0, 1, 1.0, ("c1",)),
         "paradox_recall": (1.0, 1, 1.0, ("p1",)),
         "standard_gold_false_positive_rate": (1.0, 1, 1.0, ("g1",)),
         "human_review_flag_rate": (2.0, 6, 2 / 6, ("n1", "n2", "n3", "g1", "p1", "c1")),
@@ -242,6 +242,20 @@ def test_natural_gold_denominators_are_independent_per_capability() -> None:
 
     assert metrics["natural_final_accuracy"].included_sample_ids == ("n1",)
     assert metrics["natural_process_valid_rate"].included_sample_ids == ("n2",)
+
+
+def test_detection_localization_and_paradox_denominators_exclude_mixed_kinds() -> None:
+    metrics = as_map(compute_metrics(literal_rows()).overall)
+
+    for name in (
+        "invalid_process_detection",
+        "exact_localization",
+        "within_one_localization",
+    ):
+        assert metrics[name].included_sample_ids == ("c1",)
+        assert metrics[name].denominator == 1
+    assert metrics["paradox_recall"].included_sample_ids == ("p1",)
+    assert metrics["paradox_recall"].denominator == 1
 
 
 def test_taxonomy_macro_f1_uses_frozen_nine_classes_and_formal_support() -> None:

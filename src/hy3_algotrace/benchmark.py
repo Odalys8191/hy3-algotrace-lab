@@ -2,15 +2,10 @@
 
 from __future__ import annotations
 
-import hashlib
 import threading
-import weakref
 from collections.abc import Callable
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
-from .api_models import InternalRunReport
 from .artifacts import ArtifactRef, ArtifactStore, sha256_json
 from .benchmark_models import (
     ArtifactHashEntry,
@@ -18,13 +13,13 @@ from .benchmark_models import (
     BenchmarkExecutionKind,
     BenchmarkRunReport,
     BenchmarkStatus,
+    FormalIntegrationCandidate,
     HumanConfirmedLabel,
     HumanConfirmedLabelSet,
     LedgerEvent,
     LedgerIndex,
     MetricObservation,
     ObservationReplayInput,
-    SampleKind,
 )
 from .bootstrap import (
     bootstrap_metric,
@@ -36,301 +31,12 @@ from .charts import (
     stratified_metric_chart_spec,
     taxonomy_distribution_chart_spec,
 )
-from .contracts import JudgeEvidence, SolutionTrace
 from .hy3_client import Hy3AttemptContext
 from .metrics import compute_metrics
 
 
 class BudgetExceededError(RuntimeError):
     """No further remote attempt may be transmitted."""
-
-
-class Task7BridgeUnavailableError(RuntimeError):
-    """Task-7 production capability is not present on this isolated branch."""
-
-
-@dataclass(frozen=True, slots=True)
-class FormalRunArtifacts:
-    """Concrete Task-7 corpus bytes and Task-5 run evidence for one sample."""
-
-    sample_id: str
-    trace_artifact_bytes: bytes
-    cpp_source_bytes: bytes
-    internal_report: InternalRunReport
-    judge_evidence: JudgeEvidence
-    human_label: HumanConfirmedLabel
-
-
-_TASK7_BRIDGE_TOKEN = object()
-_TASK7_BENCHMARK_CAPABILITIES: weakref.WeakSet[Any] = weakref.WeakSet()
-
-
-class Task7FormalBenchmarkCapability:
-    """Opaque, non-persistable result of replaying Task-7 and run evidence."""
-
-    _config_hash: str
-    _observation_hashes: tuple[str, ...]
-    _human_label_hashes: tuple[str, ...]
-    __slots__ = (
-        "_config_hash",
-        "_observation_hashes",
-        "_human_label_hashes",
-        "__weakref__",
-    )
-
-    def __init__(
-        self,
-        *,
-        _bridge_token: object,
-        config_hash: str = "",
-        observation_hashes: tuple[str, ...] = (),
-        human_label_hashes: tuple[str, ...] = (),
-    ) -> None:
-        if _bridge_token is not _TASK7_BRIDGE_TOKEN:
-            raise ValueError("formal eligibility requires the integrated Task-7 bridge")
-        object.__setattr__(self, "_config_hash", config_hash)
-        object.__setattr__(self, "_observation_hashes", observation_hashes)
-        object.__setattr__(self, "_human_label_hashes", human_label_hashes)
-        _TASK7_BENCHMARK_CAPABILITIES.add(self)
-
-    def __setattr__(self, _name: str, _value: object) -> None:
-        raise AttributeError("Task-7 benchmark capabilities are immutable")
-
-    def _matches(
-        self,
-        config: BenchmarkConfig,
-        observations: tuple[MetricObservation, ...],
-        human_labels: tuple[HumanConfirmedLabel, ...],
-    ) -> bool:
-        return (
-            self in _TASK7_BENCHMARK_CAPABILITIES
-            and self._config_hash == sha256_json(config.model_dump(mode="json"))
-            and self._observation_hashes
-            == tuple(sha256_json(row.model_dump(mode="json")) for row in observations)
-            and self._human_label_hashes
-            == tuple(sha256_json(label.model_dump(mode="json")) for label in human_labels)
-        )
-
-
-def issue_task7_formal_benchmark_capability(
-    *,
-    config: BenchmarkConfig,
-    observations: tuple[MetricObservation, ...],
-    selection_chain: object,
-    corpus: object,
-    judge_validation: object,
-    run_artifacts: tuple[FormalRunArtifacts, ...],
-) -> Task7FormalBenchmarkCapability:
-    """Replay integrated Task-7 capabilities and concrete per-run evidence.
-
-    Imports are deliberately local: this Task-6 branch stays isolated, while the
-    bridge becomes live only after Task 7 is integrated by the controller.
-    """
-
-    try:
-        from .corpus import (  # type: ignore[import-untyped]
-            CorpusManifest,
-            CorpusSampleKind,
-            CorpusStatus,
-        )
-        from .dataset_models import VerifiedSelectionChain  # type: ignore[import-untyped]
-        from .differential import (  # type: ignore[import-untyped]
-            FormalCorpusJudgeValidationResult,
-        )
-    except ImportError as error:
-        raise Task7BridgeUnavailableError(
-            "integrate Task 7 before issuing formal benchmark capability"
-        ) from error
-    if (
-        not isinstance(selection_chain, VerifiedSelectionChain)
-        or not selection_chain._is_verified()
-        or not isinstance(corpus, CorpusManifest)
-        or corpus.status is not CorpusStatus.COMPLETE
-        or not isinstance(judge_validation, FormalCorpusJudgeValidationResult)
-        or judge_validation.formal_eligibility is not True
-    ):
-        raise ValueError("formal benchmark requires replayed Task-7 capabilities")
-    selection = selection_chain.selection
-    if (
-        config.selection_hash != selection.content_hash
-        or config.corpus_hash != corpus.content_hash
-        or corpus.selection_manifest_hash != selection.content_hash
-        or judge_validation.evidence_manifest.corpus_manifest_hash != corpus.content_hash
-        or judge_validation.evidence_manifest.selection_manifest_hash != selection.content_hash
-    ):
-        raise ValueError("formal benchmark does not match the Task-7 evidence chain")
-    locator = config.verified_data_evidence
-    if locator is None or locator.artifact_hash != judge_validation.evidence_manifest.content_hash:
-        raise ValueError("formal benchmark locator does not bind Task-7 judge replay")
-    natural_run = corpus.natural_run_config
-    task7_parameters = tuple(
-        (parameter.name, parameter.value) for parameter in natural_run.model_parameters
-    )
-    benchmark_parameters = tuple(
-        (parameter.name, parameter.value) for parameter in config.model_parameters
-    )
-    if (
-        config.model != natural_run.model_name
-        or config.endpoint_identity != natural_run.endpoint_url
-        or config.generator_prompt_version != natural_run.prompt_version
-        or benchmark_parameters != task7_parameters
-    ):
-        raise ValueError("formal benchmark generation config does not match Task 7")
-    samples = {sample.sample_id: sample for sample in corpus.samples}
-    bindings = {binding.sample_id: binding for binding in run_artifacts}
-    if (
-        len(samples) != 165
-        or set(samples) != set(config.ordered_sample_ids)
-        or set(bindings) != set(samples)
-        or len(bindings) != len(run_artifacts)
-    ):
-        raise ValueError("formal run artifacts must exactly cover all 165 corpus samples")
-    observation_by_id = {row.sample_id: row for row in observations}
-    if set(observation_by_id) != set(samples) or len(observation_by_id) != len(observations):
-        raise ValueError("formal observations must exactly cover the Task-7 corpus")
-    kind_map = {
-        CorpusSampleKind.GOLD: SampleKind.GOLD,
-        CorpusSampleKind.CONTROLLED_WRONG: SampleKind.CONTROLLED_WRONG,
-        CorpusSampleKind.PARADOX: SampleKind.PARADOX,
-        CorpusSampleKind.NATURAL: SampleKind.NATURAL,
-    }
-    selection_by_problem = {entry.problem_id: entry for entry in selection.entries}
-    if set(selection_by_problem) != {sample.problem_id for sample in samples.values()}:
-        raise ValueError("formal corpus problem identities do not match Task 7 selection")
-    specs = {spec.sample_id: spec for spec in config.sample_specs}
-    for sample_id in config.ordered_sample_ids:
-        sample = samples[sample_id]
-        binding = bindings[sample_id]
-        observation = observation_by_id[sample_id]
-        selection_entry = selection_by_problem[sample.problem_id]
-        spec = specs[sample_id]
-        if (
-            spec.problem_id != sample.problem_id
-            or spec.topic is not selection_entry.topic
-            or spec.rating_band is not selection_entry.rating_band
-        ):
-            raise ValueError("formal benchmark stratum does not match Task 7 selection")
-        _validate_formal_run_binding(
-            sample=sample,
-            expected_kind=kind_map[sample.kind],
-            binding=binding,
-            observation=observation,
-        )
-    return Task7FormalBenchmarkCapability(
-        _bridge_token=_TASK7_BRIDGE_TOKEN,
-        config_hash=sha256_json(config.model_dump(mode="json")),
-        observation_hashes=tuple(sha256_json(row.model_dump(mode="json")) for row in observations),
-        human_label_hashes=tuple(
-            sha256_json(bindings[sample_id].human_label.model_dump(mode="json"))
-            for sample_id in config.ordered_sample_ids
-        ),
-    )
-
-
-def _validate_formal_run_binding(
-    *,
-    sample: Any,
-    expected_kind: SampleKind,
-    binding: FormalRunArtifacts,
-    observation: MetricObservation,
-) -> None:
-    if (
-        hashlib.sha256(binding.trace_artifact_bytes).hexdigest() != sample.trace.sha256
-        or hashlib.sha256(binding.cpp_source_bytes).hexdigest() != sample.cpp_source.sha256
-    ):
-        raise ValueError("formal run bytes do not match the Task-7 corpus")
-    try:
-        trace = SolutionTrace.model_validate_json(binding.trace_artifact_bytes)
-        source = binding.cpp_source_bytes.decode("utf-8")
-    except (ValueError, UnicodeError) as error:
-        raise ValueError("formal Task-7 trace/source artifacts are invalid") from error
-    internal = binding.internal_report
-    audit = internal.audit_report
-    human = binding.human_label
-    reviewer_ids = tuple(verdict.reviewer_id for verdict in audit.reviewer_verdicts)
-    if reviewer_ids not in {
-        ("logic-reviewer", "adversarial-reviewer"),
-        ("logic-reviewer", "adversarial-reviewer", "arbiter"),
-    }:
-        raise ValueError("formal observation is not bound to run and human evidence")
-    primary_agreement = _review_signature(audit.reviewer_verdicts[0]) == _review_signature(
-        audit.reviewer_verdicts[1]
-    )
-    arbitration_used = len(audit.reviewer_verdicts) == 3
-    if (
-        trace.code != source
-        or binding.sample_id != sample.sample_id
-        or internal.run_id != audit.run_id
-        or internal.trace != trace
-        or internal.problem_id != sample.problem_id
-        or audit.problem_id != sample.problem_id
-        or audit.trace_id != trace.trace_id
-        or audit.judge_evidence != binding.judge_evidence
-        or human.sample_id != sample.sample_id
-        or observation.sample_id != sample.sample_id
-        or observation.problem_id != sample.problem_id
-        or observation.sample_kind is not expected_kind
-        or observation.gold_final_correct is not human.final_correct
-        or observation.gold_process_valid is not human.process_valid
-        or observation.predicted_final_correct is not audit.final_correct
-        or observation.predicted_process_valid is not audit.process_valid
-        or observation.predicted_taxonomy is not audit.final_error_taxonomy
-        or observation.needs_human_review is not audit.needs_human_review
-        or observation.primary_review_agreement is not primary_agreement
-        or observation.arbitration_used is not arbitration_used
-    ):
-        raise ValueError("formal observation is not bound to run and human evidence")
-    expected_step_number = None
-    if audit.first_material_error_step_id is not None:
-        expected_step_number = next(
-            (
-                step.step_number
-                for step in trace.steps
-                if step.step_id == audit.first_material_error_step_id
-            ),
-            None,
-        )
-    if observation.predicted_first_error_step != expected_step_number:
-        raise ValueError("formal observation localization does not match AuditReport")
-    if expected_kind is not SampleKind.NATURAL:
-        gold_step_number = None
-        if sample.first_error_step_id is not None:
-            gold_step_number = next(
-                (
-                    step.step_number
-                    for step in trace.steps
-                    if step.step_id == sample.first_error_step_id
-                ),
-                None,
-            )
-            if gold_step_number is None:
-                raise ValueError("formal corpus gold localization is not in the trace")
-        if (
-            human.final_correct is not sample.final_expected_correct
-            or human.process_valid is not (sample.primary_error is None)
-            or human.taxonomy is not sample.primary_error
-            or human.first_error_step != gold_step_number
-        ):
-            raise ValueError("formal human label does not match controlled corpus gold")
-
-
-def _review_signature(verdict: Any) -> tuple[Any, ...]:
-    material_steps = tuple(
-        sorted(
-            (
-                (review.step_id, review.status, review.taxonomy)
-                for review in verdict.per_step_reviews
-                if review.material
-            ),
-            key=lambda item: item[0],
-        )
-    )
-    return (
-        verdict.material_error,
-        verdict.error_taxonomy,
-        verdict.first_error_step_id,
-        material_steps,
-    )
 
 
 class RemoteAttemptBudget:
@@ -437,7 +143,6 @@ class BenchmarkRunner:
         artifacts: ArtifactStore,
         budget: RemoteAttemptBudget,
         ledger: ArtifactAttemptLedger,
-        formal_capability: Task7FormalBenchmarkCapability | None = None,
         human_labels: tuple[HumanConfirmedLabel, ...] = (),
         execution_kind: BenchmarkExecutionKind = BenchmarkExecutionKind.LIVE,
         replay_input: ObservationReplayInput | None = None,
@@ -446,7 +151,6 @@ class BenchmarkRunner:
         self._artifacts = artifacts
         self._budget = budget
         self._ledger = ledger
-        self._formal_capability = formal_capability
         self._human_labels = human_labels
         self._execution_kind = execution_kind
         self._replay_input = replay_input
@@ -498,6 +202,7 @@ class BenchmarkRunner:
             )
             refs.append(self._entry("replay_input", replay_ref))
         observations: list[MetricObservation] = []
+        observation_refs: list[ArtifactRef] = []
         exhausted = False
         for sample_id in self._config.ordered_sample_ids:
             try:
@@ -511,6 +216,7 @@ class BenchmarkRunner:
                 observation.model_dump(mode="json"),
             )
             refs.append(self._entry(f"observation:{sample_id}", observation_ref))
+            observation_refs.append(observation_ref)
             observations.append(observation)
         ledger_ref = self._ledger.finalize()
         refs.append(self._entry("ledger_index", ledger_ref))
@@ -582,20 +288,38 @@ class BenchmarkRunner:
             )
             refs.append(self._entry("chart:taxonomy_distribution", taxonomy_ref))
         stable_observations = tuple(observations)
-        formal_evidence_verified = self._verify_formal_evidence(stable_observations)
         formal_attempt_profile_valid = self._formal_attempt_profile_valid(stable_observations)
+        formal_candidate_complete = (
+            complete
+            and self._config.formal
+            and formal_attempt_profile_valid
+            and tuple(label.sample_id for label in self._human_labels)
+            == self._config.ordered_sample_ids
+        )
+        if formal_candidate_complete:
+            candidate = FormalIntegrationCandidate(
+                benchmark_id=self._config.benchmark_id,
+                config_hash=config_ref.content_hash,
+                observation_hashes=tuple(ref.content_hash for ref in observation_refs),
+                human_label_hashes=tuple(
+                    sha256_json(label.model_dump(mode="json")) for label in self._human_labels
+                ),
+                ledger_index_hash=ledger_ref.content_hash,
+                remote_attempts_used=self._budget.used,
+            )
+            candidate_ref = self._artifacts.write_json(
+                root / "formal-candidate.json",
+                candidate.model_dump(mode="json"),
+            )
+            refs.append(self._entry("formal_integration_candidate", candidate_ref))
         report = BenchmarkRunReport(
             benchmark_id=self._config.benchmark_id,
             execution_kind=self._execution_kind,
             status=(BenchmarkStatus.COMPLETE if complete else BenchmarkStatus.PARTIAL),
             complete=complete,
-            formal_eligible=(
-                complete
-                and self._config.formal
-                and formal_evidence_verified
-                and formal_attempt_profile_valid
-            ),
-            formal_evidence_verified=formal_evidence_verified,
+            formal_candidate_complete=formal_candidate_complete,
+            formal_eligible=False,
+            formal_evidence_verified=False,
             formal_attempt_profile_valid=formal_attempt_profile_valid,
             completed_sample_ids=tuple(row.sample_id for row in observations),
             remote_attempts_used=self._budget.used,
@@ -622,16 +346,6 @@ class BenchmarkRunner:
         )
         if actual != expected:
             raise ValueError("benchmark observation violates its frozen sample specification")
-
-    def _verify_formal_evidence(self, observations: tuple[MetricObservation, ...]) -> bool:
-        if (
-            not self._config.formal
-            or self._execution_kind is not BenchmarkExecutionKind.LIVE
-            or self._formal_capability is None
-            or len(observations) != len(self._config.ordered_sample_ids)
-        ):
-            return False
-        return self._formal_capability._matches(self._config, observations, self._human_labels)
 
     def _formal_attempt_profile_valid(self, observations: tuple[MetricObservation, ...]) -> bool:
         if (

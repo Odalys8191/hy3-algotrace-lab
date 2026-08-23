@@ -91,10 +91,18 @@ def _metric_set(
         if row.sample_kind is SampleKind.NATURAL and row.gold_process_valid is not None
     )
     process_labeled = tuple(row for row in rows if row.gold_process_valid is not None)
-    invalid = tuple(row for row in rows if row.gold_process_valid is False)
-    localized = tuple(row for row in invalid if row.gold_first_error_step is not None)
+    controlled_wrong = tuple(
+        row
+        for row in rows
+        if row.sample_kind is SampleKind.CONTROLLED_WRONG and row.gold_process_valid is False
+    )
+    localized = tuple(row for row in controlled_wrong if row.gold_first_error_step is not None)
     paradox = tuple(
-        row for row in rows if row.gold_final_correct is True and row.gold_process_valid is False
+        row
+        for row in rows
+        if row.sample_kind is SampleKind.PARADOX
+        and row.gold_final_correct is True
+        and row.gold_process_valid is False
     )
     standard_gold = tuple(
         row
@@ -132,7 +140,7 @@ def _metric_set(
         ),
         _ratio(
             "invalid_process_detection",
-            invalid,
+            controlled_wrong,
             lambda row: not row.predicted_process_valid,
         ),
         _ratio(
