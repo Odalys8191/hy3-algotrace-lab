@@ -63,25 +63,25 @@ _CREDENTIAL_PATTERNS = (
     ),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
 )
-_PATH_ROOT = (
-    r"(?:users|private|tmp|var|home|opt|workspace|app|mnt)"
-    r"(?=/|[\s,;:)\]}'\"]|$)"
-)
+_POSIX_PATH_TOKEN = r"[^/\s,;)\]}'\"]+"
 _PUBLIC_PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
-        re.compile(rf"(?i)(?P<quote>[\"'])(?:/{_PATH_ROOT}(?:/[^\"'\r\n]*)?)(?P=quote)"),
+        re.compile(r"(?P<quote>[\"'])/(?!/)[^\"'\r\n]*(?P=quote)"),
         '"[REDACTED]"',
     ),
     (
-        re.compile(rf"(?i)\(\s*/{_PATH_ROOT}(?:/[^)\r\n]*)?\s*\)"),
+        re.compile(r"\(\s*/(?!/)[^)\r\n]*\s*\)"),
         "([REDACTED])",
     ),
     (
-        re.compile(rf"(?i)(\b[A-Za-z_][\w.-]*\s*=\s*)/{_PATH_ROOT}(?:/[^,;\r\n]*)?"),
+        re.compile(r"(\b[A-Za-z_][\w.-]*\s*=\s*)/(?!/)[^,;\r\n]*"),
         r"\1[REDACTED]",
     ),
     (
-        re.compile(rf"(?i)(?<![\w])/{_PATH_ROOT}(?:/[^,;\r\n)\]}}\"']*)?"),
+        re.compile(
+            rf"(?<![\w:/])/(?!/)(?:{_POSIX_PATH_TOKEN}/)+"
+            rf"(?:{_POSIX_PATH_TOKEN})?"
+        ),
         "[REDACTED]",
     ),
 )
