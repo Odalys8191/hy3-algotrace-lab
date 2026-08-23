@@ -1,0 +1,9 @@
+title = "Hy3 AlgoTrace controlled release allowlist"
+
+[allowlist]
+description = "Only intentionally non-secret placeholder literals are allowed."
+regexTarget = "match"
+regexes = [
+  '''HY3_API_KEY=YOUR_HY3_API_KEY''',
+  '''HY3_BASE_URL=https://YOUR_AUTHORISED_HY3_ENDPOINT''',
+]

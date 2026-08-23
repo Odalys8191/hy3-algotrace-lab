@@ -1,45 +1,43 @@
-# Local integration template. It deliberately fails until Task 5/Task 6 entry points exist.
+# Local single-user Compose only. docker compose config must render local-only ports.
 services:
   api:
-    image: python:3.12-slim
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace:ro
-      - hy3_artifacts:/artifacts
+    image: hy3-algotrace-local:dev
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+      args:
+        HY3_APP_RUNTIME_IMAGE: ${HY3_APP_RUNTIME_IMAGE:?Set a locked runtime repository@sha256 image.}
+        HY3_DOCKER_CLI_PACKAGE: ${HY3_DOCKER_CLI_PACKAGE:?Set an exact docker.io=VERSION package.}
     environment:
       HY3_ARTIFACT_ROOT: /artifacts/runs
-      HY3_API_APP_MODULE: ${HY3_API_APP_MODULE:-YOUR_TASK5_APP_FACTORY}
+      HY3_CATALOG_ROOT: /data/problems
+      HY3_BASE_URL: ${HY3_BASE_URL:?Set the authorised Hy3 endpoint URL locally.}
+      HY3_API_KEY: ${HY3_API_KEY:?Set the authorised Hy3 credential locally.}
+      HY3_MODEL: ${HY3_MODEL:?Set the authorised Hy3 model identifier locally.}
+      HY3_JUDGE_IMAGE: ${HY3_JUDGE_IMAGE:?Set an immutable repository@sha256 Judge image.}
+      HY3_BACKGROUND_WORKERS: ${HY3_BACKGROUND_WORKERS:-2}
+      HY3_CODE_REVISION: ${HY3_CODE_REVISION:-unknown}
+    volumes:
+      - hy3_artifacts:/artifacts
+      - type: bind
+        source: ${HY3_CATALOG_ROOT_HOST:?Set an absolute trusted formal-catalog directory.}
+        target: /data/problems
+        read_only: true
+      - type: bind
+        source: ${HY3_DOCKER_SOCKET_PATH:?Set the controlled local Docker socket path.}
+        target: /var/run/docker.sock
     command:
-      - /bin/sh
-      - -ec
-      - |
-        test "$${HY3_API_APP_MODULE}" != "YOUR_TASK5_APP_FACTORY" || {
-          echo "Task 5 FastAPI factory is required; refusing placeholder startup" >&2; exit 64;
-        }
-        python -m uvicorn "$${HY3_API_APP_MODULE}" --factory --host 0.0.0.0 --port 8000
+      ["python", "-m", "uvicorn", "hy3_algotrace.local_app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000"]
     ports:
       - "127.0.0.1:${HY3_API_PORT:-8000}:8000"
 
   streamlit:
     profiles: ["ui"]
-    image: python:3.12-slim
-    working_dir: /workspace
-    volumes:
-      - ./:/workspace:ro
+    image: hy3-algotrace-local:dev
     environment:
-      HY3_STREAMLIT_APP_PATH: ${HY3_STREAMLIT_APP_PATH:-YOUR_TASK6_STREAMLIT_APP_PATH}
       HY3_API_BASE_URL: http://api:8000
     command:
-      - /bin/sh
-      - -ec
-      - |
-        test "$${HY3_STREAMLIT_APP_PATH}" != "YOUR_TASK6_STREAMLIT_APP_PATH" || {
-          echo "Task 6 Streamlit app is required; refusing placeholder startup" >&2; exit 64;
-        }
-        test -f "$${HY3_STREAMLIT_APP_PATH}" || {
-          echo "Configured Streamlit app path is absent; refusing startup" >&2; exit 64;
-        }
-        streamlit run "$${HY3_STREAMLIT_APP_PATH}" --server.address 0.0.0.0 --server.port 8501
+      ["streamlit", "run", "/opt/hy3-algotrace/src/hy3_algotrace/streamlit_app.py", "--server.address", "0.0.0.0", "--server.port", "8501"]
     ports:
       - "127.0.0.1:${HY3_UI_PORT:-8501}:8501"
     depends_on:

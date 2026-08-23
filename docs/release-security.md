@@ -1,40 +1,62 @@
 # Release and security boundaries
 
-This is a local, single-user research application. Bind the API and UI only to localhost;
-do not reverse-proxy or expose them to the internet. The C++17 Docker Judge is a constrained
-local execution component, not a production internet sandbox or a multi-tenant isolation
-guarantee.
+This is a localhost-only, local-single-user research application. Do not reverse-proxy it,
+expose it to a LAN/internet, or use it as a multi-tenant code-execution service.
 
-## Credentials and release validation
+## Runtime configuration and image boundary
 
-`HY3_API_KEY` is read only from the local process environment. Do not add it to code, test
-fixtures, Docker build arguments, artifacts, reports, screenshots, shell history, or logs.
-`.env.example` contains placeholders only and `.env` is ignored. Run:
+The model boundary reads only `HY3_BASE_URL`, `HY3_API_KEY`, and `HY3_MODEL` at process
+runtime. The key is never a Docker build argument or artifact field. `.env.example` contains
+placeholders only; a real local `.env` remains ignored and is excluded from Docker build context.
+App runtime and Judge input images must use `repository@sha256` identities.
+`docker/release-runtime-lock.json` lists the complete Python 3.12 dependency closure; the
+immutable runtime image is verified against it and app installation uses `pip --no-deps`, so no
+mutable transitive resolution occurs in the app build. The image also requires an exact
+`docker.io=VERSION` package because the existing Judge backend invokes Docker by argv.
+
+`docker compose up --build` is intentionally fail-closed if any required local runtime value,
+formal catalog, immutable Judge image, or socket path is absent. Run the checks below; both
+source and rendered Compose semantic checks reject short public ports, omitted `host_ip`,
+`0.0.0.0`, and host network mode without trusting comments.
 
 ```sh
 python -m hy3_algotrace.release_validation --root .
+docker compose config --format json > /tmp/hy3-compose.json
+python -m hy3_algotrace.release_validation --root . --rendered-compose /tmp/hy3-compose.json
 ```
 
-The command fails closed if release files are absent, the required Chinese non-official
-disclaimer is absent, a Compose port is published on a non-localhost address, or a tracked
-text file contains a non-placeholder value assigned to an API key/token/secret/password
-variable. It does not print the suspected value.
+## Docker socket risk
 
-## Artifact and data boundary
+`HY3_DOCKER_SOCKET_PATH` deliberately has no default. If supplied, its host Docker socket gives
+the API container effective host-root authority. Use it only on a controlled personal machine
+for a local demonstration; never in a shared runner or public service. The per-run Judge
+container's network/resource restrictions reduce the evaluated program's scope but cannot make
+the socket mounting pattern production-safe. A missing Docker prerequisite is a hard failure,
+not permission to execute submitted C++ on the host.
 
-All persistent run and benchmark artifacts are create-only and content-addressed. Never
-overwrite an existing run, human-review decision, benchmark ledger, frozen selection, or
-formal report. Correct an error by creating a new versioned artifact and recording why the
-previous artifact is superseded.
+## Artifact, prompt, and public boundary
 
-Only original-English Codeforces statements and public examples may enter a generation
-prompt. Hidden/generated tests, oracle facts, reference answers, reviewer-only diagnostics,
-and local paths remain outside public API/UI responses and model prompts. Do not redistribute
-raw CodeContests records or third-party submitted code.
+All run/configuration/report artifacts are create-only and content-addressed. Correct an error
+by writing a new artifact that links to the earlier hash; never overwrite a run, benchmark
+ledger, frozen selection, review decision, or chart.
 
-## Operational checks
+Protected internal dataset artifacts (including hidden/generated tests and oracle material) are
+allowed only under access control for Judge/provenance replay. They must never be copied into a
+model prompt, public/API/UI response, or run artifact. Prompts and public objects use an
+allowlist; logs and errors must not expose credentials, absolute paths, reference code, or
+reviewer-only evidence.
 
-Run static/unit/release checks before publication. Docker Judge checks require a locally
-available Docker daemon and are skipped explicitly when unavailable; a skipped Docker test is
-not evidence of production safety. Never represent a local smoke test as an internet-sandbox
-assessment.
+## Secret detection
+
+The Python validator rejects non-placeholder secret-like assignments without echoing their
+values. CI fetches complete history and runs a SHA-pinned Gitleaks action with
+`.gitleaks.toml`; its allowlist is restricted to named placeholder strings, not directories or
+generic test paths. A historic finding requires credential rotation and a history remediation
+decision—it is not resolved merely by deleting the current file.
+
+For a workstation with Gitleaks installed, run `scripts/security-scan.sh`; it scans `--all`
+history with redacted output and fails closed (`69`) if Gitleaks is absent.
+
+The Python release scanner has one separate, path-and-identifier allowlist entry:
+`tests/test_run_service.py:raw_secret`. That fixture tests secret redaction in an asynchronous
+failure path; the exception does not match a value pattern, a directory, or any other variable.

@@ -1,15 +1,17 @@
 # Licence and source attribution
 
-The repository-authored code is released under the [MIT License](../LICENSE). This grant does
-not grant rights to external datasets, Codeforces statements/tests, or submitted solutions.
+Repository-authored code is released under the [MIT License](../LICENSE). This does not grant
+rights to external datasets, Codeforces statements/tests, submitted solutions, Docker images,
+Python packages, model endpoints, or GitHub Actions.
 
-Potential formal problem metadata comes from the external
+Potential formal metadata originates from the external
 [CodeContests dataset](https://github.com/deepmind/code_contests) and Codeforces problem pages.
-Those sources retain their own licences, terms, and attribution obligations. Raw records are
-external inputs: record their acquisition metadata and attribution, but do not commit them
-without a separate rights review. Never redistribute third-party submitted code.
+Record acquisition source, version/asset IDs, hashes, licence/terms, and attribution in the
+protected provenance chain. Do not commit raw external records without rights review and never
+redistribute third-party submitted code. Project-authored reference bundles require their own
+source/author attestation.
 
-Hy3 is referenced only as the model integration target required by the activity task. This
-personal project is not a Tencent product, endorsement, or official release. Any model API,
-Docker base image, Python package, or GitHub Action used in a local environment has its own
-licence and supply-chain review requirements.
+Hy3 is only an activity-task model integration target. This personal project is neither a
+Tencent product nor an official Tencent release. A future formal result must disclose the
+single-reviewer limit, same-model-review bias, 20% delayed blind re-review, historic data/prompt
+contamination risk, and local-single-user Docker-socket boundary.

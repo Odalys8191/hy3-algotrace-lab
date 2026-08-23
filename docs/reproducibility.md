@@ -1,38 +1,50 @@
 # Reproducibility and formal-run protocol
 
-## Immutable inputs
+## Data and readiness gates
 
-Use the Task 7 tooling to record external acquisition URL, byte length, SHA-256, split,
-licence/attribution, converter identity, candidate/review decisions, quota report, and frozen
-selection hash. Do not expand CodeContests validation/test data to train or synthetic rows.
-The formal selection remains invalid until its full source and review linkage is verified.
+This branch does not establish that Task 7's 30-problem/165-sample data is complete. After that
+layer is independently integrated, `scripts/data-lint.sh` validates acquired validation/test
+bytes against their frozen manifest, and `scripts/formal-readiness.sh` replays acquisition,
+selection, bundle, and corpus lint gates. Either script exits `3` for an absent integration or
+missing input, which is explicitly **not ready**.
 
-Before any benchmark freeze the ordered sample IDs, corpus/selection hashes, model name,
-credential-free endpoint identity, prompt version/hash, parameters, code revision, Judge
-image digest, metric/chart versions, random seed, bootstrap replicates, and remote-call budget.
-Reserve each outbound Hy3 attempt before sending it. Cache hits cost zero; a budget-exhausted
-run is immutable partial evidence, not a complete formal result.
+Only original-English Codeforces records with standard stdin/stdout, source attribution,
+acquisition hashes, conversion/reviewer linkage, and 15-cell quota evidence can progress. The
+1200–1500 foundation band is not a claim of beginner performance. Project-authored bundles may
+be used; raw third-party submitted solutions are not released. Record historical contamination
+from prior data/problem/prompt/output exposure before selection and treat conclusions as
+relative baselines when contamination cannot be ruled out.
 
-## Reporting
+## Frozen benchmark configuration
 
-Persist only deterministic, create-only JSON artifacts and chart specifications. Do not
-overwrite reports or replace screenshots after seeing metrics. Human review must export a
-blinded public package; keep mapping, decisions, and replay artifacts separate and immutable.
+Before one formal run, create an immutable configuration that binds, at minimum:
 
-The intended 30/60/15/60 formal corpus and 500-attempt benchmark ceiling are not completed on
-this release branch. Do not state completion, publish aggregate metrics, or claim a stable
-breakpoint until all gates—including source provenance, human checks, Judge evidence, and
-natural-output materialization—have passed.
+- acquisition/validation/conversion/selection/bundle/corpus/Judge-evidence hashes;
+- ordered sample IDs and sample categories;
+- `HY3_MODEL`, credential-free endpoint identity, prompt/version hashes, parameters, code
+  revision, immutable Judge image, metric/chart implementation versions;
+- seed, bootstrap replicate count, and a reserved-call ledger with a hard limit of 500;
+- blind-export, reviewer assignment, replay, and delayed 20% re-review configuration.
 
-## Clean verification commands
+For Docker reproduction, bind the `docker/release-runtime-lock.json` content hash to the
+digest-pinned runtime image used by the app build, along with the exact Docker CLI package and
+Judge build arguments. A changed lock, runtime digest, package version, or Judge input creates a
+new configuration; it never replaces a prior result.
 
-```sh
-python -m pytest -q
-python -m ruff check .
-python -m mypy src
-python -m hy3_algotrace.release_validation --root .
-```
+Reserve every remote model attempt before sending it; record transport failure and response
+hash afterwards. Cache hits cost zero. A run that exceeds 500 reserved attempts, lacks a ledger
+entry, or has a broken artifact linkage is immutable partial evidence and cannot be called a
+formal result.
 
-Use the task-specific dataset, benchmark, and Docker smoke commands only after the matching
-modules and verified external inputs are present. Their absence must be reported as pending,
-not bypassed with dummy data.
+## Human review and reports
+
+Export reviewers a blinded package containing only permitted public evidence. Keep the mapping,
+decision, and replay inputs separate and immutable. Draw a seeded 20% subset for delayed blind
+re-review; record its due date, reviewer, result, disagreement handling, and hashes. A lone
+reviewer is not independent confirmation, and a same-model reviewer shares potential bias with
+the generator.
+
+Use the create-only [method](method-report-template.md),
+[results](results-report-template.md), and [audit](audit-record-template.md) templates. Never
+replace a report/chart after seeing results. The planned 30/60/15/60 composition, 500-attempt
+ceiling, and any breakpoint/metric result remain specifications rather than completed facts.
