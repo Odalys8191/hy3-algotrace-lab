@@ -6,6 +6,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path, PurePath
@@ -158,6 +159,56 @@ class ArtifactStore:
                 return json.load(handle)
         finally:
             os.close(parent_fd)
+
+    def list_json(self, relative_directory: Path | str) -> tuple[Path, ...]:
+        """Enumerate regular JSON children without following links or leaving the root."""
+
+        normalized = _normalize_relative_path(relative_directory)
+        try:
+            directory_fd = self._open_directory(normalized)
+        except FileNotFoundError:
+            return ()
+        try:
+            paths: list[Path] = []
+            for name in sorted(os.listdir(directory_fd)):
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not name.endswith(".json"):
+                    continue
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise UnsafeArtifactPathError(
+                        f"unsafe artifact enumeration entry: {normalized / name}"
+                    )
+                file_fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+                        raise UnsafeArtifactPathError(
+                            f"unsafe artifact enumeration entry: {normalized / name}"
+                        )
+                finally:
+                    os.close(file_fd)
+                paths.append(normalized / name)
+            return tuple(paths)
+        finally:
+            os.close(directory_fd)
+
+    def _open_directory(self, relative_directory: Path) -> int:
+        directory_fd = os.dup(self._root_fd)
+        try:
+            for component in relative_directory.parts:
+                try:
+                    child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        raise UnsafeArtifactPathError(
+                            f"unsafe artifact path: {relative_directory}"
+                        ) from error
+                    raise
+                os.close(directory_fd)
+                directory_fd = child_fd
+            return directory_fd
+        except BaseException:
+            os.close(directory_fd)
+            raise
 
     def _open_parent(self, relative_path: Path, *, create: bool) -> tuple[int, str]:
         parent_fd = os.dup(self._root_fd)
