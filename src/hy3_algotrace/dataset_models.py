@@ -46,6 +46,14 @@ _MAX_CONVERTER_DIAGNOSTICS = 2_000
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 _LOGICAL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+_RAW_SPLIT_LOGICAL_IDS: Mapping[str, str] = {
+    "validation": "codecontests-raw-validation",
+    "test": "codecontests-raw-test",
+}
+_REVIEW_SPLIT_LOGICAL_IDS: Mapping[str, str] = {
+    "validation": "codecontests-review-validation",
+    "test": "codecontests-review-test",
+}
 
 _TOPIC_TAGS: Mapping[Topic, frozenset[str]] = {
     Topic.CONSTRUCTION_SIMULATION: frozenset({"constructive algorithms", "implementation"}),
@@ -81,6 +89,18 @@ class DatasetFormat(StrEnum):
     JSONL = "jsonl"
     PARQUET = "parquet"
     RIEGELI = "riegeli"
+
+
+def canonical_raw_split_logical_id(split: Literal["validation", "test"]) -> str:
+    """Return the non-swappable logical identity for one raw split."""
+
+    return _RAW_SPLIT_LOGICAL_IDS[split]
+
+
+def canonical_review_split_logical_id(split: Literal["validation", "test"]) -> str:
+    """Return the non-swappable logical identity for one review split."""
+
+    return _REVIEW_SPLIT_LOGICAL_IDS[split]
 
 
 class CheckerKind(StrEnum):
@@ -170,6 +190,12 @@ class ValidatedAsset(DatasetModel):
     logical_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$")
     byte_length: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_logical_identity(self) -> Self:
+        if self.logical_id != _RAW_SPLIT_LOGICAL_IDS[self.split]:
+            raise ValueError("raw split logical identifier does not match split")
+        return self
 
 
 class AcquisitionValidationReport(DatasetModel):
@@ -347,6 +373,12 @@ class ReviewArtifactAsset(DatasetModel):
         if value == "0" * 64:
             raise ValueError("review artifact SHA-256 cannot be all-zero")
         return value
+
+    @model_validator(mode="after")
+    def validate_logical_identity(self) -> Self:
+        if self.logical_id != _REVIEW_SPLIT_LOGICAL_IDS[self.split]:
+            raise ValueError("review split logical identifier does not match split")
+        return self
 
 
 class ReviewArtifactManifest(DatasetModel):
@@ -602,6 +634,73 @@ class VerifiedSelectionChain:
         return self in _VERIFIED_SELECTION_CAPABILITIES
 
 
+class SelectionReplayReceipt(DatasetModel):
+    """Persistable receipt of secure replay; never a formal capability or eligibility."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["verified_selection_replay_receipt"] = "verified_selection_replay_receipt"
+    selection_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acquisition_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acquisition_validation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    review_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    formal_eligibility: Literal[False] = False
+    capability_persisted: Literal[False] = False
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator(
+        "selection_manifest_hash",
+        "acquisition_manifest_hash",
+        "acquisition_validation_hash",
+        "review_manifest_hash",
+        "content_hash",
+    )
+    @classmethod
+    def reject_zero_hash(cls, value: str) -> str:
+        if value == "0" * 64:
+            raise ValueError("selection replay receipt hashes cannot be all-zero")
+        return value
+
+    @model_validator(mode="after")
+    def validate_receipt(self) -> Self:
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("selection replay receipt content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        selection_chain: VerifiedSelectionChain,
+        acquisition: AcquisitionManifest,
+        acquisition_validation: AcquisitionValidationReport,
+        review_manifest: ReviewArtifactManifest,
+    ) -> SelectionReplayReceipt:
+        if not selection_chain._is_verified():
+            raise ValueError("selection replay receipt requires a verified capability")
+        payload = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "verified_selection_replay_receipt",
+            "selection_manifest_hash": selection_chain.selection.content_hash,
+            "acquisition_manifest_hash": acquisition.content_hash,
+            "acquisition_validation_hash": acquisition_validation.content_hash,
+            "review_manifest_hash": review_manifest.content_hash,
+            "formal_eligibility": False,
+            "capability_persisted": False,
+        }
+        return cls(
+            selection_manifest_hash=selection_chain.selection.content_hash,
+            acquisition_manifest_hash=acquisition.content_hash,
+            acquisition_validation_hash=acquisition_validation.content_hash,
+            review_manifest_hash=review_manifest.content_hash,
+            content_hash=sha256_json(payload),
+        )
+
+
 def validate_acquired_assets(
     manifest: AcquisitionManifest,
     asset_paths: Mapping[str, Path | str],
@@ -612,9 +711,11 @@ def validate_acquired_assets(
 
     if set(asset_paths) != {"validation", "test"}:
         raise DatasetDataError("asset paths must contain exactly validation and test")
-    identifiers = logical_ids or {"validation": "validation", "test": "test"}
+    identifiers = logical_ids or _RAW_SPLIT_LOGICAL_IDS
     if set(identifiers) != {"validation", "test"}:
         raise DatasetDataError("logical IDs must contain exactly validation and test")
+    if any(identifiers[split] != _RAW_SPLIT_LOGICAL_IDS[split] for split in identifiers):
+        raise DatasetDataError("raw split logical identifiers must be canonical")
     validated: list[ValidatedAsset] = []
     by_split = {asset.split: asset for asset in manifest.assets}
     for split in ("validation", "test"):

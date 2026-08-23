@@ -22,6 +22,8 @@ from hy3_algotrace.dataset_models import (
     DatasetDataError,
     DatasetFormat,
     QuotaStatus,
+    ReviewArtifactAsset,
+    ReviewArtifactManifest,
     build_quota_report,
     convert_codecontests_file,
     validate_acquired_assets,
@@ -74,7 +76,6 @@ def _validated_source(
     return validate_acquired_assets(
         manifest,
         paths,
-        logical_ids={"validation": "validation-fixture", "test": "test-fixture"},
     )
 
 
@@ -187,15 +188,14 @@ def test_acquisition_report_is_path_free_self_hashed_and_reads_one_open_fd(
     report = validate_acquired_assets(
         manifest,
         {"validation": valid_path, "test": test_path},
-        logical_ids={"validation": "codecontests-validation", "test": "codecontests-test"},
     )
 
     assert swapped is True
     assert report.manifest_hash == manifest.content_hash
     assert report.content_hash == report.expected_content_hash()
     assert [asset.logical_id for asset in report.assets] == [
-        "codecontests-validation",
-        "codecontests-test",
+        "codecontests-raw-validation",
+        "codecontests-raw-test",
     ]
     serialized = report.model_dump_json()
     assert str(tmp_path) not in serialized
@@ -203,6 +203,61 @@ def test_acquisition_report_is_path_free_self_hashed_and_reads_one_open_fd(
     tampered["assets"][0]["sha256"] = "f" * 64
     with pytest.raises(ValidationError, match="content_hash"):
         type(report).model_validate_json(json.dumps(tampered))
+
+
+def test_split_logical_ids_are_canonical_and_cannot_be_swapped(tmp_path: Path) -> None:
+    """Rehashing a report cannot relabel validation bytes or reviews as test."""
+
+    validation_bytes = b"validation bytes"
+    test_bytes = b"test bytes"
+    paths = {
+        "validation": tmp_path / "validation.bin",
+        "test": tmp_path / "test.bin",
+    }
+    paths["validation"].write_bytes(validation_bytes)
+    paths["test"].write_bytes(test_bytes)
+    acquisition = _manifest(validation_bytes, test_bytes)
+    report = validate_acquired_assets(acquisition, paths)
+
+    assert [asset.logical_id for asset in report.assets] == [
+        "codecontests-raw-validation",
+        "codecontests-raw-test",
+    ]
+    swapped_report = report.model_dump(mode="json")
+    validation_id = swapped_report["assets"][0]["logical_id"]
+    swapped_report["assets"][0]["logical_id"] = swapped_report["assets"][1]["logical_id"]
+    swapped_report["assets"][1]["logical_id"] = validation_id
+    swapped_report["content_hash"] = sha256_json(
+        {key: value for key, value in swapped_report.items() if key != "content_hash"}
+    )
+    with pytest.raises(ValidationError, match="logical identifier"):
+        type(report).model_validate_json(json.dumps(swapped_report))
+
+    review_manifest = ReviewArtifactManifest.create(
+        (
+            ReviewArtifactAsset(
+                split="validation",
+                logical_id="codecontests-review-validation",
+                byte_length=10,
+                sha256="a" * 64,
+            ),
+            ReviewArtifactAsset(
+                split="test",
+                logical_id="codecontests-review-test",
+                byte_length=11,
+                sha256="b" * 64,
+            ),
+        )
+    )
+    swapped_reviews = review_manifest.model_dump(mode="json")
+    validation_id = swapped_reviews["assets"][0]["logical_id"]
+    swapped_reviews["assets"][0]["logical_id"] = swapped_reviews["assets"][1]["logical_id"]
+    swapped_reviews["assets"][1]["logical_id"] = validation_id
+    swapped_reviews["content_hash"] = sha256_json(
+        {key: value for key, value in swapped_reviews.items() if key != "content_hash"}
+    )
+    with pytest.raises(ValidationError, match="logical identifier"):
+        ReviewArtifactManifest.model_validate_json(json.dumps(swapped_reviews))
 
 
 def test_conversion_requires_and_binds_matching_acquisition_validation(
@@ -227,7 +282,6 @@ def test_conversion_requires_and_binds_matching_acquisition_validation(
     validation = validate_acquired_assets(
         manifest,
         {"validation": source, "test": other},
-        logical_ids={"validation": "validation-json", "test": "test-json"},
     )
 
     conversion = convert_codecontests_file(
@@ -240,7 +294,7 @@ def test_conversion_requires_and_binds_matching_acquisition_validation(
     )
 
     assert conversion.acquisition_validation_hash == validation.content_hash
-    assert conversion.source_logical_id == "validation-json"
+    assert conversion.source_logical_id == "codecontests-raw-validation"
     forged_validation = validation.model_copy(
         update={"content_hash": sha256_json("self-authored-report")}
     )

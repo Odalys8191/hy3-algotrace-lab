@@ -247,10 +247,6 @@ def _verified_selection_chain(
     acquisition_validation = validate_acquired_assets(
         acquisition,
         paths,
-        logical_ids={
-            "validation": "formal-chain-validation",
-            "test": "formal-chain-test",
-        },
     )
     review_sets: dict[str, CandidateReviewSet] = {}
     review_paths = {
@@ -272,7 +268,7 @@ def _verified_selection_chain(
         tuple(
             ReviewArtifactAsset(
                 split=split,
-                logical_id=f"formal-chain-reviews-{split}",
+                logical_id=f"codecontests-review-{split}",
                 byte_length=len(review_paths[split].read_bytes()),
                 sha256=hashlib.sha256(review_paths[split].read_bytes()).hexdigest(),
             )

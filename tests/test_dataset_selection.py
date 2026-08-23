@@ -114,7 +114,6 @@ def _fixture_chain(
     validation = validate_acquired_assets(
         acquisition,
         paths,
-        logical_ids={"validation": f"{prefix}-validation", "test": f"{prefix}-test"},
     )
     conversions = tuple(
         convert_codecontests_file(
@@ -180,7 +179,6 @@ def _trusted_replay_chain(tmp_path: Path):  # type: ignore[no-untyped-def]
     acquisition_validation = validate_acquired_assets(
         acquisition,
         raw_paths,
-        logical_ids={"validation": "replay-validation", "test": "replay-test"},
     )
     review_sets: dict[str, CandidateReviewSet] = {}
     review_paths = {split: tmp_path / f"reviews-{split}.json" for split in ("validation", "test")}
@@ -200,7 +198,7 @@ def _trusted_replay_chain(tmp_path: Path):  # type: ignore[no-untyped-def]
         tuple(
             ReviewArtifactAsset(
                 split=split,
-                logical_id=f"checker-reviews-{split}",
+                logical_id=f"codecontests-review-{split}",
                 byte_length=len(review_paths[split].read_bytes()),
                 sha256=hashlib.sha256(review_paths[split].read_bytes()).hexdigest(),
             )

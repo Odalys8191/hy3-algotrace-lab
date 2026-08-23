@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from collections.abc import Mapping, Sequence
@@ -11,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ValidationError
 
-from hy3_algotrace.artifacts import canonical_json_bytes
+from hy3_algotrace.artifacts import canonical_json_bytes, sha256_json
 from hy3_algotrace.corpus import (
     CorpusDataError,
     ProjectBundleManifest,
@@ -23,18 +24,25 @@ from hy3_algotrace.dataset_models import (
     AcquisitionValidationReport,
     CandidateConversionReport,
     CandidateReview,
+    CandidateReviewArtifact,
+    CandidateReviewSet,
     ConversionTool,
     DatasetDataError,
     DatasetFormat,
     EligibilityQuotaReport,
     FrozenSelectionManifest,
     QuotaStatus,
+    ReviewArtifactAsset,
+    ReviewArtifactManifest,
+    SelectionReplayReceipt,
     build_quota_report,
+    canonical_review_split_logical_id,
     convert_codecontests_file,
     freeze_selection,
     read_trusted_file,
     validate_acquired_assets,
     validate_frozen_selection,
+    verify_frozen_selection_chain,
 )
 
 
@@ -76,8 +84,6 @@ def _parser() -> argparse.ArgumentParser:
     acquisition.add_argument("manifest", type=Path)
     acquisition.add_argument("--validation", type=Path, required=True)
     acquisition.add_argument("--test", type=Path, required=True)
-    acquisition.add_argument("--validation-id", required=True)
-    acquisition.add_argument("--test-id", required=True)
     acquisition.add_argument("--output", type=Path, required=True)
     acquisition.set_defaults(handler=_validate_acquisition)
 
@@ -111,13 +117,58 @@ def _parser() -> argparse.ArgumentParser:
     freeze.add_argument("--output", type=Path, required=True)
     freeze.set_defaults(handler=_freeze_selection)
 
-    selection = commands.add_parser("validate-selection")
+    selection = commands.add_parser(
+        "validate-selection-preliminary",
+        help="structural-only validation; does not establish formal readiness",
+    )
     selection.add_argument("manifest", type=Path)
     selection.add_argument("--conversion", type=Path, action="append", required=True)
     selection.add_argument("--quota", type=Path, required=True)
     selection.add_argument("--acquisition", type=Path, required=True)
     selection.add_argument("--validation-report", type=Path, required=True)
-    selection.set_defaults(handler=_validate_selection)
+    selection.set_defaults(handler=_validate_selection_preliminary)
+
+    review_artifact = commands.add_parser("create-review-artifact")
+    review_artifact.add_argument("review", type=Path)
+    review_artifact.add_argument("--raw-row", type=Path, required=True)
+    review_artifact.add_argument("--output", type=Path, required=True)
+    review_artifact.set_defaults(handler=_create_review_artifact)
+
+    review_set = commands.add_parser("create-review-set")
+    review_set.add_argument("--split", choices=("validation", "test"), required=True)
+    review_set.add_argument("--artifact", type=Path, action="append", default=[])
+    review_set.add_argument("--output", type=Path, required=True)
+    review_set.set_defaults(handler=_create_review_set)
+
+    review_manifest = commands.add_parser("pin-review-manifest")
+    review_manifest.add_argument("--validation", type=Path, required=True)
+    review_manifest.add_argument("--test", type=Path, required=True)
+    review_manifest.add_argument("--output", type=Path, required=True)
+    review_manifest.set_defaults(handler=_pin_review_manifest)
+
+    secure_selection = commands.add_parser("verify-selection-chain")
+    secure_selection.add_argument("manifest", type=Path)
+    secure_selection.add_argument("--validation-raw", type=Path, required=True)
+    secure_selection.add_argument("--test-raw", type=Path, required=True)
+    secure_selection.add_argument(
+        "--validation-format",
+        choices=tuple(item.value for item in DatasetFormat),
+        required=True,
+    )
+    secure_selection.add_argument(
+        "--test-format",
+        choices=tuple(item.value for item in DatasetFormat),
+        required=True,
+    )
+    secure_selection.add_argument("--validation-reviews", type=Path, required=True)
+    secure_selection.add_argument("--test-reviews", type=Path, required=True)
+    secure_selection.add_argument("--review-manifest", type=Path, required=True)
+    secure_selection.add_argument("--acquisition", type=Path, required=True)
+    secure_selection.add_argument("--validation-report", type=Path, required=True)
+    secure_selection.add_argument("--validation-converter-arg", action="append", default=[])
+    secure_selection.add_argument("--test-converter-arg", action="append", default=[])
+    secure_selection.add_argument("--output", type=Path, required=True)
+    secure_selection.set_defaults(handler=_verify_selection_chain)
 
     bundles = commands.add_parser("lint-bundles")
     bundles.add_argument("manifest", type=Path)
@@ -140,10 +191,6 @@ def _validate_acquisition(arguments: argparse.Namespace) -> int:
     report = validate_acquired_assets(
         manifest,
         {"validation": arguments.validation, "test": arguments.test},
-        logical_ids={
-            "validation": arguments.validation_id,
-            "test": arguments.test_id,
-        },
     )
     _write_model(arguments.output, report)
     print(arguments.output)
@@ -214,7 +261,7 @@ def _freeze_selection(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _validate_selection(arguments: argparse.Namespace) -> int:
+def _validate_selection_preliminary(arguments: argparse.Namespace) -> int:
     payload = _read_object(arguments.manifest)
     conversions = tuple(
         _read_model(CandidateConversionReport, path) for path in arguments.conversion
@@ -232,7 +279,93 @@ def _validate_selection(arguments: argparse.Namespace) -> int:
         acquisition=acquisition,
         acquisition_validation=validation,
     )
-    print(manifest.content_hash)
+    print(f"preliminary-structural-only:{manifest.content_hash}")
+    return 0
+
+
+def _create_review_artifact(arguments: argparse.Namespace) -> int:
+    raw_row = _read_object(arguments.raw_row)
+    review = _read_model(CandidateReview, arguments.review)
+    artifact = CandidateReviewArtifact.create(
+        raw_row_hash=sha256_json(raw_row),
+        review=review,
+    )
+    _write_model(arguments.output, artifact)
+    print(arguments.output)
+    return 0
+
+
+def _create_review_set(arguments: argparse.Namespace) -> int:
+    artifacts = tuple(_read_model(CandidateReviewArtifact, path) for path in arguments.artifact)
+    review_set = CandidateReviewSet.create(
+        split=arguments.split,
+        artifacts=artifacts,
+    )
+    _write_model(arguments.output, review_set)
+    print(arguments.output)
+    return 0
+
+
+def _pin_review_manifest(arguments: argparse.Namespace) -> int:
+    assets: list[ReviewArtifactAsset] = []
+    for split, path in (
+        ("validation", arguments.validation),
+        ("test", arguments.test),
+    ):
+        review_set, contents = _read_model_bytes(CandidateReviewSet, path)
+        if review_set.split != split:
+            raise DatasetDataError(f"{split} review set split does not match")
+        assets.append(
+            ReviewArtifactAsset(
+                split=split,
+                logical_id=canonical_review_split_logical_id(split),
+                byte_length=len(contents),
+                sha256=hashlib.sha256(contents).hexdigest(),
+            )
+        )
+    manifest = ReviewArtifactManifest.create(tuple(assets))
+    _write_model(arguments.output, manifest)
+    print(arguments.output)
+    return 0
+
+
+def _verify_selection_chain(arguments: argparse.Namespace) -> int:
+    acquisition = _read_model(AcquisitionManifest, arguments.acquisition)
+    validation = _read_model(
+        AcquisitionValidationReport,
+        arguments.validation_report,
+    )
+    review_manifest = _read_model(ReviewArtifactManifest, arguments.review_manifest)
+    chain = verify_frozen_selection_chain(
+        _read_object(arguments.manifest),
+        raw_asset_paths={
+            "validation": arguments.validation_raw,
+            "test": arguments.test_raw,
+        },
+        data_formats={
+            "validation": DatasetFormat(arguments.validation_format),
+            "test": DatasetFormat(arguments.test_format),
+        },
+        review_artifact_paths={
+            "validation": arguments.validation_reviews,
+            "test": arguments.test_reviews,
+        },
+        review_manifest=review_manifest,
+        acquisition=acquisition,
+        acquisition_validation=validation,
+        converter_argv_by_split={
+            "validation": tuple(arguments.validation_converter_arg) or None,
+            "test": tuple(arguments.test_converter_arg) or None,
+        },
+    )
+    receipt = SelectionReplayReceipt.create(
+        selection_chain=chain,
+        acquisition=acquisition,
+        acquisition_validation=validation,
+        review_manifest=review_manifest,
+    )
+    _write_model(arguments.output, receipt)
+    print(receipt.selection_manifest_hash)
     return 0
 
 
@@ -265,6 +398,21 @@ def _read_model[ModelT: BaseModel](model: type[ModelT], path: Path) -> ModelT:
     try:
         text = _read_text(path)
         return model.model_validate_json(text)
+    except ValidationError as error:
+        raise DatasetDataError(f"invalid {model.__name__}") from error
+
+
+def _read_model_bytes[ModelT: BaseModel](
+    model: type[ModelT],
+    path: Path,
+) -> tuple[ModelT, bytes]:
+    snapshot = read_trusted_file(
+        path,
+        logical_id="cli-input",
+        max_bytes=256 * 1024 * 1024,
+    )
+    try:
+        return model.model_validate_json(snapshot.contents), snapshot.contents
     except ValidationError as error:
         raise DatasetDataError(f"invalid {model.__name__}") from error
 
