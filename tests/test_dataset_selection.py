@@ -115,18 +115,38 @@ def _fixture_chain(
         acquisition,
         paths,
     )
-    conversions = tuple(
-        convert_codecontests_file(
-            paths[split],
-            split=split,
-            data_format=DatasetFormat.JSON,
-            reviews=(validation_reviews or []) if split == "validation" else (test_reviews or []),
-            converter=converter,
-            acquisition_validation=validation,
+    split_rows = {
+        "validation": validation_rows or [],
+        "test": test_rows or [],
+    }
+    split_reviews = {
+        "validation": validation_reviews or [],
+        "test": test_reviews or [],
+    }
+    conversions = []
+    for split in ("validation", "test"):
+        review_artifacts = tuple(
+            CandidateReviewArtifact.create(
+                raw_row_hash=sha256_json(row),
+                review=review,
+            )
+            for row, review in zip(
+                split_rows[split],
+                split_reviews[split],
+                strict=True,
+            )
         )
-        for split in ("validation", "test")
-    )
-    return conversions, acquisition, validation
+        conversions.append(
+            convert_codecontests_file(
+                paths[split],
+                split=split,
+                data_format=DatasetFormat.JSON,
+                reviews=review_artifacts,
+                converter=converter,
+                acquisition_validation=validation,
+            )
+        )
+    return tuple(conversions), acquisition, validation
 
 
 def _fulfilled_chain(tmp_path: Path):  # type: ignore[no-untyped-def]

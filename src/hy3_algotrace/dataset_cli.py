@@ -39,6 +39,7 @@ from hy3_algotrace.dataset_models import (
     canonical_review_split_logical_id,
     convert_codecontests_file,
     freeze_selection,
+    load_pinned_review_set,
     read_trusted_file,
     validate_acquired_assets,
     validate_frozen_selection,
@@ -87,21 +88,44 @@ def _parser() -> argparse.ArgumentParser:
     acquisition.add_argument("--output", type=Path, required=True)
     acquisition.set_defaults(handler=_validate_acquisition)
 
-    convert = commands.add_parser("convert")
-    convert.add_argument("input", type=Path)
-    convert.add_argument("--split", choices=("validation", "test"), required=True)
-    convert.add_argument(
+    preliminary_convert = commands.add_parser(
+        "convert-preliminary",
+        help="bare-review exploration only; output cannot be frozen formally",
+    )
+    preliminary_convert.add_argument("input", type=Path)
+    preliminary_convert.add_argument("--split", choices=("validation", "test"), required=True)
+    preliminary_convert.add_argument(
         "--format",
         choices=tuple(item.value for item in DatasetFormat),
         required=True,
     )
-    convert.add_argument("--reviews", type=Path, required=True)
-    convert.add_argument("--converter-name", required=True)
-    convert.add_argument("--converter-version", required=True)
-    convert.add_argument("--validation-report", type=Path, required=True)
-    convert.add_argument("--converter-arg", action="append", default=[])
-    convert.add_argument("--output", type=Path, required=True)
-    convert.set_defaults(handler=_convert)
+    preliminary_convert.add_argument("--reviews", type=Path, required=True)
+    preliminary_convert.add_argument("--converter-name", required=True)
+    preliminary_convert.add_argument("--converter-version", required=True)
+    preliminary_convert.add_argument("--validation-report", type=Path, required=True)
+    preliminary_convert.add_argument("--converter-arg", action="append", default=[])
+    preliminary_convert.add_argument("--output", type=Path, required=True)
+    preliminary_convert.set_defaults(handler=_convert_preliminary)
+
+    formal_convert = commands.add_parser(
+        "convert-formal",
+        help="convert with a split-matching, byte-pinned CandidateReviewSet",
+    )
+    formal_convert.add_argument("input", type=Path)
+    formal_convert.add_argument("--split", choices=("validation", "test"), required=True)
+    formal_convert.add_argument(
+        "--format",
+        choices=tuple(item.value for item in DatasetFormat),
+        required=True,
+    )
+    formal_convert.add_argument("--review-set", type=Path, required=True)
+    formal_convert.add_argument("--review-manifest", type=Path, required=True)
+    formal_convert.add_argument("--converter-name", required=True)
+    formal_convert.add_argument("--converter-version", required=True)
+    formal_convert.add_argument("--validation-report", type=Path, required=True)
+    formal_convert.add_argument("--converter-arg", action="append", default=[])
+    formal_convert.add_argument("--output", type=Path, required=True)
+    formal_convert.set_defaults(handler=_convert_formal)
 
     quota = commands.add_parser("quota")
     quota.add_argument("conversions", type=Path, nargs="+")
@@ -197,7 +221,7 @@ def _validate_acquisition(arguments: argparse.Namespace) -> int:
     return 0
 
 
-def _convert(arguments: argparse.Namespace) -> int:
+def _convert_preliminary(arguments: argparse.Namespace) -> int:
     raw_reviews = _read_json(arguments.reviews)
     if not isinstance(raw_reviews, list):
         raise DatasetDataError("checker reviews must be a JSON array")
@@ -209,6 +233,33 @@ def _convert(arguments: argparse.Namespace) -> int:
         split=arguments.split,
         data_format=DatasetFormat(arguments.format),
         reviews=reviews,
+        converter=ConversionTool(
+            name=arguments.converter_name,
+            version=arguments.converter_version,
+        ),
+        acquisition_validation=_read_model(
+            AcquisitionValidationReport,
+            arguments.validation_report,
+        ),
+        converter_argv=tuple(arguments.converter_arg) or None,
+    )
+    _write_model(arguments.output, report)
+    print(arguments.output)
+    return 0
+
+
+def _convert_formal(arguments: argparse.Namespace) -> int:
+    review_manifest = _read_model(ReviewArtifactManifest, arguments.review_manifest)
+    review_set = load_pinned_review_set(
+        arguments.review_set,
+        split=arguments.split,
+        manifest=review_manifest,
+    )
+    report = convert_codecontests_file(
+        arguments.input,
+        split=arguments.split,
+        data_format=DatasetFormat(arguments.format),
+        reviews=review_set.artifacts,
         converter=ConversionTool(
             name=arguments.converter_name,
             version=arguments.converter_version,

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,22 +15,29 @@ from hy3_algotrace.dataset_cli import main
 from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
     AcquisitionManifest,
-    AcquisitionValidationReport,
     CandidateReview,
-    CandidateReviewSet,
     CheckerKind,
     ConversionTool,
-    DatasetFormat,
-    ReviewArtifactManifest,
-    build_quota_report,
-    convert_codecontests_file,
-    freeze_selection,
     validate_acquired_assets,
 )
 
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _run_cli(*arguments: str | Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "hy3_algotrace.dataset_cli",
+            *(str(argument) for argument in arguments),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
 
 
 def _formal_row(contest_id: int, topic: Topic, rating: int) -> dict[str, object]:
@@ -265,7 +274,7 @@ def test_cli_conversion_and_quota_preserve_unfulfilled_status(tmp_path: Path, ca
     assert (
         main(
             [
-                "convert",
+                "convert-preliminary",
                 str(source),
                 "--split",
                 "validation",
@@ -312,7 +321,7 @@ def test_cli_errors_are_sanitized_and_do_not_echo_hidden_row_content(
     assert (
         main(
             [
-                "convert",
+                "convert-preliminary",
                 str(source),
                 "--split",
                 "test",
@@ -339,7 +348,7 @@ def test_cli_errors_are_sanitized_and_do_not_echo_hidden_row_content(
 
 
 def test_cli_secure_review_pin_and_selection_replay_workflow(tmp_path: Path) -> None:
-    """The CLI can reach trusted raw/review replay without persisting its capability."""
+    """Every derived formal artifact can be produced by CLI before secure replay."""
 
     rows: list[dict[str, object]] = []
     contest_id = 8000
@@ -374,59 +383,51 @@ def test_cli_secure_review_pin_and_selection_replay_workflow(tmp_path: Path) -> 
     acquisition_path = tmp_path / "acquisition.json"
     _write_json(acquisition_path, acquisition.model_dump(mode="json"))
     validation_report_path = tmp_path / "acquisition-validation.json"
-    assert (
-        main(
-            [
-                "validate-acquisition",
-                str(acquisition_path),
-                "--validation",
-                str(raw_paths["validation"]),
-                "--test",
-                str(raw_paths["test"]),
-                "--output",
-                str(validation_report_path),
-            ]
-        )
-        == 0
+    result = _run_cli(
+        "validate-acquisition",
+        acquisition_path,
+        "--validation",
+        raw_paths["validation"],
+        "--test",
+        raw_paths["test"],
+        "--output",
+        validation_report_path,
     )
+    assert result.returncode == 0, result.stderr
 
     artifact_paths: list[Path] = []
+    bare_reviews: list[dict[str, object]] = []
     for row in rows:
         row_id = int(row["cf_contest_id"])
         row_path = tmp_path / f"row-{row_id}.json"
         review_path = tmp_path / f"review-{row_id}.json"
         artifact_path = tmp_path / f"review-artifact-{row_id}.json"
         _write_json(row_path, row)
-        _write_json(
+        review = CandidateReview(
+            problem_id=f"cf-{row_id}-a",
+            checker_reviewed=True,
+            checker_kind=CheckerKind.STANDARD,
+            reviewer="approved-human-reviewer",
+            reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
+            evidence_url=f"https://codeforces.com/problemset/problem/{row_id}/A",
+        )
+        bare_reviews.append(review.model_dump(mode="json"))
+        _write_json(review_path, review.model_dump(mode="json"))
+        result = _run_cli(
+            "create-review-artifact",
             review_path,
-            CandidateReview(
-                problem_id=f"cf-{row_id}-a",
-                checker_reviewed=True,
-                checker_kind=CheckerKind.STANDARD,
-                reviewer="approved-human-reviewer",
-                reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
-                evidence_url=f"https://codeforces.com/problemset/problem/{row_id}/A",
-            ).model_dump(mode="json"),
+            "--raw-row",
+            row_path,
+            "--output",
+            artifact_path,
         )
-        assert (
-            main(
-                [
-                    "create-review-artifact",
-                    str(review_path),
-                    "--raw-row",
-                    str(row_path),
-                    "--output",
-                    str(artifact_path),
-                ]
-            )
-            == 0
-        )
+        assert result.returncode == 0, result.stderr
         artifact_paths.append(artifact_path)
     review_set_paths = {
         "validation": tmp_path / "validation-reviews.json",
         "test": tmp_path / "test-reviews.json",
     }
-    validation_set_argv = [
+    validation_set_argv: list[str | Path] = [
         "create-review-set",
         "--split",
         "validation",
@@ -434,108 +435,201 @@ def test_cli_secure_review_pin_and_selection_replay_workflow(tmp_path: Path) -> 
         str(review_set_paths["validation"]),
     ]
     for artifact_path in artifact_paths:
-        validation_set_argv.extend(("--artifact", str(artifact_path)))
-    assert main(validation_set_argv) == 0
-    assert (
-        main(
-            [
-                "create-review-set",
-                "--split",
-                "test",
-                "--output",
-                str(review_set_paths["test"]),
-            ]
-        )
-        == 0
+        validation_set_argv.extend(("--artifact", artifact_path))
+    result = _run_cli(*validation_set_argv)
+    assert result.returncode == 0, result.stderr
+    result = _run_cli(
+        "create-review-set",
+        "--split",
+        "test",
+        "--output",
+        review_set_paths["test"],
     )
+    assert result.returncode == 0, result.stderr
     review_manifest_path = tmp_path / "review-manifest.json"
-    assert (
-        main(
-            [
-                "pin-review-manifest",
-                "--validation",
-                str(review_set_paths["validation"]),
-                "--test",
-                str(review_set_paths["test"]),
-                "--output",
-                str(review_manifest_path),
-            ]
-        )
-        == 0
+    result = _run_cli(
+        "pin-review-manifest",
+        "--validation",
+        review_set_paths["validation"],
+        "--test",
+        review_set_paths["test"],
+        "--output",
+        review_manifest_path,
     )
+    assert result.returncode == 0, result.stderr
 
-    acquisition_validation = AcquisitionValidationReport.model_validate_json(
-        validation_report_path.read_text(encoding="utf-8")
-    )
-    review_sets = {
-        split: CandidateReviewSet.model_validate_json(
-            review_set_paths[split].read_text(encoding="utf-8")
-        )
-        for split in ("validation", "test")
+    conversion_paths = {
+        split: tmp_path / f"formal-{split}-conversion.json" for split in ("validation", "test")
     }
-    conversions = tuple(
-        convert_codecontests_file(
+    for split in ("validation", "test"):
+        result = _run_cli(
+            "convert-formal",
             raw_paths[split],
-            split=split,
-            data_format=DatasetFormat.JSON,
-            reviews=review_sets[split].artifacts,
-            converter=converter,
-            acquisition_validation=acquisition_validation,
+            "--split",
+            split,
+            "--format",
+            "json",
+            "--review-set",
+            review_set_paths[split],
+            "--review-manifest",
+            review_manifest_path,
+            "--converter-name",
+            "secure-cli-json",
+            "--converter-version",
+            "1",
+            "--validation-report",
+            validation_report_path,
+            "--output",
+            conversion_paths[split],
         )
-        for split in ("validation", "test")
+        assert result.returncode == 0, result.stderr
+
+    quota_path = tmp_path / "formal-quota.json"
+    result = _run_cli(
+        "quota",
+        conversion_paths["validation"],
+        conversion_paths["test"],
+        "--output",
+        quota_path,
     )
-    quota = build_quota_report(conversions)
-    selection = freeze_selection(
-        tuple(
-            assessment.problem_id
-            for conversion in conversions
-            for assessment in conversion.eligible
-        ),
-        conversions=conversions,
-        quota=quota,
-        acquisition=acquisition,
-        acquisition_validation=acquisition_validation,
+    assert result.returncode == 0, result.stderr
+    selected_ids_path = tmp_path / "selected-ids.json"
+    _write_json(
+        selected_ids_path,
+        [f"cf-{int(row['cf_contest_id'])}-a" for row in rows],
     )
     selection_path = tmp_path / "selection.json"
-    _write_json(selection_path, selection.model_dump(mode="json"))
-    receipt_path = tmp_path / "selection-replay-receipt.json"
-    assert (
-        main(
-            [
-                "verify-selection-chain",
-                str(selection_path),
-                "--validation-raw",
-                str(raw_paths["validation"]),
-                "--test-raw",
-                str(raw_paths["test"]),
-                "--validation-format",
-                "json",
-                "--test-format",
-                "json",
-                "--acquisition",
-                str(acquisition_path),
-                "--validation-report",
-                str(validation_report_path),
-                "--validation-reviews",
-                str(review_set_paths["validation"]),
-                "--test-reviews",
-                str(review_set_paths["test"]),
-                "--review-manifest",
-                str(review_manifest_path),
-                "--output",
-                str(receipt_path),
-            ]
-        )
-        == 0
+    result = _run_cli(
+        "freeze-selection",
+        selected_ids_path,
+        "--conversion",
+        conversion_paths["validation"],
+        "--conversion",
+        conversion_paths["test"],
+        "--quota",
+        quota_path,
+        "--acquisition",
+        acquisition_path,
+        "--validation-report",
+        validation_report_path,
+        "--output",
+        selection_path,
     )
+    assert result.returncode == 0, result.stderr
+    result = _run_cli(
+        "validate-selection-preliminary",
+        selection_path,
+        "--conversion",
+        conversion_paths["validation"],
+        "--conversion",
+        conversion_paths["test"],
+        "--quota",
+        quota_path,
+        "--acquisition",
+        acquisition_path,
+        "--validation-report",
+        validation_report_path,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("preliminary-structural-only:")
+
+    artifact_hashes = {
+        json.loads(path.read_text(encoding="utf-8"))["content_hash"] for path in artifact_paths
+    }
+    selection_payload = json.loads(selection_path.read_text(encoding="utf-8"))
+    assert {entry["review_hash"] for entry in selection_payload["entries"]} == artifact_hashes
+
+    receipt_path = tmp_path / "selection-replay-receipt.json"
+    result = _run_cli(
+        "verify-selection-chain",
+        selection_path,
+        "--validation-raw",
+        raw_paths["validation"],
+        "--test-raw",
+        raw_paths["test"],
+        "--validation-format",
+        "json",
+        "--test-format",
+        "json",
+        "--acquisition",
+        acquisition_path,
+        "--validation-report",
+        validation_report_path,
+        "--validation-reviews",
+        review_set_paths["validation"],
+        "--test-reviews",
+        review_set_paths["test"],
+        "--review-manifest",
+        review_manifest_path,
+        "--output",
+        receipt_path,
+    )
+    assert result.returncode == 0, result.stderr
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     assert receipt["kind"] == "verified_selection_replay_receipt"
-    assert receipt["selection_manifest_hash"] == selection.content_hash
+    assert receipt["selection_manifest_hash"] == selection_payload["content_hash"]
     assert (
         receipt["review_manifest_hash"]
-        == ReviewArtifactManifest.model_validate_json(
-            review_manifest_path.read_text(encoding="utf-8")
-        ).content_hash
+        == json.loads(review_manifest_path.read_text(encoding="utf-8"))["content_hash"]
     )
     assert receipt["formal_eligibility"] is False
     assert receipt["capability_persisted"] is False
+
+    preliminary_reviews = {
+        "validation": tmp_path / "bare-validation-reviews.json",
+        "test": tmp_path / "bare-test-reviews.json",
+    }
+    _write_json(preliminary_reviews["validation"], bare_reviews)
+    _write_json(preliminary_reviews["test"], [])
+    preliminary_conversions = {
+        split: tmp_path / f"preliminary-{split}-conversion.json" for split in ("validation", "test")
+    }
+    for split in ("validation", "test"):
+        result = _run_cli(
+            "convert-preliminary",
+            raw_paths[split],
+            "--split",
+            split,
+            "--format",
+            "json",
+            "--reviews",
+            preliminary_reviews[split],
+            "--converter-name",
+            "secure-cli-json",
+            "--converter-version",
+            "1",
+            "--validation-report",
+            validation_report_path,
+            "--output",
+            preliminary_conversions[split],
+        )
+        assert result.returncode == 0, result.stderr
+    preliminary_quota_path = tmp_path / "preliminary-quota.json"
+    result = _run_cli(
+        "quota",
+        preliminary_conversions["validation"],
+        preliminary_conversions["test"],
+        "--output",
+        preliminary_quota_path,
+    )
+    assert result.returncode == 0, result.stderr
+    rejected_selection = tmp_path / "must-not-freeze-preliminary.json"
+    result = _run_cli(
+        "freeze-selection",
+        selected_ids_path,
+        "--conversion",
+        preliminary_conversions["validation"],
+        "--conversion",
+        preliminary_conversions["test"],
+        "--quota",
+        preliminary_quota_path,
+        "--acquisition",
+        acquisition_path,
+        "--validation-report",
+        validation_report_path,
+        "--output",
+        rejected_selection,
+    )
+    assert result.returncode == 2
+    assert result.stderr == "error: dataset command failed\n"
+    assert not rejected_selection.exists()

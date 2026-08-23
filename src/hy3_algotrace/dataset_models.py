@@ -860,6 +860,45 @@ def convert_codecontests_file(
     )
 
 
+def load_pinned_review_set(
+    path: Path | str,
+    *,
+    split: Literal["validation", "test"],
+    manifest: ReviewArtifactManifest,
+) -> CandidateReviewSet:
+    """Read one review set through its independently approved byte manifest."""
+
+    try:
+        trusted_manifest = ReviewArtifactManifest.model_validate_json(manifest.model_dump_json())
+    except ValidationError as error:
+        raise DatasetDataError("review artifact manifest is invalid") from error
+    expected = next(
+        (asset for asset in trusted_manifest.assets if asset.split == split),
+        None,
+    )
+    if expected is None:
+        raise DatasetDataError(f"{split} review artifact manifest entry is missing")
+    try:
+        observed = read_trusted_file(
+            path,
+            logical_id=expected.logical_id,
+            max_bytes=expected.byte_length,
+        )
+    except DatasetDataError as error:
+        raise DatasetDataError(f"{split} review artifact byte length mismatch") from error
+    if observed.byte_length != expected.byte_length:
+        raise DatasetDataError(f"{split} review artifact byte length mismatch")
+    if observed.sha256 != expected.sha256:
+        raise DatasetDataError(f"{split} review artifact SHA-256 mismatch")
+    try:
+        review_set = CandidateReviewSet.model_validate_json(observed.contents)
+    except (TypeError, ValueError, ValidationError) as error:
+        raise DatasetDataError(f"{split} review artifact is invalid") from error
+    if review_set.split != split:
+        raise DatasetDataError(f"{split} review artifact split does not match")
+    return review_set
+
+
 def build_quota_report(
     conversion: CandidateConversionReport | Iterable[CandidateConversionReport],
 ) -> EligibilityQuotaReport:
@@ -924,6 +963,12 @@ def freeze_selection(
         raise DatasetDataError("cannot freeze selection while status is unfulfilled_quota")
     if quota.source_conversion_hash != _conversion_set_hash(materialized):
         raise DatasetDataError("quota report does not match candidate conversions")
+    if any(
+        assessment.review_artifact_hash is None
+        for conversion in materialized
+        for assessment in conversion.eligible
+    ):
+        raise DatasetDataError("formal selection requires pinned review artifacts")
     selected_ids = tuple(selected_problem_ids)
     if len(selected_ids) != 30 or len(set(selected_ids)) != 30:
         raise DatasetDataError("formal selection requires exactly 30 unique problem IDs")
@@ -1065,34 +1110,10 @@ def _load_pinned_review_sets(
     paths: Mapping[str, Path | str],
     manifest: ReviewArtifactManifest,
 ) -> dict[str, CandidateReviewSet]:
-    try:
-        trusted_manifest = ReviewArtifactManifest.model_validate_json(manifest.model_dump_json())
-    except ValidationError as error:
-        raise DatasetDataError("review artifact manifest is invalid") from error
-    expected_by_split = {asset.split: asset for asset in trusted_manifest.assets}
-    result: dict[str, CandidateReviewSet] = {}
-    for split in ("validation", "test"):
-        expected = expected_by_split[split]
-        try:
-            observed = read_trusted_file(
-                paths[split],
-                logical_id=expected.logical_id,
-                max_bytes=expected.byte_length,
-            )
-        except DatasetDataError as error:
-            raise DatasetDataError(f"{split} review artifact byte length mismatch") from error
-        if observed.byte_length != expected.byte_length:
-            raise DatasetDataError(f"{split} review artifact byte length mismatch")
-        if observed.sha256 != expected.sha256:
-            raise DatasetDataError(f"{split} review artifact SHA-256 mismatch")
-        try:
-            review_set = CandidateReviewSet.model_validate_json(observed.contents)
-        except (TypeError, ValueError, ValidationError) as error:
-            raise DatasetDataError(f"{split} review artifact is invalid") from error
-        if review_set.split != split:
-            raise DatasetDataError(f"{split} review artifact split does not match")
-        result[split] = review_set
-    return result
+    return {
+        split: load_pinned_review_set(paths[split], split=split, manifest=manifest)
+        for split in ("validation", "test")
+    }
 
 
 def _assess_row(

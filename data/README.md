@@ -20,18 +20,22 @@ The supported workflow is:
    size/SHA-256 observed from one no-follow file descriptor per split. Relabeling
    or swapping the two logical identities is invalid even if the report is
    rehashed.
-2. Convert verified JSON, JSONL, or Parquet rows with `convert`. Official
-   Riegeli input uses a trusted external converter command whose argument list
-   contains the separate `{input}` and `{output}` tokens. Missing `pyarrow` or
-   a Riegeli converter fails with an actionable error. Every `convert` command
-   requires `--validation-report`; the raw bytes are reopened safely and must
-   match the report before conversion.
-3. Store checker-review annotations outside the repository. Use
+2. Store checker-review annotations outside the repository. Use
    `create-review-artifact` with the exact raw row and one `CandidateReview`;
    the resulting self-hashed artifact binds that annotation to the canonical
    raw-row hash. Use `create-review-set` separately for validation and test,
    then `pin-review-manifest` to observe both files through trusted descriptors
    and freeze their canonical identities, lengths, and SHA-256 values.
+3. Convert verified JSON, JSONL, or Parquet rows with `convert-formal`, supplying
+   the matching `--review-set` and independently approved `--review-manifest`.
+   Every eligible assessment then carries its exact review-artifact hash through
+   quota and selection freeze. Official Riegeli input uses a trusted external
+   converter command whose argument list contains the separate `{input}` and
+   `{output}` tokens. Missing `pyarrow` or a Riegeli converter fails with an
+   actionable error. Every conversion requires `--validation-report`; the raw
+   bytes are reopened safely and must match the report before conversion.
+   `convert-preliminary` accepts bare review annotations for exploration only;
+   its output cannot be used by `freeze-selection`.
 4. Independently record and human-approve the exact
    `ReviewArtifactManifest.content_hash` as the review trust root for this data
    version. Self-hashing detects inconsistency; it does **not** authenticate the
