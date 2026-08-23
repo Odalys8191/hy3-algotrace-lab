@@ -11,6 +11,7 @@ import pytest
 from hy3_algotrace.contracts import ErrorTaxonomy, ProblemRecord, Topic
 from hy3_algotrace.contracts import TestCase as ContractTestCase
 from hy3_algotrace.hy3_client import (
+    Hy3AttemptContext,
     Hy3Client,
     Hy3Config,
     Hy3ResponseError,
@@ -263,6 +264,59 @@ def test_generate_allows_exactly_one_schema_repair(tmp_path: Path) -> None:
     assert result.trace_id == "trace-1"
     assert len(request_bodies) == 2
     assert "repair" in request_bodies[1].lower()
+
+
+def test_attempt_observer_counts_retry_and_repair_but_not_cache_hit(
+    tmp_path: Path,
+) -> None:
+    responses = iter(
+        (
+            httpx.Response(503, json={"error": {"message": "busy"}}),
+            completion("not json"),
+            completion(json.dumps(valid_trace_payload())),
+        )
+    )
+    contexts: list[Hy3AttemptContext] = []
+    transport_calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal transport_calls
+        transport_calls += 1
+        return next(responses)
+
+    hy3 = Hy3Client(
+        Hy3Config(
+            base_url="https://hy3.example/v1",
+            api_key="test-key",
+            max_attempts=3,
+        ),
+        cache=JsonResponseCache(tmp_path / "cache"),
+        transport=httpx.MockTransport(handler),
+        attempt_observer=contexts.append,
+    )
+
+    first = hy3.generate(problem())
+    second = hy3.generate(problem())
+
+    assert first == second
+    assert transport_calls == 3
+    assert contexts == [
+        Hy3AttemptContext(
+            operation="solution-trace-v1",
+            phase="request",
+            retry_number=1,
+        ),
+        Hy3AttemptContext(
+            operation="solution-trace-v1",
+            phase="request",
+            retry_number=2,
+        ),
+        Hy3AttemptContext(
+            operation="solution-trace-v1",
+            phase="schema_repair",
+            retry_number=1,
+        ),
+    ]
 
 
 def test_generate_stops_after_one_failed_schema_repair(tmp_path: Path) -> None:
