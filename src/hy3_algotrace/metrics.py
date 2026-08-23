@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 
 from .benchmark_models import (
+    HumanConfirmedLabel,
     MetricBreakdown,
     MetricObservation,
     MetricResult,
@@ -32,9 +33,7 @@ def _ratio(
     )
 
 
-def _taxonomy_macro_f1(
-    rows: Sequence[MetricObservation], *, formal: bool
-) -> MetricResult:
+def _taxonomy_macro_f1(rows: Sequence[MetricObservation], *, formal: bool) -> MetricResult:
     included = tuple(row for row in rows if row.gold_taxonomy is not None)
     if not included and not formal:
         return MetricResult(
@@ -49,12 +48,9 @@ def _taxonomy_macro_f1(
     for taxonomy in ErrorTaxonomy:
         support = sum(row.gold_taxonomy is taxonomy for row in included)
         if formal and support == 0:
-            raise ValueError(
-                f"formal taxonomy support is missing for {taxonomy.value}"
-            )
+            raise ValueError(f"formal taxonomy support is missing for {taxonomy.value}")
         true_positive = sum(
-            row.gold_taxonomy is taxonomy and row.predicted_taxonomy is taxonomy
-            for row in included
+            row.gold_taxonomy is taxonomy and row.predicted_taxonomy is taxonomy for row in included
         )
         false_positive = sum(
             row.gold_taxonomy is not taxonomy and row.predicted_taxonomy is taxonomy
@@ -65,9 +61,7 @@ def _taxonomy_macro_f1(
             for row in included
         )
         f1_denominator = 2 * true_positive + false_positive + false_negative
-        class_scores.append(
-            0.0 if f1_denominator == 0 else 2 * true_positive / f1_denominator
-        )
+        class_scores.append(0.0 if f1_denominator == 0 else 2 * true_positive / f1_denominator)
     denominator = len(tuple(ErrorTaxonomy))
     numerator = float(sum(class_scores))
     return MetricResult(
@@ -81,20 +75,26 @@ def _taxonomy_macro_f1(
 
 
 def _metric_set(
-    rows: Sequence[MetricObservation], *, formal: bool = False
+    rows: Sequence[MetricObservation],
+    *,
+    human_labels: Sequence[HumanConfirmedLabel] = (),
+    formal: bool = False,
 ) -> tuple[MetricResult, ...]:
-    natural = tuple(
+    natural_final = tuple(
         row
         for row in rows
         if row.sample_kind is SampleKind.NATURAL and row.gold_final_correct is not None
+    )
+    natural_process = tuple(
+        row
+        for row in rows
+        if row.sample_kind is SampleKind.NATURAL and row.gold_process_valid is not None
     )
     process_labeled = tuple(row for row in rows if row.gold_process_valid is not None)
     invalid = tuple(row for row in rows if row.gold_process_valid is False)
     localized = tuple(row for row in invalid if row.gold_first_error_step is not None)
     paradox = tuple(
-        row
-        for row in rows
-        if row.gold_final_correct is True and row.gold_process_valid is False
+        row for row in rows if row.gold_final_correct is True and row.gold_process_valid is False
     )
     standard_gold = tuple(
         row
@@ -104,25 +104,29 @@ def _metric_set(
         and row.gold_process_valid is True
     )
     audited = tuple(rows)
-    flagged_final = tuple(
-        row
-        for row in rows
-        if row.needs_human_review and row.gold_final_correct is not None
-    )
-    flagged_process = tuple(
-        row
-        for row in rows
-        if row.needs_human_review and row.gold_process_valid is not None
+    human_by_sample = {label.sample_id: label for label in human_labels}
+    flagged_confirmed = tuple(
+        row for row in rows if row.needs_human_review and row.sample_id in human_by_sample
     )
     reviewed = tuple(row for row in rows if row.primary_review_agreement is not None)
     return (
         _ratio(
             "natural_final_accuracy",
-            natural,
+            natural_final,
+            lambda row: row.gold_final_correct is True,
+        ),
+        _ratio(
+            "natural_process_valid_rate",
+            natural_process,
+            lambda row: row.gold_process_valid is True,
+        ),
+        _ratio(
+            "natural_final_correctness_evaluator_agreement",
+            natural_final,
             lambda row: row.predicted_final_correct is row.gold_final_correct,
         ),
         _ratio(
-            "process_correctness",
+            "process_validity_evaluator_agreement",
             process_labeled,
             lambda row: row.predicted_process_valid is row.gold_process_valid,
         ),
@@ -165,14 +169,17 @@ def _metric_set(
             lambda row: row.needs_human_review,
         ),
         _ratio(
-            "flagged_final_incorrect_proportion",
-            flagged_final,
-            lambda row: row.gold_final_correct is False,
+            "flagged_final_correct_process_issue_rate",
+            flagged_confirmed,
+            lambda row: (
+                human_by_sample[row.sample_id].final_correct
+                and not human_by_sample[row.sample_id].process_valid
+            ),
         ),
         _ratio(
-            "flagged_process_invalid_proportion",
-            flagged_process,
-            lambda row: row.gold_process_valid is False,
+            "flagged_false_positive_rate",
+            flagged_confirmed,
+            lambda row: human_by_sample[row.sample_id].process_valid,
         ),
         _ratio(
             "primary_review_agreement_rate",
@@ -189,17 +196,32 @@ def _metric_set(
 
 
 def compute_metrics(
-    rows: Sequence[MetricObservation], *, formal: bool = False
+    rows: Sequence[MetricObservation],
+    *,
+    human_labels: Sequence[HumanConfirmedLabel] = (),
+    formal: bool = False,
 ) -> MetricsReport:
     """Compute overall and stratified metrics directly from included rows."""
 
     stable_rows = tuple(rows)
-    overall = _metric_set(stable_rows, formal=formal)
+    stable_human_labels = tuple(human_labels)
+    known_ids = {row.sample_id for row in stable_rows}
+    label_ids = tuple(label.sample_id for label in stable_human_labels)
+    if len(set(label_ids)) != len(label_ids):
+        raise ValueError("human-confirmed sample IDs must be unique")
+    if not set(label_ids) <= known_ids:
+        raise ValueError("human-confirmed label references an unknown sample")
+    overall = _metric_set(
+        stable_rows,
+        human_labels=stable_human_labels,
+        formal=formal,
+    )
     by_topic = tuple(
         MetricBreakdown(
             key=topic.value,
             metrics=_metric_set(
-                tuple(row for row in stable_rows if row.topic is topic)
+                tuple(row for row in stable_rows if row.topic is topic),
+                human_labels=stable_human_labels,
             ),
         )
         for topic in Topic
@@ -209,7 +231,8 @@ def compute_metrics(
         MetricBreakdown(
             key=rating.value,
             metrics=_metric_set(
-                tuple(row for row in stable_rows if row.rating_band is rating)
+                tuple(row for row in stable_rows if row.rating_band is rating),
+                human_labels=stable_human_labels,
             ),
         )
         for rating in RatingBand

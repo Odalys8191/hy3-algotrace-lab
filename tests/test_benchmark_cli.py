@@ -39,9 +39,7 @@ def test_validate_config_cli_emits_literal_machine_readable_identity(
     }
 
 
-def test_run_cli_uses_injected_executor_and_immutable_artifact_tree(
-    tmp_path: Path, capsys
-) -> None:  # type: ignore[no-untyped-def]
+def test_run_cli_uses_injected_executor_and_immutable_artifact_tree(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
     benchmark_config = config(
         benchmark_id="cli-run",
         sample_ids=("n1",),
@@ -53,18 +51,10 @@ def test_run_cli_uses_injected_executor_and_immutable_artifact_tree(
     write_json(config_path, benchmark_config.model_dump(mode="json"))
     row = {item.sample_id: item for item in literal_rows()}["n1"]
 
-    def execute(
-        sample_id: str, observer: Callable[[Hy3AttemptContext], None]
-    ):
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]):
+        observer(Hy3AttemptContext(operation="logic-reviewer-v1", phase="request", retry_number=1))
         observer(
-            Hy3AttemptContext(
-                operation="logic-reviewer-v1", phase="request", retry_number=1
-            )
-        )
-        observer(
-            Hy3AttemptContext(
-                operation="adversarial-reviewer-v1", phase="request", retry_number=1
-            )
+            Hy3AttemptContext(operation="adversarial-reviewer-v1", phase="request", retry_number=1)
         )
         return row
 
@@ -140,9 +130,7 @@ def test_replay_cli_is_executable_through_real_module_boundary(tmp_path: Path) -
         "status": "complete",
     }
     assert (artifact_root / "benchmarks/shell-replay/replay-input.json").is_file()
-    report = json.loads(
-        (artifact_root / "benchmarks/shell-replay/report.json").read_text()
-    )
+    report = json.loads((artifact_root / "benchmarks/shell-replay/report.json").read_text())
     assert report["execution_kind"] == "artifact_replay"
     assert report["formal_eligible"] is False
 

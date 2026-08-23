@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import random
 import re
+from datetime import datetime
 from enum import StrEnum
 from pathlib import PurePosixPath
 from typing import Literal, Self
@@ -62,13 +64,45 @@ class MetricObservation(BenchmarkModel):
         if self.gold_process_valid is False and (
             self.gold_first_error_step is None or self.gold_taxonomy is None
         ):
-            raise ValueError(
-                "gold invalid process requires first-error and taxonomy labels"
-            )
+            raise ValueError("gold invalid process requires first-error and taxonomy labels")
         if self.gold_process_valid is True and (
             self.gold_first_error_step is not None or self.gold_taxonomy is not None
         ):
             raise ValueError("gold valid process cannot carry error labels")
+        return self
+
+
+class HumanConfirmedLabel(BenchmarkModel):
+    """Independent human label; never folded back into evaluator predictions."""
+
+    schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    sample_id: str = Field(min_length=1, strict=True)
+    final_correct: bool = Field(strict=True)
+    process_valid: bool = Field(strict=True)
+    first_error_step: int | None = Field(default=None, gt=0, strict=True)
+    taxonomy: ErrorTaxonomy | None = None
+
+    @model_validator(mode="after")
+    def validate_process_label(self) -> Self:
+        if self.process_valid and (self.first_error_step is not None or self.taxonomy is not None):
+            raise ValueError("valid human process label cannot carry an error")
+        if not self.process_valid and (self.first_error_step is None or self.taxonomy is None):
+            raise ValueError("invalid human process label requires error evidence")
+        return self
+
+
+class HumanConfirmedLabelSet(BenchmarkModel):
+    """Create-only benchmark artifact kept separate from evaluator observations."""
+
+    schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    benchmark_id: str = Field(min_length=1, strict=True)
+    labels: tuple[HumanConfirmedLabel, ...] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_unique_labels(self) -> Self:
+        sample_ids = tuple(label.sample_id for label in self.labels)
+        if len(set(sample_ids)) != len(sample_ids):
+            raise ValueError("human-confirmed sample IDs must be unique")
         return self
 
 
@@ -88,10 +122,7 @@ class MetricResult(BenchmarkModel):
                 raise ValueError("zero-denominator metric must be not_evaluable")
         elif self.value is None or self.not_evaluable:
             raise ValueError("nonzero-denominator metric must have a value")
-        if (
-            self.name != "taxonomy_macro_f1"
-            and len(self.included_sample_ids) != self.denominator
-        ):
+        if self.name != "taxonomy_macro_f1" and len(self.included_sample_ids) != self.denominator:
             raise ValueError("metric denominator must equal included sample count")
         return self
 
@@ -261,15 +292,11 @@ class BenchmarkConfig(BenchmarkModel):
         if tuple(item.sample_id for item in self.sample_specs) != self.ordered_sample_ids:
             raise ValueError("sample specs must match ordered sample IDs exactly")
         known = set(self.ordered_sample_ids)
-        if not set(self.generation_sample_ids) <= known or not set(
-            self.audit_sample_ids
-        ) <= known:
+        if not set(self.generation_sample_ids) <= known or not set(self.audit_sample_ids) <= known:
             raise ValueError("generation and audit IDs must belong to ordered samples")
         if self.remote_attempt_budget < self.static_attempt_lower_bound:
             raise ValueError("remote budget is below the static remote-attempt lower bound")
-        if len({item.name for item in self.model_parameters}) != len(
-            self.model_parameters
-        ):
+        if len({item.name for item in self.model_parameters}) != len(self.model_parameters):
             raise ValueError("model parameter names must be unique")
         parsed = urlsplit(self.endpoint_identity)
         if (
@@ -299,13 +326,10 @@ class BenchmarkConfig(BenchmarkModel):
             SampleKind.NATURAL: 60,
         }
         actual_counts = {
-            kind: sum(spec.sample_kind is kind for spec in self.sample_specs)
-            for kind in SampleKind
+            kind: sum(spec.sample_kind is kind for spec in self.sample_specs) for kind in SampleKind
         }
         natural_ids = tuple(
-            spec.sample_id
-            for spec in self.sample_specs
-            if spec.sample_kind is SampleKind.NATURAL
+            spec.sample_id for spec in self.sample_specs if spec.sample_kind is SampleKind.NATURAL
         )
         if (
             actual_counts != expected_counts
@@ -324,14 +348,39 @@ class BenchmarkConfig(BenchmarkModel):
                 raise ValueError("one formal problem cannot cross frozen strata")
         if len(problem_strata) != 30:
             raise ValueError("formal profile requires exactly 30 problem identities")
+        for problem_id in problem_strata:
+            per_kind = {
+                kind: sum(
+                    spec.problem_id == problem_id and spec.sample_kind is kind
+                    for spec in self.sample_specs
+                )
+                for kind in SampleKind
+            }
+            if (
+                per_kind[SampleKind.GOLD] != 1
+                or per_kind[SampleKind.CONTROLLED_WRONG] != 2
+                or per_kind[SampleKind.NATURAL] != 2
+            ):
+                raise ValueError(
+                    "formal profile requires one gold, two controlled_wrong, "
+                    "and two natural samples per problem"
+                )
         for topic in Topic:
             for band in RatingBand:
-                count = sum(
-                    stratum == (topic, band) for stratum in problem_strata.values()
-                )
+                count = sum(stratum == (topic, band) for stratum in problem_strata.values())
                 if count != 2:
                     raise ValueError(
                         "formal profile requires two problems in every 5x3 topic/rating cell"
+                    )
+                paradox_count = sum(
+                    spec.sample_kind is SampleKind.PARADOX
+                    and spec.topic is topic
+                    and spec.rating_band is band
+                    for spec in self.sample_specs
+                )
+                if paradox_count != 1:
+                    raise ValueError(
+                        "formal profile requires one paradox in every 5x3 topic/rating cell"
                     )
         if self.verified_data_evidence is None:
             raise ValueError("formal profile requires hash-bound verified-data evidence")
@@ -397,6 +446,7 @@ class BenchmarkRunReport(BenchmarkModel):
     complete: bool = Field(strict=True)
     formal_eligible: bool = Field(strict=True)
     formal_evidence_verified: bool = Field(strict=True)
+    formal_attempt_profile_valid: bool = Field(strict=True)
     completed_sample_ids: tuple[str, ...]
     remote_attempts_used: int = Field(ge=0, strict=True)
     artifacts: tuple[ArtifactHashEntry, ...]
@@ -406,11 +456,11 @@ class BenchmarkRunReport(BenchmarkModel):
         if self.complete is not (self.status is BenchmarkStatus.COMPLETE):
             raise ValueError("complete flag must match benchmark status")
         if self.formal_eligible and (
-            not self.complete or not self.formal_evidence_verified
+            not self.complete
+            or not self.formal_evidence_verified
+            or not self.formal_attempt_profile_valid
         ):
-            raise ValueError(
-                "formal eligibility requires a complete run and verified external evidence"
-            )
+            raise ValueError("formal eligibility requires complete evidence and attempt profile")
         if self.formal_evidence_verified and not self.complete:
             raise ValueError("partial benchmark cannot verify formal evidence")
         return self
@@ -444,9 +494,12 @@ class HumanReviewCandidate(BenchmarkModel):
 
 class BlindReasoningStep(BenchmarkModel):
     schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    step_id: str = Field(min_length=1, strict=True)
     step_number: int = Field(gt=0, strict=True)
+    stage: ReasoningStage
     claim: str = Field(min_length=1, strict=True)
     rationale: str = Field(min_length=1, strict=True)
+    depends_on: tuple[str, ...]
 
 
 class BlindReviewItem(BenchmarkModel):
@@ -498,23 +551,31 @@ class HumanReviewMapping(BenchmarkModel):
         return self
 
 
+class HumanReviewRound(StrEnum):
+    INITIAL = "initial"
+    DELAYED = "delayed"
+
+
 class HumanDecision(BenchmarkModel):
     schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    decision_id: str = Field(min_length=1, strict=True)
     blind_id: str = Field(min_length=1, strict=True)
+    reviewer_id: str = Field(min_length=1, strict=True)
+    round: HumanReviewRound
+    decided_at: datetime
+    final_correct: bool = Field(strict=True)
     process_valid: bool = Field(strict=True)
     first_error_step: int | None = Field(default=None, gt=0, strict=True)
     taxonomy: ErrorTaxonomy | None = None
 
     @model_validator(mode="after")
     def validate_process_decision(self) -> Self:
-        if self.process_valid and (
-            self.first_error_step is not None or self.taxonomy is not None
-        ):
+        if self.process_valid and (self.first_error_step is not None or self.taxonomy is not None):
             raise ValueError("valid process cannot carry an error decision")
-        if not self.process_valid and (
-            self.first_error_step is None or self.taxonomy is None
-        ):
+        if not self.process_valid and (self.first_error_step is None or self.taxonomy is None):
             raise ValueError("invalid process requires localization and taxonomy")
+        if self.decided_at.tzinfo is None or self.decided_at.utcoffset() is None:
+            raise ValueError("human decisions require timezone-aware timestamps")
         return self
 
 
@@ -522,12 +583,68 @@ class HumanDecisionSet(BenchmarkModel):
     schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
     batch_id: str = Field(min_length=1, strict=True)
     decision_set_id: str = Field(min_length=1, strict=True)
-    decisions: tuple[HumanDecision, ...] = Field(min_length=1)
+    sample_seed: int = Field(strict=True)
+    rereview_fraction: float = Field(default=0.2, ge=0.2, le=0.2, strict=True)
+    initial_decisions: tuple[HumanDecision, ...] = Field(min_length=1)
+    delayed_decisions: tuple[HumanDecision, ...] = Field(min_length=1)
 
     @model_validator(mode="after")
-    def validate_unique_decisions(self) -> Self:
-        if len({item.blind_id for item in self.decisions}) != len(self.decisions):
-            raise ValueError("a blind item may be decided only once")
+    def validate_review_rounds(self) -> Self:
+        initial_ids = tuple(item.blind_id for item in self.initial_decisions)
+        delayed_ids = tuple(item.blind_id for item in self.delayed_decisions)
+        all_decision_ids = tuple(
+            item.decision_id for item in (*self.initial_decisions, *self.delayed_decisions)
+        )
+        if len(set(initial_ids)) != len(initial_ids):
+            raise ValueError("a blind item may have only one initial decision")
+        if len(set(delayed_ids)) != len(delayed_ids):
+            raise ValueError("a blind item may have only one delayed decision")
+        if len(set(all_decision_ids)) != len(all_decision_ids):
+            raise ValueError("human decision IDs must be unique")
+        if any(item.round is not HumanReviewRound.INITIAL for item in self.initial_decisions):
+            raise ValueError("initial decisions must identify the initial round")
+        if any(item.round is not HumanReviewRound.DELAYED for item in self.delayed_decisions):
+            raise ValueError("delayed decisions must identify the delayed round")
+        sample_size = (len(initial_ids) + 4) // 5
+        expected_ids = tuple(random.Random(self.sample_seed).sample(initial_ids, sample_size))
+        if delayed_ids != expected_ids:
+            raise ValueError("delayed decisions must match the seeded 20% sample")
+        initial_by_id = {item.blind_id: item for item in self.initial_decisions}
+        for delayed in self.delayed_decisions:
+            initial = initial_by_id[delayed.blind_id]
+            if delayed.reviewer_id == initial.reviewer_id:
+                raise ValueError("delayed rereview requires a different reviewer")
+            if delayed.decided_at <= initial.decided_at:
+                raise ValueError("delayed rereview must occur after the initial decision")
+        if self.rereview_fraction != 0.2:
+            raise ValueError("delayed rereview fraction is frozen at 20%")
+        return self
+
+
+HumanDecisionField = Literal["final_correct", "process_valid", "first_error_step", "taxonomy"]
+
+
+class HumanDecisionChange(BenchmarkModel):
+    schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    blind_id: str = Field(min_length=1, strict=True)
+    initial_decision_id: str = Field(min_length=1, strict=True)
+    delayed_decision_id: str = Field(min_length=1, strict=True)
+    changed_fields: tuple[HumanDecisionField, ...] = Field(min_length=1)
+
+
+class HumanRereviewAgreement(BenchmarkModel):
+    schema_version: BenchmarkSchemaVersion = BENCHMARK_SCHEMA_VERSION
+    rereviewed_count: int = Field(gt=0, strict=True)
+    unchanged_count: int = Field(ge=0, strict=True)
+    agreement: float = Field(ge=0.0, le=1.0)
+    changes: tuple[HumanDecisionChange, ...]
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> Self:
+        if self.unchanged_count + len(self.changes) != self.rereviewed_count:
+            raise ValueError("rereview agreement counts must cover the delayed sample")
+        if self.agreement != self.unchanged_count / self.rereviewed_count:
+            raise ValueError("rereview agreement must equal its exact fraction")
         return self
 
 
@@ -537,6 +654,8 @@ class HumanReviewReplay(BenchmarkModel):
     batch_id: str = Field(min_length=1, strict=True)
     source_decision_set_id: str = Field(min_length=1, strict=True)
     observations: tuple[MetricObservation, ...]
+    human_labels: tuple[HumanConfirmedLabel, ...] = Field(min_length=1)
+    rereview_agreement: HumanRereviewAgreement
 
 
 class UiTimelineStep(BenchmarkModel):
@@ -563,6 +682,7 @@ class UiRunView(BenchmarkModel):
     status: RunStatus
     timeline: tuple[UiTimelineStep, ...]
     code: str | None = None
+    compile_status: JudgeStatus | None = None
     judge_verdict: JudgeStatus | None = None
     judge_tests: tuple[UiJudgeTest, ...]
     first_error_step_id: str | None = None

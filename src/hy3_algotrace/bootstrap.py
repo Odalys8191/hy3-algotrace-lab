@@ -12,16 +12,39 @@ from collections.abc import Mapping, Sequence
 from .benchmark_models import (
     BreakpointResult,
     ConfidenceInterval,
+    HumanConfirmedLabel,
     MetricObservation,
+    SampleKind,
 )
 from .contracts import RatingBand
 from .metrics import compute_metrics
 
 
+def natural_final_outcomes(
+    rows: Sequence[MetricObservation],
+) -> Mapping[RatingBand, tuple[bool, ...]]:
+    """Return actual independently established natural-run correctness outcomes."""
+
+    return {
+        band: tuple(
+            row.gold_final_correct
+            for row in rows
+            if row.sample_kind is SampleKind.NATURAL
+            and row.gold_final_correct is not None
+            and row.rating_band is band
+        )
+        for band in RatingBand
+    }
+
+
 def _metric_value(
-    rows: Sequence[MetricObservation], metric_name: str
+    rows: Sequence[MetricObservation],
+    metric_name: str,
+    human_labels: Sequence[HumanConfirmedLabel],
 ) -> float | None:
-    for metric in compute_metrics(rows).overall:
+    row_ids = {row.sample_id for row in rows}
+    sampled_labels = tuple(label for label in human_labels if label.sample_id in row_ids)
+    for metric in compute_metrics(rows, human_labels=sampled_labels).overall:
         if metric.name == metric_name:
             return metric.value
     raise ValueError(f"unknown metric: {metric_name}")
@@ -33,9 +56,7 @@ def _percentile(values: Sequence[float], probability: float) -> float:
     lower_index = int(position)
     upper_index = min(lower_index + 1, len(ordered) - 1)
     fraction = position - lower_index
-    return ordered[lower_index] + fraction * (
-        ordered[upper_index] - ordered[lower_index]
-    )
+    return ordered[lower_index] + fraction * (ordered[upper_index] - ordered[lower_index])
 
 
 def bootstrap_metric(
@@ -44,12 +65,14 @@ def bootstrap_metric(
     metric_name: str,
     seed: int,
     replicates: int = 10_000,
+    human_labels: Sequence[HumanConfirmedLabel] = (),
 ) -> ConfidenceInterval:
     """Bootstrap one metric from exactly the rows in its frozen denominator."""
 
     if replicates < 1:
         raise ValueError("bootstrap replicates must be positive")
-    report = compute_metrics(rows)
+    stable_human_labels = tuple(human_labels)
+    report = compute_metrics(rows, human_labels=stable_human_labels)
     try:
         metric = next(item for item in report.overall if item.name == metric_name)
     except StopIteration as error:
@@ -67,6 +90,9 @@ def bootstrap_metric(
         )
     included_ids = set(metric.included_sample_ids)
     included = tuple(row for row in rows if row.sample_id in included_ids)
+    included_human_labels = tuple(
+        label for label in stable_human_labels if label.sample_id in included_ids
+    )
     if not included:
         return ConfidenceInterval(
             metric_name=metric_name,
@@ -82,7 +108,7 @@ def bootstrap_metric(
     values: list[float] = []
     for _ in range(replicates):
         sample = tuple(generator.choice(included) for _ in included)
-        value = _metric_value(sample, metric_name)
+        value = _metric_value(sample, metric_name, included_human_labels)
         if value is not None:
             values.append(value)
     if not values:

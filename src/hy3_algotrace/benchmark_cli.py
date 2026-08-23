@@ -13,20 +13,19 @@ from .artifacts import ArtifactStore
 from .benchmark import (
     ArtifactAttemptLedger,
     BenchmarkRunner,
-    FormalEvidenceVerifier,
     RemoteAttemptBudget,
+    Task7FormalBenchmarkCapability,
 )
 from .benchmark_models import (
     BenchmarkConfig,
     BenchmarkExecutionKind,
+    HumanConfirmedLabel,
     MetricObservation,
     ObservationReplayInput,
 )
 from .hy3_client import Hy3AttemptContext
 
-type BenchmarkExecute = Callable[
-    [str, Callable[[Hy3AttemptContext], None]], MetricObservation
-]
+type BenchmarkExecute = Callable[[str, Callable[[Hy3AttemptContext], None]], MetricObservation]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -65,7 +64,8 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     execute: BenchmarkExecute | None = None,
-    formal_evidence_verifier: FormalEvidenceVerifier | None = None,
+    formal_capability: Task7FormalBenchmarkCapability | None = None,
+    human_labels: tuple[HumanConfirmedLabel, ...] = (),
     output: TextIO | None = None,
 ) -> int:
     """Validate or execute a frozen config; execution is injected by corpus wiring."""
@@ -105,9 +105,7 @@ def main(
 
         execute = replay_execute
     elif execute is None:
-        parser.error(
-            "live run requires the trusted Task-7/Hy3 execution adapter and credentials"
-        )
+        parser.error("live run requires the trusted Task-7/Hy3 execution adapter and credentials")
     assert execute is not None
     artifacts = ArtifactStore(args.artifact_root)
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id=config.benchmark_id)
@@ -123,7 +121,8 @@ def main(
         ledger=ledger,
         execution_kind=execution_kind,
         replay_input=replay_input,
-        formal_evidence_verifier=formal_evidence_verifier,
+        formal_capability=formal_capability,
+        human_labels=human_labels,
     ).run(execute)
     _emit(
         {

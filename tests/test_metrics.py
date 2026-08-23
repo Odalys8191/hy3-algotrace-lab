@@ -3,7 +3,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from hy3_algotrace.benchmark_models import MetricObservation, SampleKind
+from hy3_algotrace.benchmark_models import (
+    HumanConfirmedLabel,
+    MetricObservation,
+    SampleKind,
+)
 from hy3_algotrace.contracts import ErrorTaxonomy, RatingBand, Topic
 from hy3_algotrace.metrics import compute_metrics
 
@@ -133,24 +137,53 @@ def literal_rows() -> tuple[MetricObservation, ...]:
     )
 
 
+def literal_human_labels() -> tuple[HumanConfirmedLabel, ...]:
+    return (
+        HumanConfirmedLabel(
+            sample_id="n2",
+            final_correct=True,
+            process_valid=False,
+            first_error_step=2,
+            taxonomy=ErrorTaxonomy.ALGORITHM_LOGIC,
+        ),
+        HumanConfirmedLabel(
+            sample_id="g1",
+            final_correct=True,
+            process_valid=True,
+        ),
+    )
+
+
 def as_map(metrics):  # type: ignore[no-untyped-def]
     return {metric.name: metric for metric in metrics}
 
 
 def test_metrics_use_frozen_literal_denominators_and_included_ids() -> None:
-    report = compute_metrics(literal_rows())
+    report = compute_metrics(literal_rows(), human_labels=literal_human_labels())
     metrics = as_map(report.overall)
     expected = {
-        "natural_final_accuracy": (2.0, 3, 2 / 3, ("n1", "n2", "n3")),
-        "process_correctness": (4.0, 6, 4 / 6, ("n1", "n2", "n3", "g1", "p1", "c1")),
+        "natural_final_accuracy": (1.0, 3, 1 / 3, ("n1", "n2", "n3")),
+        "natural_process_valid_rate": (1.0, 3, 1 / 3, ("n1", "n2", "n3")),
+        "natural_final_correctness_evaluator_agreement": (
+            2.0,
+            3,
+            2 / 3,
+            ("n1", "n2", "n3"),
+        ),
+        "process_validity_evaluator_agreement": (
+            4.0,
+            6,
+            4 / 6,
+            ("n1", "n2", "n3", "g1", "p1", "c1"),
+        ),
         "invalid_process_detection": (3.0, 4, 3 / 4, ("n2", "n3", "p1", "c1")),
         "exact_localization": (2.0, 4, 2 / 4, ("n2", "n3", "p1", "c1")),
         "within_one_localization": (3.0, 4, 3 / 4, ("n2", "n3", "p1", "c1")),
         "paradox_recall": (1.0, 1, 1.0, ("p1",)),
         "standard_gold_false_positive_rate": (1.0, 1, 1.0, ("g1",)),
         "human_review_flag_rate": (2.0, 6, 2 / 6, ("n1", "n2", "n3", "g1", "p1", "c1")),
-        "flagged_final_incorrect_proportion": (1.0, 2, 0.5, ("n2", "g1")),
-        "flagged_process_invalid_proportion": (1.0, 2, 0.5, ("n2", "g1")),
+        "flagged_final_correct_process_issue_rate": (1.0, 2, 0.5, ("n2", "g1")),
+        "flagged_false_positive_rate": (1.0, 2, 0.5, ("n2", "g1")),
         "primary_review_agreement_rate": (4.0, 6, 4 / 6, ("n1", "n2", "n3", "g1", "p1", "c1")),
         "arbitration_rate": (2.0, 6, 2 / 6, ("n1", "n2", "n3", "g1", "p1", "c1")),
     }
@@ -166,18 +199,18 @@ def test_metrics_use_frozen_literal_denominators_and_included_ids() -> None:
 
 
 def test_breakdowns_recompute_rows_instead_of_averaging_percentages() -> None:
-    report = compute_metrics(literal_rows())
+    report = compute_metrics(literal_rows(), human_labels=literal_human_labels())
     topics = {item.key: as_map(item.metrics) for item in report.by_topic}
     ratings = {item.key: as_map(item.metrics) for item in report.by_rating_band}
 
     assert topics["greedy"]["natural_final_accuracy"].value == 0.5
     assert topics["greedy"]["natural_final_accuracy"].denominator == 2
-    assert topics["graph"]["natural_final_accuracy"].value == 1.0
+    assert topics["graph"]["natural_final_accuracy"].value == 0.0
     assert topics["graph"]["natural_final_accuracy"].denominator == 1
-    assert ratings["1200-1500"]["process_correctness"].value == 2 / 3
-    assert ratings["1200-1500"]["process_correctness"].denominator == 3
-    assert ratings["2000-2400"]["process_correctness"].value == 2 / 3
-    assert ratings["2000-2400"]["process_correctness"].denominator == 3
+    assert ratings["1200-1500"]["process_validity_evaluator_agreement"].value == 2 / 3
+    assert ratings["1200-1500"]["process_validity_evaluator_agreement"].denominator == 3
+    assert ratings["2000-2400"]["process_validity_evaluator_agreement"].value == 2 / 3
+    assert ratings["2000-2400"]["process_validity_evaluator_agreement"].denominator == 3
 
 
 def test_zero_denominator_is_explicitly_not_evaluable() -> None:
@@ -199,6 +232,16 @@ def test_zero_denominator_is_explicitly_not_evaluable() -> None:
     assert (natural.numerator, natural.denominator, natural.value) == (0.0, 0, None)
     assert natural.not_evaluable is True
     assert natural.included_sample_ids == ()
+
+
+def test_natural_gold_denominators_are_independent_per_capability() -> None:
+    final_only = literal_rows()[0].model_copy(update={"gold_process_valid": None})
+    process_only = literal_rows()[1].model_copy(update={"gold_final_correct": None})
+
+    metrics = as_map(compute_metrics((final_only, process_only)).overall)
+
+    assert metrics["natural_final_accuracy"].included_sample_ids == ("n1",)
+    assert metrics["natural_process_valid_rate"].included_sample_ids == ("n2",)
 
 
 def test_taxonomy_macro_f1_uses_frozen_nine_classes_and_formal_support() -> None:

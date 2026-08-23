@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+import os
+from collections.abc import Callable, Mapping
 from types import MappingProxyType
-from urllib.parse import quote
+from typing import TypeVar
+from urllib.parse import quote, urlsplit
 
 import httpx
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .api_models import (
     ProblemDetailResponse,
@@ -26,12 +28,45 @@ class AuditTraceInputError(ValueError):
     """Safe user-facing error for pasted structured trace input."""
 
 
+class ApiClientError(RuntimeError):
+    """Fixed safe failure from the public HTTP boundary."""
+
+
+ModelT = TypeVar("ModelT", bound=BaseModel)
+
+
 RUN_MODE_LABELS: Mapping[str, RunMode] = MappingProxyType(
     {
         "Hy3 生成并审计": RunMode.SOLVE_AND_AUDIT,
         "粘贴结构化解答审计": RunMode.AUDIT,
     }
 )
+
+_LOCAL_API_BASE_URL = "http://127.0.0.1:8000"
+
+
+def default_api_base_url(environ: Mapping[str, str] | None = None) -> str:
+    """Resolve Compose's API URL without accepting URL-borne credentials."""
+
+    source = os.environ if environ is None else environ
+    value = source.get("HY3_API_BASE_URL", _LOCAL_API_BASE_URL)
+    if value != value.strip():
+        return _LOCAL_API_BASE_URL
+    try:
+        parsed = urlsplit(value)
+        parsed.port
+    except ValueError:
+        return _LOCAL_API_BASE_URL
+    if (
+        parsed.scheme not in {"http", "https"}
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        return _LOCAL_API_BASE_URL
+    return value.rstrip("/")
 
 
 def build_run_request(
@@ -50,9 +85,7 @@ def build_run_request(
         payload = json.loads(structured_trace_json)
         trace = SolutionTrace.model_validate(payload)
     except (json.JSONDecodeError, ValidationError) as error:
-        raise AuditTraceInputError(
-            "Paste a valid SolutionTrace JSON document."
-        ) from error
+        raise AuditTraceInputError("Paste a valid SolutionTrace JSON document.") from error
     if trace.problem_id != problem_id:
         raise AuditTraceInputError("SolutionTrace must match the selected problem.")
     return RunCreateRequest(mode=mode, problem_id=problem_id, trace=trace)
@@ -75,32 +108,56 @@ class AlgoTraceApiClient:
         self._base_url = base_url.rstrip("/")
         self._client = client or httpx.Client(timeout=timeout_seconds)
 
+    def _request_model(
+        self,
+        request: Callable[[], httpx.Response],
+        model: type[ModelT],
+        *,
+        safe_message: str,
+    ) -> ModelT:
+        parsed: ModelT | None = None
+        try:
+            response = request()
+            response.raise_for_status()
+            parsed = model.model_validate(response.json())
+        except (httpx.HTTPError, ValueError):
+            pass
+        if parsed is None:
+            raise ApiClientError(safe_message)
+        return parsed
+
     def list_problems(self) -> ProblemListResponse:
-        response = self._client.get(f"{self._base_url}/api/v1/problems")
-        response.raise_for_status()
-        return ProblemListResponse.model_validate(response.json())
+        return self._request_model(
+            lambda: self._client.get(f"{self._base_url}/api/v1/problems"),
+            ProblemListResponse,
+            safe_message="Problem list unavailable.",
+        )
 
     def get_problem(self, problem_id: str) -> ProblemDetailResponse:
-        response = self._client.get(
-            f"{self._base_url}/api/v1/problems/{quote(problem_id, safe='')}"
+        return self._request_model(
+            lambda: self._client.get(
+                f"{self._base_url}/api/v1/problems/{quote(problem_id, safe='')}"
+            ),
+            ProblemDetailResponse,
+            safe_message="Problem details unavailable.",
         )
-        response.raise_for_status()
-        return ProblemDetailResponse.model_validate(response.json())
 
     def create_run(self, request: RunCreateRequest) -> RunAcceptedResponse:
-        response = self._client.post(
-            f"{self._base_url}/api/v1/runs",
-            json=request.model_dump(mode="json"),
+        return self._request_model(
+            lambda: self._client.post(
+                f"{self._base_url}/api/v1/runs",
+                json=request.model_dump(mode="json"),
+            ),
+            RunAcceptedResponse,
+            safe_message="Run creation unavailable.",
         )
-        response.raise_for_status()
-        return RunAcceptedResponse.model_validate(response.json())
 
     def get_run(self, run_id: str) -> RunReadResponse:
-        response = self._client.get(
-            f"{self._base_url}/api/v1/runs/{quote(run_id, safe='')}"
+        return self._request_model(
+            lambda: self._client.get(f"{self._base_url}/api/v1/runs/{quote(run_id, safe='')}"),
+            RunReadResponse,
+            safe_message="Run status unavailable.",
         )
-        response.raise_for_status()
-        return RunReadResponse.model_validate(response.json())
 
     def poll_run(self, run_id: str, *, max_polls: int) -> RunReadResponse:
         if max_polls < 1:
@@ -143,6 +200,7 @@ def build_run_view(response: RunReadResponse) -> UiRunView:
             for step in sorted(trace.steps, key=lambda item: item.step_number)
         ),
         code=trace.code,
+        compile_status=audit.judge.compile_status,
         judge_verdict=audit.judge.verdict,
         judge_tests=tuple(
             UiJudgeTest(
@@ -164,20 +222,23 @@ def main() -> None:  # pragma: no cover - Streamlit runtime owns the event loop
     import streamlit as st
 
     st.title("Hy3 AlgoTrace Lab")
-    base_url = st.sidebar.text_input("API base URL", "http://127.0.0.1:8000")
+    base_url = st.sidebar.text_input("API base URL", default_api_base_url())
     client = AlgoTraceApiClient(base_url)
     try:
         listing = client.list_problems()
-    except httpx.HTTPError as error:
-        st.error(f"API unavailable: {error}")
+    except ApiClientError as error:
+        st.error(str(error))
         return
     by_label = {
-        f"{problem.title} · {problem.rating}": problem.problem_id
-        for problem in listing.problems
+        f"{problem.title} · {problem.rating}": problem.problem_id for problem in listing.problems
     }
     selected_label = st.selectbox("Built-in problem", tuple(by_label))
     selected_id = by_label[selected_label]
-    detail = client.get_problem(selected_id)
+    try:
+        detail = client.get_problem(selected_id)
+    except ApiClientError as error:
+        st.error(str(error))
+        return
     st.subheader(detail.title)
     st.write(detail.statement_en)
     mode_label = st.radio("Run mode", tuple(RUN_MODE_LABELS), horizontal=True)
@@ -199,12 +260,20 @@ def main() -> None:  # pragma: no cover - Streamlit runtime owns the event loop
         except AuditTraceInputError as error:
             st.error(str(error))
         else:
-            accepted = client.create_run(request)
-            st.session_state["run_id"] = accepted.run_id
+            try:
+                accepted = client.create_run(request)
+            except ApiClientError as error:
+                st.error(str(error))
+            else:
+                st.session_state["run_id"] = accepted.run_id
     run_id = st.session_state.get("run_id")
     if run_id is None:
         return
-    response = client.poll_run(run_id, max_polls=1)
+    try:
+        response = client.poll_run(run_id, max_polls=1)
+    except ApiClientError as error:
+        st.error(str(error))
+        return
     view = build_run_view(response)
     st.write(f"Status: {view.status.value}")
     if should_offer_refresh(response) and st.button("Refresh run status"):
@@ -218,6 +287,8 @@ def main() -> None:  # pragma: no cover - Streamlit runtime owns the event loop
     if view.code is not None:
         st.code(view.code, language="cpp")
     if view.judge_verdict is not None:
+        if view.compile_status is not None:
+            st.write(f"Compile status: {view.compile_status.value}")
         st.write(f"Judge verdict: {view.judge_verdict.value}")
         st.dataframe([item.model_dump(mode="json") for item in view.judge_tests])
         st.write(f"First material error: {view.first_error_step_id or 'none'}")

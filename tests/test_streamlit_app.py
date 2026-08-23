@@ -11,9 +11,11 @@ from hy3_algotrace.api_models import RunCreateRequest, RunMode
 from hy3_algotrace.streamlit_app import (
     RUN_MODE_LABELS,
     AlgoTraceApiClient,
+    ApiClientError,
     AuditTraceInputError,
     build_run_request,
     build_run_view,
+    default_api_base_url,
     should_offer_refresh,
 )
 
@@ -49,9 +51,7 @@ PROBLEM_DETAIL = {
     "language": "cpp17",
     "time_limit_ms": 1000,
     "memory_limit_mb": 256,
-    "public_tests": [
-        {"schema_version": "1.2", "test_id": "public-1", "input_data": "1\n"}
-    ],
+    "public_tests": [{"schema_version": "1.2", "test_id": "public-1", "input_data": "1\n"}],
     "content_hash": "a" * 64,
 }
 COMPLETED_RUN = {
@@ -179,6 +179,7 @@ def test_completed_run_view_contains_timeline_code_judge_and_audit_decision() ->
             }
         ],
         "code": "int main(){}",
+        "compile_status": "ac",
         "judge_verdict": "wa",
         "judge_tests": [
             {
@@ -237,6 +238,59 @@ def test_nonterminal_status_offers_refresh_but_terminal_status_does_not() -> Non
 
     assert should_offer_refresh(queued) is True
     assert should_offer_refresh(completed) is False
+
+
+@pytest.mark.parametrize(
+    ("operation", "message"),
+    (
+        ("list", "Problem list unavailable."),
+        ("detail", "Problem details unavailable."),
+        ("create", "Run creation unavailable."),
+        ("refresh", "Run status unavailable."),
+    ),
+)
+def test_http_failures_are_fixed_safe_messages_without_url_or_userinfo(
+    operation: str, message: str
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connection failed for {request.url}", request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as transport:
+        client = AlgoTraceApiClient("https://user:secret@internal.example", client=transport)
+        with pytest.raises(ApiClientError) as caught:
+            if operation == "list":
+                client.list_problems()
+            elif operation == "detail":
+                client.get_problem("cf-123-a")
+            elif operation == "create":
+                client.create_run(
+                    RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a")
+                )
+            else:
+                client.poll_run("run-1", max_polls=1)
+
+    assert str(caught.value) == message
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert "internal.example" not in str(caught.value)
+    assert "user" not in str(caught.value)
+    assert "secret" not in str(caught.value)
+
+
+def test_compose_api_base_url_env_is_used_only_when_credential_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HY3_API_BASE_URL", "http://api:8000")
+    assert default_api_base_url() == "http://api:8000"
+
+    for unsafe in (
+        "https://user:secret@api:8000",
+        "https://api:8000?api_key=secret",
+        "https://api:8000#fragment",
+        "api:8000",
+    ):
+        monkeypatch.setenv("HY3_API_BASE_URL", unsafe)
+        assert default_api_base_url() == "http://127.0.0.1:8000"
 
 
 def test_streamlit_module_has_no_internal_service_or_storage_imports() -> None:

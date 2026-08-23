@@ -1,33 +1,48 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic import ValidationError
 from test_hy3_client import problem
-from test_metrics import literal_rows
+from test_metrics import literal_human_labels, literal_rows
+from test_run_service import clean_verdict, valid_trace
 
+from hy3_algotrace.api_models import InternalRunReport, RunMode
 from hy3_algotrace.artifacts import ArtifactExistsError, ArtifactStore, sha256_json
 from hy3_algotrace.benchmark import (
     ArtifactAttemptLedger,
     BenchmarkRunner,
     BudgetExceededError,
+    FormalRunArtifacts,
     RemoteAttemptBudget,
+    Task7FormalBenchmarkCapability,
+    _validate_formal_run_binding,
 )
 from hy3_algotrace.benchmark_models import (
     BenchmarkConfig,
     BenchmarkParameter,
     BenchmarkSampleSpec,
     BenchmarkStatus,
+    HumanConfirmedLabel,
     LedgerEvent,
     MetricObservation,
     SampleKind,
     VerifiedDataEvidence,
 )
-from hy3_algotrace.contracts import ErrorTaxonomy, RatingBand, Topic
+from hy3_algotrace.contracts import (
+    AuditReport,
+    ErrorTaxonomy,
+    JudgeEvidence,
+    JudgeStatus,
+    RatingBand,
+    Topic,
+)
 from hy3_algotrace.hy3_client import Hy3AttemptContext, Hy3Client, Hy3Config
 
 
@@ -48,14 +63,10 @@ def config(
         BenchmarkSampleSpec(
             sample_id=sample_id,
             problem_id=(
-                known_rows[sample_id].problem_id
-                if sample_id in known_rows
-                else f"p-{index}"
+                known_rows[sample_id].problem_id if sample_id in known_rows else f"p-{index}"
             ),
             sample_kind=(
-                known_rows[sample_id].sample_kind
-                if sample_id in known_rows
-                else SampleKind.NATURAL
+                known_rows[sample_id].sample_kind if sample_id in known_rows else SampleKind.NATURAL
             ),
             topic=(known_rows[sample_id].topic if sample_id in known_rows else Topic.GREEDY),
             rating_band=(
@@ -164,9 +175,7 @@ def formal_profile(
     for index in range(60):
         add(f"natural-{index}", problems[index // 2], SampleKind.NATURAL, None)
     ordered = tuple(spec.sample_id for spec in specs)
-    generation = tuple(
-        spec.sample_id for spec in specs if spec.sample_kind is SampleKind.NATURAL
-    )
+    generation = tuple(spec.sample_id for spec in specs if spec.sample_kind is SampleKind.NATURAL)
     evidence = VerifiedDataEvidence(
         evidence_kind="verified-task7-replay",
         artifact_path="verified/task7-replay.json",
@@ -224,6 +233,32 @@ def test_formal_config_rejects_tiny_self_authored_profile_even_with_evidence() -
         )
 
 
+def test_formal_profile_rejects_per_problem_and_paradox_redistribution() -> None:
+    valid, _ = formal_profile()
+    payload = valid.model_dump(mode="json")
+    specs = payload["sample_specs"]
+    assert isinstance(specs, list)
+    first_problem = specs[0]["problem_id"]
+    second_problem = specs[1]["problem_id"]
+    specs[0]["problem_id"] = second_problem
+
+    with pytest.raises(ValidationError, match="one gold, two controlled_wrong, and two natural"):
+        BenchmarkConfig.model_validate(payload)
+
+    payload = valid.model_dump(mode="json")
+    specs = payload["sample_specs"]
+    assert isinstance(specs, list)
+    first_paradox = next(item for item in specs if item["sample_id"] == "paradox-0")
+    target = next(item for item in specs if item["sample_id"] == "gold-2")
+    assert first_paradox["problem_id"] == first_problem
+    first_paradox["problem_id"] = target["problem_id"]
+    first_paradox["topic"] = target["topic"]
+    first_paradox["rating_band"] = target["rating_band"]
+
+    with pytest.raises(ValidationError, match="one paradox in every 5x3"):
+        BenchmarkConfig.model_validate(payload)
+
+
 def test_returned_observation_must_match_frozen_problem_kind_and_strata(
     tmp_path: Path,
 ) -> None:
@@ -253,22 +288,23 @@ def test_formal_complete_run_needs_external_verified_evidence_gate(
     benchmark_config, rows = formal_profile(benchmark_id="formal-gated")
     artifacts = ArtifactStore(tmp_path / "artifacts")
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id="formal-gated")
-    budget = RemoteAttemptBudget(
-        limit=390, event_sink=ledger.record, benchmark_id="formal-gated"
-    )
+    budget = RemoteAttemptBudget(limit=390, event_sink=ledger.record, benchmark_id="formal-gated")
     by_id = {row.sample_id: row for row in rows}
 
-    def execute(
-        sample_id: str, observer: Callable[[Hy3AttemptContext], None]
-    ) -> MetricObservation:
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
         spec = next(item for item in benchmark_config.sample_specs if item.sample_id == sample_id)
-        attempts = 3 if spec.sample_kind is SampleKind.NATURAL else 2
-        for retry_number in range(1, attempts + 1):
+        operations = [
+            benchmark_config.logic_review_prompt_version,
+            benchmark_config.adversarial_review_prompt_version,
+        ]
+        if spec.sample_kind is SampleKind.NATURAL:
+            operations.insert(0, benchmark_config.generator_prompt_version)
+        for operation in operations:
             observer(
                 Hy3AttemptContext(
-                    operation="formal-operation",
+                    operation=operation,
                     phase="request",
-                    retry_number=retry_number,
+                    retry_number=1,
                 )
             )
         return by_id[sample_id]
@@ -281,57 +317,171 @@ def test_formal_complete_run_needs_external_verified_evidence_gate(
     ).run(execute)
 
     assert self_authored.complete is True
+    assert self_authored.formal_attempt_profile_valid is True
     assert self_authored.formal_evidence_verified is False
     assert self_authored.formal_eligible is False
 
 
-def test_trusted_verifier_can_confirm_hash_bound_formal_evidence(
+def test_zero_observer_calls_and_public_capability_construction_never_become_formal(
     tmp_path: Path,
 ) -> None:
-    benchmark_config, rows = formal_profile(benchmark_id="formal-verified")
+    benchmark_config, rows = formal_profile(benchmark_id="formal-zero-attempts")
     artifacts = ArtifactStore(tmp_path / "artifacts")
-    ledger = ArtifactAttemptLedger(artifacts, benchmark_id="formal-verified")
+    ledger = ArtifactAttemptLedger(artifacts, benchmark_id="formal-zero-attempts")
     budget = RemoteAttemptBudget(
-        limit=390, event_sink=ledger.record, benchmark_id="formal-verified"
+        limit=390,
+        event_sink=ledger.record,
+        benchmark_id="formal-zero-attempts",
     )
     by_id = {row.sample_id: row for row in rows}
-    verified_paths: list[str] = []
-
-    def execute(
-        sample_id: str, observer: Callable[[Hy3AttemptContext], None]
-    ) -> MetricObservation:
-        spec = next(item for item in benchmark_config.sample_specs if item.sample_id == sample_id)
-        for retry_number in range(
-            1, 4 if spec.sample_kind is SampleKind.NATURAL else 3
-        ):
-            observer(
-                Hy3AttemptContext(
-                    operation="formal-operation",
-                    phase="request",
-                    retry_number=retry_number,
-                )
-            )
-        return by_id[sample_id]
-
-    def verify(config_value, evidence, observations) -> bool:  # type: ignore[no-untyped-def]
-        verified_paths.append(evidence.artifact_path)
-        return (
-            config_value.corpus_hash == evidence.corpus_hash
-            and evidence.artifact_hash == "d" * 64
-            and len(observations) == 165
-        )
 
     report = BenchmarkRunner(
         config=benchmark_config,
         artifacts=artifacts,
         budget=budget,
         ledger=ledger,
-        formal_evidence_verifier=verify,
+    ).run(lambda sample_id, _observer: by_id[sample_id])
+
+    assert report.complete is True
+    assert report.remote_attempts_used == 0
+    assert report.formal_attempt_profile_valid is False
+    assert report.formal_evidence_verified is False
+    assert report.formal_eligible is False
+    with pytest.raises(ValueError, match="integrated Task-7 bridge"):
+        Task7FormalBenchmarkCapability(_bridge_token=object())
+
+
+def test_unpersisted_attempt_events_cannot_satisfy_formal_ledger_profile(
+    tmp_path: Path,
+) -> None:
+    benchmark_config, rows = formal_profile(benchmark_id="formal-unpersisted-ledger")
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    ledger = ArtifactAttemptLedger(artifacts, benchmark_id="formal-unpersisted-ledger")
+    budget = RemoteAttemptBudget(
+        limit=390,
+        benchmark_id="formal-unpersisted-ledger",
+    )
+    by_id = {row.sample_id: row for row in rows}
+
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
+        if sample_id in benchmark_config.generation_sample_ids:
+            observer(
+                Hy3AttemptContext(
+                    operation=benchmark_config.generator_prompt_version,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        for operation in (
+            benchmark_config.logic_review_prompt_version,
+            benchmark_config.adversarial_review_prompt_version,
+        ):
+            observer(
+                Hy3AttemptContext(
+                    operation=operation,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        return by_id[sample_id]
+
+    report = BenchmarkRunner(
+        config=benchmark_config,
+        artifacts=artifacts,
+        budget=budget,
+        ledger=ledger,
     ).run(execute)
 
-    assert report.formal_evidence_verified is True
-    assert report.formal_eligible is True
-    assert verified_paths == ["verified/task7-replay.json"]
+    assert report.complete is True
+    assert report.remote_attempts_used == 390
+    assert report.formal_attempt_profile_valid is False
+    assert (
+        artifacts.read_json("benchmarks/formal-unpersisted-ledger/ledger-index.json")["event_paths"]
+        == []
+    )
+
+
+def test_formal_run_binding_covers_run_audit_reviewer_and_ui_flag_fields() -> None:
+    trace = valid_trace()
+    trace_bytes = trace.model_dump_json().encode("utf-8")
+    source_bytes = trace.code.encode("utf-8")
+    judge = JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
+    audit = AuditReport(
+        run_id="run-1",
+        problem_id=trace.problem_id,
+        trace_id=trace.trace_id,
+        judge_evidence=judge,
+        reviewer_verdicts=(
+            clean_verdict(trace, "logic-reviewer"),
+            clean_verdict(trace, "adversarial-reviewer"),
+        ),
+        final_correct=True,
+        process_score=100.0,
+        process_valid=True,
+    )
+    internal = InternalRunReport(
+        run_id="run-1",
+        problem_id=trace.problem_id,
+        mode=RunMode.AUDIT,
+        trace=trace,
+        audit_report=audit,
+    )
+    observation = literal_rows()[0].model_copy(
+        update={
+            "problem_id": trace.problem_id,
+            "sample_kind": SampleKind.GOLD,
+        }
+    )
+    sample = SimpleNamespace(
+        sample_id="n1",
+        problem_id=trace.problem_id,
+        trace=SimpleNamespace(sha256=hashlib.sha256(trace_bytes).hexdigest()),
+        cpp_source=SimpleNamespace(sha256=hashlib.sha256(source_bytes).hexdigest()),
+        final_expected_correct=True,
+        primary_error=None,
+        first_error_step_id=None,
+    )
+    binding = FormalRunArtifacts(
+        sample_id="n1",
+        trace_artifact_bytes=trace_bytes,
+        cpp_source_bytes=source_bytes,
+        internal_report=internal,
+        judge_evidence=judge,
+        human_label=HumanConfirmedLabel(sample_id="n1", final_correct=True, process_valid=True),
+    )
+
+    _validate_formal_run_binding(
+        sample=sample,
+        expected_kind=SampleKind.GOLD,
+        binding=binding,
+        observation=observation,
+    )
+    for update in (
+        {"needs_human_review": True},
+        {"primary_review_agreement": False},
+        {"arbitration_used": True},
+    ):
+        with pytest.raises(ValueError, match="run and human evidence"):
+            _validate_formal_run_binding(
+                sample=sample,
+                expected_kind=SampleKind.GOLD,
+                binding=binding,
+                observation=observation.model_copy(update=update),
+            )
+    with pytest.raises(ValueError, match="run and human evidence"):
+        _validate_formal_run_binding(
+            sample=sample,
+            expected_kind=SampleKind.GOLD,
+            binding=FormalRunArtifacts(
+                sample_id=binding.sample_id,
+                trace_artifact_bytes=trace_bytes,
+                cpp_source_bytes=source_bytes,
+                internal_report=internal.model_copy(update={"run_id": "different-run"}),
+                judge_evidence=judge,
+                human_label=binding.human_label,
+            ),
+            observation=observation,
+        )
 
 
 def test_budget_reservation_is_atomic_under_concurrency() -> None:
@@ -400,9 +550,7 @@ def test_budget_partial_is_immutable_and_never_formal(tmp_path: Path) -> None:
     artifacts = ArtifactStore(tmp_path / "artifacts")
     benchmark_config = config(benchmark_id="bench-partial")
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id="bench-partial")
-    budget = RemoteAttemptBudget(
-        limit=4, event_sink=ledger.record, benchmark_id="bench-partial"
-    )
+    budget = RemoteAttemptBudget(limit=4, event_sink=ledger.record, benchmark_id="bench-partial")
     runner = BenchmarkRunner(
         config=benchmark_config,
         artifacts=artifacts,
@@ -486,9 +634,7 @@ def test_complete_run_persists_metrics_intervals_breakpoint_chart_and_hashes(
         observer: Callable[[Hy3AttemptContext], None],
     ):
         for operation in ("logic-reviewer-v1", "adversarial-reviewer-v1"):
-            observer(
-                Hy3AttemptContext(operation=operation, phase="request", retry_number=1)
-            )
+            observer(Hy3AttemptContext(operation=operation, phase="request", retry_number=1))
         return by_id[sample_id]
 
     report = BenchmarkRunner(
@@ -496,6 +642,7 @@ def test_complete_run_persists_metrics_intervals_breakpoint_chart_and_hashes(
         artifacts=artifacts,
         budget=budget,
         ledger=ledger,
+        human_labels=(literal_human_labels()[0],),
     ).run(execute)
 
     assert report.status is BenchmarkStatus.COMPLETE
@@ -508,13 +655,28 @@ def test_complete_run_persists_metrics_intervals_breakpoint_chart_and_hashes(
         "observation:n2",
         "observation:n3",
         "ledger_index",
+        "human_labels",
         "metrics",
         "confidence_intervals",
         "breakpoint",
         "chart:overall_metrics",
+        "chart:topic_metrics",
+        "chart:rating_band_metrics",
+        "chart:taxonomy_distribution",
     }
     for entry in report.artifacts:
         assert sha256_json(artifacts.read_json(entry.path)) == entry.content_hash
-    assert artifacts.read_json(
-        "benchmarks/bench-complete/breakpoint.json"
-    )["not_evaluable"] is False
+    assert (
+        artifacts.read_json("benchmarks/bench-complete/breakpoint.json")["not_evaluable"] is False
+    )
+    metrics_payload = artifacts.read_json("benchmarks/bench-complete/metrics.json")
+    flagged = next(
+        item
+        for item in metrics_payload["overall"]
+        if item["name"] == "flagged_final_correct_process_issue_rate"
+    )
+    assert (flagged["numerator"], flagged["denominator"], flagged["value"]) == (
+        1.0,
+        1,
+        1.0,
+    )
