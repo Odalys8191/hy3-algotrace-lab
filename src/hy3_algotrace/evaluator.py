@@ -73,8 +73,28 @@ class ReviewOutcome:
 
 def _verdict_signature(
     verdict: ReviewerVerdict,
-) -> tuple[bool, ErrorTaxonomy | None, str | None]:
-    return verdict.material_error, verdict.error_taxonomy, verdict.first_error_step_id
+) -> tuple[
+    bool,
+    ErrorTaxonomy | None,
+    str | None,
+    tuple[tuple[str, StepStatus, ErrorTaxonomy | None], ...],
+]:
+    material_steps = tuple(
+        sorted(
+            (
+                (review.step_id, review.status, review.taxonomy)
+                for review in verdict.per_step_reviews
+                if review.material
+            ),
+            key=lambda item: item[0],
+        )
+    )
+    return (
+        verdict.material_error,
+        verdict.error_taxonomy,
+        verdict.first_error_step_id,
+        material_steps,
+    )
 
 
 class ReviewOrchestrator:
@@ -168,33 +188,6 @@ def score_process(trace: SolutionTrace, material_step_ids: Iterable[str]) -> flo
     return float(100 - sum(DIMENSION_WEIGHTS[stage] for stage in affected_stages))
 
 
-EXECUTION_TAXONOMY: Mapping[JudgeStatus, ErrorTaxonomy] = MappingProxyType(
-    {
-        JudgeStatus.WA: ErrorTaxonomy.IMPLEMENTATION_ERROR,
-        JudgeStatus.COMPILE_ERROR: ErrorTaxonomy.IMPLEMENTATION_ERROR,
-        JudgeStatus.RUNTIME_ERROR: ErrorTaxonomy.IMPLEMENTATION_ERROR,
-        JudgeStatus.OUTPUT_LIMIT: ErrorTaxonomy.IMPLEMENTATION_ERROR,
-        JudgeStatus.TLE: ErrorTaxonomy.COMPLEXITY_ERROR,
-        JudgeStatus.MLE: ErrorTaxonomy.COMPLEXITY_ERROR,
-    }
-)
-
-
-TAXONOMY_STAGE: Mapping[ErrorTaxonomy, ReasoningStage] = MappingProxyType(
-    {
-        ErrorTaxonomy.PROBLEM_MISREAD: ReasoningStage.PROBLEM_UNDERSTANDING,
-        ErrorTaxonomy.CONSTRAINT_OMISSION: ReasoningStage.PROBLEM_UNDERSTANDING,
-        ErrorTaxonomy.ALGORITHM_LOGIC: ReasoningStage.ALGORITHM_DESIGN,
-        ErrorTaxonomy.PROOF_GAP_CIRCULARITY: ReasoningStage.CORRECTNESS_ARGUMENT,
-        ErrorTaxonomy.COMPLEXITY_ERROR: ReasoningStage.COMPLEXITY_ANALYSIS,
-        ErrorTaxonomy.BOUNDARY_ERROR: ReasoningStage.EDGE_CASES,
-        ErrorTaxonomy.IMPLEMENTATION_ERROR: ReasoningStage.IMPLEMENTATION,
-        ErrorTaxonomy.HALLUCINATION: ReasoningStage.PROBLEM_UNDERSTANDING,
-        ErrorTaxonomy.FORMAT_SCHEMA: ReasoningStage.PROBLEM_UNDERSTANDING,
-    }
-)
-
-
 class EvidenceFusion:
     """Fuse execution, rules, reviewer consensus, then arbiter evidence in that order."""
 
@@ -214,21 +207,6 @@ class EvidenceFusion:
             if reviews.arbiter is None
             else (*reviews.primary, reviews.arbiter)
         )
-
-        if judge.verdict is not JudgeStatus.AC:
-            taxonomy = EXECUTION_TAXONOMY[judge.verdict]
-            root = self._first_stage_step(trace, TAXONOMY_STAGE[taxonomy])
-            return self._report(
-                run_id=run_id,
-                problem=problem,
-                trace=trace,
-                judge=judge,
-                reviewer_verdicts=reviewer_verdicts,
-                taxonomy=taxonomy,
-                root=root,
-                material_steps=(root,),
-                needs_human_review=False,
-            )
 
         material_rules = tuple(finding for finding in rule_findings if finding.material)
         if material_rules:
@@ -271,10 +249,12 @@ class EvidenceFusion:
                 trace_id=trace.trace_id,
                 judge_evidence=judge,
                 reviewer_verdicts=reviewer_verdicts,
-                final_correct=True,
+                final_correct=judge.verdict is JudgeStatus.AC,
                 process_score=100.0,
                 process_valid=True,
-                needs_human_review=reviews.unresolved,
+                needs_human_review=(
+                    reviews.unresolved or judge.verdict is not JudgeStatus.AC
+                ),
             )
         root = localize_root_error(trace, material_reviews) or trace.steps[0].step_id
         taxonomy = next(
@@ -309,13 +289,17 @@ class EvidenceFusion:
             raise InfrastructureEvidenceError(
                 "judge infrastructure did not produce authoritative execution evidence"
             )
-        if judge.verdict not in EXECUTION_TAXONOMY and judge.verdict is not JudgeStatus.AC:
+        supported = {
+            JudgeStatus.AC,
+            JudgeStatus.WA,
+            JudgeStatus.COMPILE_ERROR,
+            JudgeStatus.RUNTIME_ERROR,
+            JudgeStatus.TLE,
+            JudgeStatus.MLE,
+            JudgeStatus.OUTPUT_LIMIT,
+        }
+        if judge.verdict not in supported:
             raise InfrastructureEvidenceError("unsupported judge infrastructure verdict")
-
-    @staticmethod
-    def _first_stage_step(trace: SolutionTrace, stage: ReasoningStage) -> str:
-        matching = tuple(step for step in trace.steps if step.stage is stage)
-        return min(matching or trace.steps, key=lambda step: step.step_number).step_id
 
     @staticmethod
     def _report(

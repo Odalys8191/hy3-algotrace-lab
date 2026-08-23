@@ -92,7 +92,7 @@ def test_dependency_on_a_later_step_is_a_deterministic_logic_error() -> None:
     ]
 
 
-def test_explanation_complexity_edge_and_code_consistency_signals_are_reported() -> None:
+def test_explanation_and_complexity_consistency_signals_are_reported() -> None:
     findings = RuleEngine().evaluate(
         trace(
             correctness_argument=" ",
@@ -105,6 +105,18 @@ def test_explanation_complexity_edge_and_code_consistency_signals_are_reported()
     assert {finding.taxonomy for finding in findings} == {
         ErrorTaxonomy.PROOF_GAP_CIRCULARITY,
         ErrorTaxonomy.COMPLEXITY_ERROR,
-        ErrorTaxonomy.BOUNDARY_ERROR,
     }
     assert all(finding.material for finding in findings)
+
+
+def test_constant_division_does_not_invent_a_zero_divisor_boundary_error() -> None:
+    findings = RuleEngine().evaluate(
+        trace(
+            edge_cases=("Odd inputs round down.",),
+            code="int main(){ int n; cin >> n; cout << n / 2; }",
+        )
+    )
+
+    assert ErrorTaxonomy.BOUNDARY_ERROR not in {
+        finding.taxonomy for finding in findings
+    }

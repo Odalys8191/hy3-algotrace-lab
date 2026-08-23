@@ -30,7 +30,12 @@ from hy3_algotrace.evaluator import (
     localize_root_error,
     score_process,
 )
-from hy3_algotrace.hy3_client import Hy3Client, Hy3Config, JsonResponseCache
+from hy3_algotrace.hy3_client import (
+    Hy3Client,
+    Hy3Config,
+    Hy3ResponseError,
+    JsonResponseCache,
+)
 from hy3_algotrace.rules import RuleEngine, RuleSignal
 
 
@@ -99,33 +104,35 @@ def verdict(
     error_step_ids: tuple[str, ...] = (),
     taxonomy: ErrorTaxonomy = ErrorTaxonomy.ALGORITHM_LOGIC,
 ) -> ReviewerVerdict:
-    if not error_step_ids:
-        review = StepReview(
-            step_id="step-1",
-            status=StepStatus.CORRECT,
-            material=False,
-            evidence="The checked reasoning is consistent.",
+    error_steps = set(error_step_ids)
+    reviews = tuple(
+        StepReview(
+            step_id=f"step-{index}",
+            status=(
+                StepStatus.INCORRECT
+                if f"step-{index}" in error_steps
+                else StepStatus.CORRECT
+            ),
+            material=f"step-{index}" in error_steps,
+            taxonomy=taxonomy if f"step-{index}" in error_steps else None,
+            evidence=(
+                f"step-{index} is materially wrong."
+                if f"step-{index}" in error_steps
+                else f"step-{index} is consistent."
+            ),
             confidence=0.9,
         )
+        for index in range(1, 7)
+    )
+    if not error_step_ids:
         return ReviewerVerdict(
             reviewer_id=reviewer_id,
             trace_id="trace-1",
             material_error=False,
             explanation="No material error found.",
-            per_step_reviews=(review,),
+            per_step_reviews=reviews,
             confidence=0.9,
         )
-    reviews = tuple(
-        StepReview(
-            step_id=step_id,
-            status=StepStatus.INCORRECT,
-            material=True,
-            taxonomy=taxonomy,
-            evidence=f"{step_id} is materially wrong.",
-            confidence=0.9,
-        )
-        for step_id in error_step_ids
-    )
     return ReviewerVerdict(
         reviewer_id=reviewer_id,
         trace_id="trace-1",
@@ -209,6 +216,73 @@ def test_material_disagreement_calls_arbiter_with_both_verdicts(tmp_path: Path) 
     assert "adversarial-reviewer" in arbiter_request
 
 
+def test_additional_material_step_is_a_disagreement_that_calls_arbiter() -> None:
+    logic = verdict(
+        "logic-reviewer", error_step_ids=("step-2", "step-3")
+    )
+    adversarial = verdict("adversarial-reviewer", error_step_ids=("step-2",))
+    arbiter = verdict("arbiter", error_step_ids=("step-2",))
+
+    class Client:
+        def __init__(self) -> None:
+            self.arbitrations = 0
+
+        def review(
+            self,
+            problem: ProblemRecord,
+            oracle: ProblemOracle,
+            trace: SolutionTrace,
+            *,
+            reviewer_id: str,
+        ) -> ReviewerVerdict:
+            return logic if reviewer_id == "logic-reviewer" else adversarial
+
+        def arbitrate(
+            self,
+            problem: ProblemRecord,
+            oracle: ProblemOracle,
+            trace: SolutionTrace,
+            primary: tuple[ReviewerVerdict, ReviewerVerdict],
+        ) -> ReviewerVerdict:
+            self.arbitrations += 1
+            return arbiter
+
+    client = Client()
+
+    outcome = ReviewOrchestrator(client).review(problem(), oracle(), trace())
+
+    assert outcome.material_disagreement is True
+    assert outcome.arbiter == arbiter
+    assert client.arbitrations == 1
+
+
+@pytest.mark.parametrize("coverage", ["missing", "duplicate"])
+def test_review_requires_every_trace_step_exactly_once(
+    tmp_path: Path, coverage: str
+) -> None:
+    complete = verdict("logic-reviewer")
+    reviews = complete.per_step_reviews[:-1]
+    if coverage == "duplicate":
+        reviews = (*reviews, reviews[0])
+    payload = complete.model_dump(mode="json") | {
+        "per_step_reviews": [review.model_dump(mode="json") for review in reviews]
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return completion(payload)
+
+    client = Hy3Client(
+        Hy3Config(base_url="https://hy3.example/v1", api_key="test-key"),
+        cache=JsonResponseCache(tmp_path / "cache"),
+        transport=httpx.MockTransport(handler),
+    )
+
+    with pytest.raises(Hy3ResponseError, match="every trace step exactly once"):
+        client.review(
+            problem(), oracle(), trace(), reviewer_id="logic-reviewer"
+        )
+
+
 def test_dimension_weights_and_score_use_exact_required_values() -> None:
     solution = trace()
 
@@ -260,7 +334,7 @@ def test_deterministic_rules_override_reviewer_consensus_and_preserve_ac_paradox
     assert is_paradox(report) is True
 
 
-def test_execution_failure_overrides_model_opinion() -> None:
+def test_execution_failure_does_not_invent_process_error_from_clean_reviews() -> None:
     reviews = ReviewOutcome(
         primary=(verdict("logic-reviewer"), verdict("adversarial-reviewer")),
     )
@@ -275,10 +349,36 @@ def test_execution_failure_overrides_model_opinion() -> None:
     )
 
     assert report.final_correct is False
+    assert report.process_valid is True
+    assert report.final_error_taxonomy is None
+    assert report.first_material_error_step_id is None
+    assert report.process_score == 100.0
+    assert report.needs_human_review is True
+
+
+def test_execution_failure_uses_review_evidence_for_process_localization() -> None:
+    reviews = ReviewOutcome(
+        primary=(
+            verdict("logic-reviewer", error_step_ids=("step-2",)),
+            verdict("adversarial-reviewer", error_step_ids=("step-2",)),
+        ),
+    )
+
+    report = EvidenceFusion().fuse(
+        run_id="run-1",
+        problem=problem(),
+        trace=trace(),
+        judge=JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.WA),
+        rule_findings=(),
+        reviews=reviews,
+    )
+
+    assert report.final_correct is False
     assert report.process_valid is False
-    assert report.final_error_taxonomy is ErrorTaxonomy.IMPLEMENTATION_ERROR
-    assert report.first_material_error_step_id == "step-5"
-    assert report.process_score == 90.0
+    assert report.final_error_taxonomy is ErrorTaxonomy.ALGORITHM_LOGIC
+    assert report.first_material_error_step_id == "step-2"
+    assert report.process_score == 75.0
+    assert report.needs_human_review is False
 
 
 def test_novel_arbiter_result_is_unresolved_and_needs_human_review() -> None:
