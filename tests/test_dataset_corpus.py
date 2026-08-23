@@ -50,11 +50,15 @@ from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
     AcquisitionManifest,
     CandidateReview,
+    CandidateReviewArtifact,
+    CandidateReviewSet,
     CheckerKind,
     ConversionTool,
     DatasetFormat,
     FrozenSelectionEntry,
     FrozenSelectionManifest,
+    ReviewArtifactAsset,
+    ReviewArtifactManifest,
     VerifiedSelectionChain,
     build_quota_report,
     convert_codecontests_file,
@@ -248,12 +252,39 @@ def _verified_selection_chain(
             "test": "formal-chain-test",
         },
     )
+    review_sets: dict[str, CandidateReviewSet] = {}
+    review_paths = {
+        split: root / f"formal-chain-reviews-{split}.json" for split in ("validation", "test")
+    }
+    for split in ("validation", "test"):
+        artifacts = tuple(
+            CandidateReviewArtifact.create(
+                raw_row_hash=sha256_json(row),
+                review=review,
+            )
+            for row, review in zip(rows[split], reviews[split], strict=True)
+        )
+        review_sets[split] = CandidateReviewSet.create(split=split, artifacts=artifacts)
+        review_paths[split].write_bytes(
+            canonical_json_bytes(review_sets[split].model_dump(mode="json"))
+        )
+    review_manifest = ReviewArtifactManifest.create(
+        tuple(
+            ReviewArtifactAsset(
+                split=split,
+                logical_id=f"formal-chain-reviews-{split}",
+                byte_length=len(review_paths[split].read_bytes()),
+                sha256=hashlib.sha256(review_paths[split].read_bytes()).hexdigest(),
+            )
+            for split in ("validation", "test")
+        )
+    )
     conversions = tuple(
         convert_codecontests_file(
             paths[split],
             split=split,
             data_format=DatasetFormat.JSON,
-            reviews=reviews[split],
+            reviews=review_sets[split].artifacts,
             converter=converter,
             acquisition_validation=acquisition_validation,
         )
@@ -269,8 +300,13 @@ def _verified_selection_chain(
     )
     chain = verify_frozen_selection_chain(
         selection.model_dump(mode="json"),
-        conversions=conversions,
-        quota=quota,
+        raw_asset_paths=paths,
+        data_formats={
+            "validation": DatasetFormat.JSON,
+            "test": DatasetFormat.JSON,
+        },
+        review_artifact_paths=review_paths,
+        review_manifest=review_manifest,
         acquisition=acquisition,
         acquisition_validation=acquisition_validation,
     )
@@ -792,6 +828,27 @@ def test_corpus_model_rejects_self_rehashed_natural_selection_link(tmp_path: Pat
 
     with pytest.raises(ValidationError, match="natural.*selection"):
         CorpusManifest.model_validate_json(json.dumps(payload))
+
+
+def test_natural_run_endpoint_rejects_query_credentials() -> None:
+    """Frozen endpoint identity must not serialize API keys or any query string."""
+
+    selection = _selection()
+    baseline = _natural_config(selection)
+
+    with pytest.raises(ValidationError, match="query|credentials"):
+        NaturalRunConfig.create(
+            selection_manifest_hash=selection.content_hash,
+            problem_ids=baseline.problem_ids,
+            prompt_version=baseline.prompt_version,
+            prompt_hash=baseline.prompt_hash,
+            model_name=baseline.model_name,
+            endpoint_url="https://api.example.invalid/v1?api_key=SECRET",
+            model_parameters=baseline.model_parameters,
+            credential_env_var=baseline.credential_env_var,
+            status=NaturalRunStatus.PENDING_CREDENTIALS,
+            pending_reason=baseline.pending_reason,
+        )
 
 
 def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(

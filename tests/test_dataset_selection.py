@@ -9,18 +9,23 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from hy3_algotrace.artifacts import sha256_json
+from hy3_algotrace.artifacts import canonical_json_bytes, sha256_json
+from hy3_algotrace.catalog import problem_content_hash
 from hy3_algotrace.contracts import Topic
 from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
     AcquisitionManifest,
     CandidateReview,
+    CandidateReviewArtifact,
+    CandidateReviewSet,
     CheckerKind,
     ConversionTool,
     DatasetDataError,
     DatasetFormat,
     FrozenSelectionManifest,
     QuotaStatus,
+    ReviewArtifactAsset,
+    ReviewArtifactManifest,
     VerifiedSelectionChain,
     build_quota_report,
     convert_codecontests_file,
@@ -142,6 +147,102 @@ def _fulfilled_chain(tmp_path: Path):  # type: ignore[no-untyped-def]
     )
 
 
+def _trusted_replay_chain(tmp_path: Path):  # type: ignore[no-untyped-def]
+    rows: dict[str, list[dict[str, object]]] = {"validation": [], "test": []}
+    reviews: dict[str, list[CandidateReview]] = {"validation": [], "test": []}
+    contest_id = 4500
+    for topic in Topic:
+        for rating in (1300, 1700, 2100):
+            for _ in range(2):
+                rows["validation"].append(_row(contest_id, topic, rating))
+                reviews["validation"].append(_review(contest_id))
+                contest_id += 1
+    raw_paths = {split: tmp_path / f"replay-{split}.json" for split in ("validation", "test")}
+    for split in ("validation", "test"):
+        raw_paths[split].write_text(json.dumps(rows[split]), encoding="utf-8")
+    converter = ConversionTool(name="trusted-replay-json", version="1")
+    acquisition = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=tuple(
+            AcquisitionAsset(
+                split=split,
+                url=f"https://example.invalid/replay-{split}.json",
+                byte_length=len(raw_paths[split].read_bytes()),
+                sha256=hashlib.sha256(raw_paths[split].read_bytes()).hexdigest(),
+                license="CC-BY-4.0 plus third-party terms",
+                attribution="Google DeepMind CodeContests and Codeforces",
+            )
+            for split in ("validation", "test")
+        ),
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    acquisition_validation = validate_acquired_assets(
+        acquisition,
+        raw_paths,
+        logical_ids={"validation": "replay-validation", "test": "replay-test"},
+    )
+    review_sets: dict[str, CandidateReviewSet] = {}
+    review_paths = {split: tmp_path / f"reviews-{split}.json" for split in ("validation", "test")}
+    for split in ("validation", "test"):
+        artifacts = tuple(
+            CandidateReviewArtifact.create(
+                raw_row_hash=sha256_json(row),
+                review=review,
+            )
+            for row, review in zip(rows[split], reviews[split], strict=True)
+        )
+        review_sets[split] = CandidateReviewSet.create(split=split, artifacts=artifacts)
+        review_paths[split].write_bytes(
+            canonical_json_bytes(review_sets[split].model_dump(mode="json"))
+        )
+    review_manifest = ReviewArtifactManifest.create(
+        tuple(
+            ReviewArtifactAsset(
+                split=split,
+                logical_id=f"checker-reviews-{split}",
+                byte_length=len(review_paths[split].read_bytes()),
+                sha256=hashlib.sha256(review_paths[split].read_bytes()).hexdigest(),
+            )
+            for split in ("validation", "test")
+        )
+    )
+    conversions = tuple(
+        convert_codecontests_file(
+            raw_paths[split],
+            split=split,
+            data_format=DatasetFormat.JSON,
+            reviews=review_sets[split].artifacts,
+            converter=converter,
+            acquisition_validation=acquisition_validation,
+        )
+        for split in ("validation", "test")
+    )
+    quota = build_quota_report(conversions)
+    selection = freeze_selection(
+        tuple(
+            assessment.problem_id
+            for conversion in conversions
+            for assessment in conversion.eligible
+        ),
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=acquisition_validation,
+    )
+    return {
+        "raw_paths": raw_paths,
+        "review_paths": review_paths,
+        "review_manifest": review_manifest,
+        "review_sets": review_sets,
+        "acquisition": acquisition,
+        "acquisition_validation": acquisition_validation,
+        "conversions": conversions,
+        "quota": quota,
+        "selection": selection,
+    }
+
+
 def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashes(
     tmp_path: Path,
 ) -> None:
@@ -174,17 +275,6 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
         )
         == manifest
     )
-    verified_chain = verify_frozen_selection_chain(
-        manifest.model_dump(mode="json"),
-        conversions=conversions,
-        quota=quota,
-        acquisition=acquisition,
-        acquisition_validation=validation,
-    )
-    assert verified_chain.selection == manifest
-    with pytest.raises(TypeError):
-        VerifiedSelectionChain(selection=manifest)
-
     payload = manifest.model_dump(mode="json")
     payload["entries"][0]["review_hash"] = "b" * 64
     payload["content_hash"] = sha256_json(
@@ -192,17 +282,6 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
     )
     with pytest.raises(DatasetDataError, match="candidate hashes"):
         validate_frozen_selection(
-            payload,
-            conversions=conversions,
-            quota=quota,
-            acquisition=acquisition,
-            acquisition_validation=validation,
-        )
-    forged_manifest = FrozenSelectionManifest.model_validate_json(json.dumps(payload))
-    with pytest.raises((TypeError, ValueError)):
-        replace(verified_chain, selection=forged_manifest)
-    with pytest.raises(DatasetDataError, match="candidate hashes"):
-        verify_frozen_selection_chain(
             payload,
             conversions=conversions,
             quota=quota,
@@ -265,6 +344,132 @@ def test_selection_entry_rejects_all_zero_evidence_hashes(
 
     with pytest.raises(ValidationError, match="all-zero"):
         type(manifest.entries[0]).model_validate(payload)
+
+
+def test_verified_selection_replays_raw_rows_and_pinned_human_reviews(
+    tmp_path: Path,
+) -> None:
+    """Self-rehashing every derived row/reviewer/record cannot mint a capability."""
+
+    chain = _trusted_replay_chain(tmp_path)
+    forged_conversions = []
+    for conversion in chain["conversions"]:
+        forged_assessments = []
+        for assessment in conversion.assessments:
+            if not assessment.eligible:
+                forged_assessments.append(assessment)
+                continue
+            assert assessment.record is not None
+            assert assessment.review is not None
+            forged_raw_hash = hashlib.sha256(
+                f"forged-row:{assessment.problem_id}".encode()
+            ).hexdigest()
+            forged_provisional = assessment.record.model_copy(
+                update={"title": "Forged attacker title", "content_hash": "0" * 64}
+            )
+            forged_record = forged_provisional.model_copy(
+                update={"content_hash": problem_content_hash(forged_provisional)}
+            )
+            forged_review = assessment.review.model_copy(update={"reviewer": "attacker"})
+            forged_artifact = CandidateReviewArtifact.create(
+                raw_row_hash=forged_raw_hash,
+                review=forged_review,
+            )
+            forged_assessments.append(
+                assessment.model_copy(
+                    update={
+                        "raw_row_hash": forged_raw_hash,
+                        "record": forged_record,
+                        "review": forged_review,
+                        "review_artifact_hash": forged_artifact.content_hash,
+                    }
+                )
+            )
+        forged_conversions.append(
+            conversion.model_copy(update={"assessments": tuple(forged_assessments)})
+        )
+    forged_quota = build_quota_report(tuple(forged_conversions))
+    forged_selection = freeze_selection(
+        tuple(entry.problem_id for entry in chain["selection"].entries),
+        conversions=tuple(forged_conversions),
+        quota=forged_quota,
+        acquisition=chain["acquisition"],
+        acquisition_validation=chain["acquisition_validation"],
+    )
+
+    with pytest.raises(DatasetDataError, match="candidate hashes"):
+        verify_frozen_selection_chain(
+            forged_selection.model_dump(mode="json"),
+            raw_asset_paths=chain["raw_paths"],
+            data_formats={
+                "validation": DatasetFormat.JSON,
+                "test": DatasetFormat.JSON,
+            },
+            review_artifact_paths=chain["review_paths"],
+            review_manifest=chain["review_manifest"],
+            acquisition=chain["acquisition"],
+            acquisition_validation=chain["acquisition_validation"],
+        )
+
+
+@pytest.mark.parametrize("altered_input", ("raw", "review"))
+def test_verified_selection_rejects_altered_raw_or_review_file(
+    tmp_path: Path,
+    altered_input: str,
+) -> None:
+    """Capability issuance reobserves both pinned byte roots on every replay."""
+
+    chain = _trusted_replay_chain(tmp_path)
+    verified_chain = verify_frozen_selection_chain(
+        chain["selection"].model_dump(mode="json"),
+        raw_asset_paths=chain["raw_paths"],
+        data_formats={
+            "validation": DatasetFormat.JSON,
+            "test": DatasetFormat.JSON,
+        },
+        review_artifact_paths=chain["review_paths"],
+        review_manifest=chain["review_manifest"],
+        acquisition=chain["acquisition"],
+        acquisition_validation=chain["acquisition_validation"],
+    )
+    assert verified_chain.selection == chain["selection"]
+    with pytest.raises(TypeError):
+        VerifiedSelectionChain(selection=chain["selection"])
+    with pytest.raises((TypeError, ValueError)):
+        replace(verified_chain, selection=chain["selection"])
+    if altered_input == "raw":
+        target = chain["raw_paths"]["validation"]
+        altered_rows = json.loads(target.read_text(encoding="utf-8"))
+        altered_rows[0]["name"] = "Altered raw title"
+        target.write_text(json.dumps(altered_rows), encoding="utf-8")
+    else:
+        target = chain["review_paths"]["validation"]
+        review_set = chain["review_sets"]["validation"]
+        original = review_set.artifacts[0]
+        altered_review = original.review.model_copy(update={"reviewer": "attacker"})
+        altered_artifact = CandidateReviewArtifact.create(
+            raw_row_hash=original.raw_row_hash,
+            review=altered_review,
+        )
+        altered_set = CandidateReviewSet.create(
+            split="validation",
+            artifacts=(altered_artifact, *review_set.artifacts[1:]),
+        )
+        target.write_bytes(canonical_json_bytes(altered_set.model_dump(mode="json")))
+
+    with pytest.raises(DatasetDataError, match="byte length|raw source|review artifact"):
+        verify_frozen_selection_chain(
+            chain["selection"].model_dump(mode="json"),
+            raw_asset_paths=chain["raw_paths"],
+            data_formats={
+                "validation": DatasetFormat.JSON,
+                "test": DatasetFormat.JSON,
+            },
+            review_artifact_paths=chain["review_paths"],
+            review_manifest=chain["review_manifest"],
+            acquisition=chain["acquisition"],
+            acquisition_validation=chain["acquisition_validation"],
+        )
 
 
 def test_freeze_selection_rejects_conversion_not_pinned_by_acquisition(tmp_path: Path) -> None:

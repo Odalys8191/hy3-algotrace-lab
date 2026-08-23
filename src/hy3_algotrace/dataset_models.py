@@ -240,17 +240,161 @@ class CandidateReview(DatasetModel):
         return sha256_json(self.model_dump(mode="json"))
 
 
+class CandidateReviewArtifact(DatasetModel):
+    """Canonical human review bound to the exact raw CodeContests row."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["codecontests_checker_review"] = "codecontests_checker_review"
+    raw_row_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    review: CandidateReview
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("raw_row_hash", "content_hash")
+    @classmethod
+    def reject_zero_hash(cls, value: str) -> str:
+        if value == "0" * 64:
+            raise ValueError("review artifact hashes cannot be all-zero")
+        return value
+
+    @model_validator(mode="after")
+    def validate_artifact(self) -> Self:
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("review artifact content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        raw_row_hash: str,
+        review: CandidateReview,
+    ) -> CandidateReviewArtifact:
+        payload = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "codecontests_checker_review",
+            "raw_row_hash": raw_row_hash,
+            "review": review.model_dump(mode="json"),
+        }
+        return cls(
+            raw_row_hash=raw_row_hash,
+            review=review,
+            content_hash=sha256_json(payload),
+        )
+
+
+class CandidateReviewSet(DatasetModel):
+    """Canonical review artifact file for one source split."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["codecontests_checker_review_set"] = "codecontests_checker_review_set"
+    split: Literal["validation", "test"]
+    artifacts: tuple[CandidateReviewArtifact, ...]
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_set(self) -> Self:
+        problem_ids = [artifact.review.problem_id for artifact in self.artifacts]
+        if len(problem_ids) != len(set(problem_ids)):
+            raise ValueError("review artifact problem IDs must be unique")
+        if problem_ids != sorted(problem_ids):
+            raise ValueError("review artifacts must use canonical problem-ID order")
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("review set content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        split: Literal["validation", "test"],
+        artifacts: Iterable[CandidateReviewArtifact],
+    ) -> CandidateReviewSet:
+        materialized = tuple(sorted(artifacts, key=lambda artifact: artifact.review.problem_id))
+        payload = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "codecontests_checker_review_set",
+            "split": split,
+            "artifacts": [artifact.model_dump(mode="json") for artifact in materialized],
+        }
+        return cls(
+            split=split,
+            artifacts=materialized,
+            content_hash=sha256_json(payload),
+        )
+
+
+class ReviewArtifactAsset(DatasetModel):
+    """Trusted root observation for one separately reviewed split artifact."""
+
+    split: Literal["validation", "test"]
+    logical_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+    byte_length: int = Field(gt=0)
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("sha256")
+    @classmethod
+    def reject_zero_hash(cls, value: str) -> str:
+        if value == "0" * 64:
+            raise ValueError("review artifact SHA-256 cannot be all-zero")
+        return value
+
+
+class ReviewArtifactManifest(DatasetModel):
+    """Caller-approved byte roots for validation/test human review files."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["codecontests_checker_review_manifest"] = "codecontests_checker_review_manifest"
+    assets: tuple[ReviewArtifactAsset, ...] = Field(min_length=2, max_length=2)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Self:
+        if [asset.split for asset in self.assets] != ["validation", "test"]:
+            raise ValueError("review assets must contain validation and test in order")
+        if len({asset.logical_id for asset in self.assets}) != 2:
+            raise ValueError("review asset logical identifiers must be unique")
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("review artifact manifest content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
+
+    @classmethod
+    def create(cls, assets: Iterable[ReviewArtifactAsset]) -> ReviewArtifactManifest:
+        materialized = tuple(assets)
+        payload = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "codecontests_checker_review_manifest",
+            "assets": [asset.model_dump(mode="json") for asset in materialized],
+        }
+        return cls(assets=materialized, content_hash=sha256_json(payload))
+
+
 class CandidateAssessment(DatasetModel):
     row_number: int = Field(gt=0)
     problem_id: str | None = Field(default=None, min_length=1)
     raw_row_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     record: ProblemRecord | None = None
     review: CandidateReview | None = None
+    review_artifact_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     eligible: bool
     reasons: tuple[str, ...] = ()
     reason_detail: str = Field(default="", max_length=2_000)
 
-    @field_validator("raw_row_hash")
+    @field_validator("raw_row_hash", "review_artifact_hash")
     @classmethod
     def reject_zero_raw_row_hash(cls, value: str) -> str:
         if value == "0" * 64:
@@ -266,6 +410,15 @@ class CandidateAssessment(DatasetModel):
             raise ValueError("rejected assessment requires at least one reason")
         if self.record is not None and self.problem_id != self.record.problem_id:
             raise ValueError("assessment problem ID does not match record")
+        if self.review_artifact_hash is not None:
+            if self.review is None:
+                raise ValueError("review artifact hash requires a review")
+            expected = CandidateReviewArtifact.create(
+                raw_row_hash=self.raw_row_hash,
+                review=self.review,
+            ).content_hash
+            if self.review_artifact_hash != expected:
+                raise ValueError("assessment review artifact hash does not match")
         return self
 
 
@@ -510,7 +663,7 @@ def convert_codecontests_file(
     *,
     split: Literal["validation", "test"],
     data_format: DatasetFormat,
-    reviews: Iterable[CandidateReview],
+    reviews: Iterable[CandidateReview | CandidateReviewArtifact],
     converter: ConversionTool,
     acquisition_validation: AcquisitionValidationReport,
     converter_argv: Sequence[str] | None = None,
@@ -536,10 +689,19 @@ def convert_codecontests_file(
     if source.byte_length != observed_asset.byte_length or source.sha256 != observed_asset.sha256:
         raise DatasetDataError("raw source does not match acquisition validation report")
     review_by_id: dict[str, CandidateReview] = {}
-    for review in reviews:
+    review_artifact_by_id: dict[str, CandidateReviewArtifact] = {}
+    for supplied_review in reviews:
+        if isinstance(supplied_review, CandidateReviewArtifact):
+            artifact: CandidateReviewArtifact | None = supplied_review
+            review = supplied_review.review
+        else:
+            artifact = None
+            review = supplied_review
         if review.problem_id in review_by_id:
             raise DatasetDataError(f"duplicate checker review: {review.problem_id}")
         review_by_id[review.problem_id] = review
+        if artifact is not None:
+            review_artifact_by_id[review.problem_id] = artifact
     rows = _load_rows(
         source.contents,
         source_label=source.logical_id,
@@ -566,9 +728,25 @@ def convert_codecontests_file(
             reviews=review_by_id,
             seen_ids=seen_ids,
         )
+        artifact = (
+            review_artifact_by_id.get(assessment.problem_id)
+            if assessment.problem_id is not None
+            else None
+        )
+        if artifact is not None:
+            if artifact.raw_row_hash != assessment.raw_row_hash:
+                raise DatasetDataError(
+                    f"review artifact raw row hash mismatch: {artifact.review.problem_id}"
+                )
+            assessment = assessment.model_copy(
+                update={"review_artifact_hash": artifact.content_hash}
+            )
         assessments.append(assessment)
         if assessment.problem_id is not None:
             seen_ids.add(assessment.problem_id)
+    missing_review_rows = sorted(set(review_artifact_by_id).difference(seen_ids))
+    if missing_review_rows:
+        raise DatasetDataError(f"review artifacts do not match raw rows: {missing_review_rows}")
     return CandidateConversionReport(
         split=split,
         data_format=data_format,
@@ -725,16 +903,53 @@ def validate_frozen_selection(
 def verify_frozen_selection_chain(
     payload: Mapping[str, Any],
     *,
-    conversions: Iterable[CandidateConversionReport],
-    quota: EligibilityQuotaReport,
+    raw_asset_paths: Mapping[str, Path | str],
+    data_formats: Mapping[str, DatasetFormat],
+    review_artifact_paths: Mapping[str, Path | str],
+    review_manifest: ReviewArtifactManifest,
     acquisition: AcquisitionManifest,
     acquisition_validation: AcquisitionValidationReport,
+    converter_argv_by_split: Mapping[str, Sequence[str] | None] | None = None,
 ) -> VerifiedSelectionChain:
-    """Replay acquisition through selection and issue an in-memory capability."""
+    """Reobserve raw/review bytes and replay every derived selection artifact."""
 
+    expected_splits = {"validation", "test"}
+    if (
+        set(raw_asset_paths) != expected_splits
+        or set(data_formats) != expected_splits
+        or set(review_artifact_paths) != expected_splits
+    ):
+        raise DatasetDataError(
+            "verified selection replay requires raw, format, and review inputs for both splits"
+        )
+    converter_arguments = converter_argv_by_split or {
+        "validation": None,
+        "test": None,
+    }
+    if set(converter_arguments) != expected_splits:
+        raise DatasetDataError("converter argv replay inputs must contain both splits")
+    review_sets = _load_pinned_review_sets(review_artifact_paths, review_manifest)
+    conversions: list[CandidateConversionReport] = []
+    for split in ("validation", "test"):
+        try:
+            conversions.append(
+                convert_codecontests_file(
+                    raw_asset_paths[split],
+                    split=split,
+                    data_format=data_formats[split],
+                    reviews=review_sets[split].artifacts,
+                    converter=acquisition.converter,
+                    acquisition_validation=acquisition_validation,
+                    converter_argv=converter_arguments[split],
+                )
+            )
+        except DatasetDataError as error:
+            raise DatasetDataError(f"{split} raw source replay failed") from error
+    materialized = tuple(conversions)
+    quota = build_quota_report(materialized)
     manifest = validate_frozen_selection(
         payload,
-        conversions=conversions,
+        conversions=materialized,
         quota=quota,
         acquisition=acquisition,
         acquisition_validation=acquisition_validation,
@@ -743,6 +958,40 @@ def verify_frozen_selection_chain(
         selection=manifest,
         _verification_token=_VERIFIED_SELECTION_TOKEN,
     )
+
+
+def _load_pinned_review_sets(
+    paths: Mapping[str, Path | str],
+    manifest: ReviewArtifactManifest,
+) -> dict[str, CandidateReviewSet]:
+    try:
+        trusted_manifest = ReviewArtifactManifest.model_validate_json(manifest.model_dump_json())
+    except ValidationError as error:
+        raise DatasetDataError("review artifact manifest is invalid") from error
+    expected_by_split = {asset.split: asset for asset in trusted_manifest.assets}
+    result: dict[str, CandidateReviewSet] = {}
+    for split in ("validation", "test"):
+        expected = expected_by_split[split]
+        try:
+            observed = read_trusted_file(
+                paths[split],
+                logical_id=expected.logical_id,
+                max_bytes=expected.byte_length,
+            )
+        except DatasetDataError as error:
+            raise DatasetDataError(f"{split} review artifact byte length mismatch") from error
+        if observed.byte_length != expected.byte_length:
+            raise DatasetDataError(f"{split} review artifact byte length mismatch")
+        if observed.sha256 != expected.sha256:
+            raise DatasetDataError(f"{split} review artifact SHA-256 mismatch")
+        try:
+            review_set = CandidateReviewSet.model_validate_json(observed.contents)
+        except (TypeError, ValueError, ValidationError) as error:
+            raise DatasetDataError(f"{split} review artifact is invalid") from error
+        if review_set.split != split:
+            raise DatasetDataError(f"{split} review artifact split does not match")
+        result[split] = review_set
+    return result
 
 
 def _assess_row(
@@ -928,7 +1177,7 @@ def _selection_entry(assessment: CandidateAssessment) -> FrozenSelectionEntry:
         rating=record.rating,
         raw_row_hash=assessment.raw_row_hash,
         record_hash=sha256_json(record.model_dump(mode="json")),
-        review_hash=assessment.review.content_hash,
+        review_hash=assessment.review_artifact_hash or assessment.review.content_hash,
     )
 
 

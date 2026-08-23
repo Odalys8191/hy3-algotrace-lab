@@ -318,9 +318,10 @@ class NaturalRunConfig(DatasetModel):
             or not parsed.hostname
             or parsed.username is not None
             or parsed.password is not None
+            or parsed.query
             or parsed.fragment
         ):
-            raise ValueError("natural run endpoint must be an HTTPS URL without credentials")
+            raise ValueError("natural run endpoint must be HTTPS without credentials or a query")
         return value
 
     @model_validator(mode="after")
