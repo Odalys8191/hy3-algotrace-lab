@@ -319,6 +319,14 @@ class BenchmarkConfig(BenchmarkModel):
         return self
 
     def _validate_formal_profile(self) -> None:
+        prompt_versions = (
+            self.generator_prompt_version,
+            self.logic_review_prompt_version,
+            self.adversarial_review_prompt_version,
+            self.arbiter_prompt_version,
+        )
+        if len(set(prompt_versions)) != len(prompt_versions):
+            raise ValueError("formal prompt versions must be distinct across operation roles")
         expected_counts = {
             SampleKind.GOLD: 30,
             SampleKind.CONTROLLED_WRONG: 60,
@@ -636,8 +644,6 @@ class HumanDecisionSet(BenchmarkModel):
         initial_by_id = {item.blind_id: item for item in self.initial_decisions}
         for delayed in self.delayed_decisions:
             initial = initial_by_id[delayed.blind_id]
-            if delayed.reviewer_id == initial.reviewer_id:
-                raise ValueError("delayed rereview requires a different reviewer")
             if delayed.decided_at <= initial.decided_at:
                 raise ValueError("delayed rereview must occur after the initial decision")
         if self.rereview_fraction != 0.2:

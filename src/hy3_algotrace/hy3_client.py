@@ -125,9 +125,7 @@ def _accept_result(_result: BaseModel) -> None:
     """Replace context-bearing validators before raising a public safe failure."""
 
 
-def _raise_safe_failure(
-    message: str, error_taxonomy: ErrorTaxonomy | None
-) -> NoReturn:
+def _raise_safe_failure(message: str, error_taxonomy: ErrorTaxonomy | None) -> NoReturn:
     """Publish a sanitized error from a frame with no client or transport state."""
 
     raise Hy3ResponseError(message, error_taxonomy=error_taxonomy)
@@ -432,8 +430,7 @@ class Hy3Client:
                 {
                     "role": "user",
                     "content": (
-                        f"{SCHEMA_REPAIR_PROMPT}\n"
-                        f"Validation error: {safe_validation_error}"
+                        f"{SCHEMA_REPAIR_PROMPT}\nValidation error: {safe_validation_error}"
                     ),
                 },
             ]
@@ -450,9 +447,7 @@ class Hy3Client:
                 result = self._validate_content(repaired_content, output_model)
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
                 return None, _SafeFailure(
-                    self._redact(
-                        f"response failed schema validation after one repair: {error}"
-                    ),
+                    self._redact(f"response failed schema validation after one repair: {error}"),
                     ErrorTaxonomy.FORMAT_SCHEMA,
                 )
 
@@ -503,9 +498,7 @@ class Hy3Client:
             except httpx.TransportError as error:
                 if attempt + 1 < self._config.max_attempts:
                     continue
-                terminal_error = Hy3ResponseError(
-                    self._redact(f"Hy3 transport failure: {error}")
-                )
+                terminal_error = Hy3ResponseError(self._redact(f"Hy3 transport failure: {error}"))
                 break
             if response.status_code in TRANSIENT_STATUS_CODES:
                 if attempt + 1 < self._config.max_attempts:
@@ -533,9 +526,7 @@ class Hy3Client:
         return _canonical_json(content)
 
     @staticmethod
-    def _validate_content(
-        content: object, output_model: type[StructuredModel]
-    ) -> StructuredModel:
+    def _validate_content(content: object, output_model: type[StructuredModel]) -> StructuredModel:
         payload = json.loads(content) if isinstance(content, str) else content
         return output_model.model_validate(payload)
 

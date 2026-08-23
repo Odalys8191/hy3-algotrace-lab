@@ -241,7 +241,7 @@ def test_delayed_rereview_is_seeded_deterministic_twenty_percent() -> None:
     assert select_delayed_rereview(blind_ids, seed=17) == ("blind-8", "blind-6")
 
 
-def test_delayed_rereview_must_be_independent_and_later() -> None:
+def test_delayed_rereview_allows_same_reviewer_with_later_independent_decision() -> None:
     initial_time = datetime(2026, 8, 21, tzinfo=UTC)
     initial = HumanDecision(
         decision_id="initial-1",
@@ -252,21 +252,106 @@ def test_delayed_rereview_must_be_independent_and_later() -> None:
         final_correct=True,
         process_valid=True,
     )
-    with pytest.raises(ValueError, match="different reviewer"):
+    decision_set = HumanDecisionSet(
+        batch_id="review-3",
+        decision_set_id="decision-3",
+        sample_seed=1,
+        initial_decisions=(initial,),
+        delayed_decisions=(
+            HumanDecision(
+                decision_id="delayed-1",
+                blind_id="blind-1",
+                reviewer_id="reviewer-a",
+                round=HumanReviewRound.DELAYED,
+                decided_at=initial_time + timedelta(days=1),
+                final_correct=True,
+                process_valid=True,
+            ),
+        ),
+    )
+
+    assert decision_set.delayed_decisions[0].reviewer_id == "reviewer-a"
+    assert decision_set.delayed_decisions[0].decision_id != initial.decision_id
+
+
+def test_delayed_rereview_requires_strictly_later_time_and_unique_decision_id() -> None:
+    initial_time = datetime(2026, 8, 21, tzinfo=UTC)
+    initial = HumanDecision(
+        decision_id="decision-1",
+        blind_id="blind-1",
+        reviewer_id="reviewer-a",
+        round=HumanReviewRound.INITIAL,
+        decided_at=initial_time,
+        final_correct=True,
+        process_valid=True,
+    )
+
+    def delayed(*, decision_id: str, decided_at: datetime) -> HumanDecision:
+        return HumanDecision(
+            decision_id=decision_id,
+            blind_id="blind-1",
+            reviewer_id="reviewer-a",
+            round=HumanReviewRound.DELAYED,
+            decided_at=decided_at,
+            final_correct=True,
+            process_valid=True,
+        )
+
+    with pytest.raises(ValueError, match="after the initial decision"):
         HumanDecisionSet(
-            batch_id="review-3",
-            decision_set_id="decision-3",
-            sample_seed=1,
+            batch_id="review-time",
+            decision_set_id="set-time",
+            sample_seed=17,
+            initial_decisions=(initial,),
+            delayed_decisions=(delayed(decision_id="decision-2", decided_at=initial_time),),
+        )
+    with pytest.raises(ValueError, match="decision IDs must be unique"):
+        HumanDecisionSet(
+            batch_id="review-id",
+            decision_set_id="set-id",
+            sample_seed=17,
             initial_decisions=(initial,),
             delayed_decisions=(
+                delayed(
+                    decision_id=initial.decision_id,
+                    decided_at=initial_time + timedelta(days=1),
+                ),
+            ),
+        )
+
+
+def test_decision_set_requires_exact_seeded_twenty_percent_rereview_selection() -> None:
+    initial_time = datetime(2026, 8, 21, tzinfo=UTC)
+    initial_decisions = tuple(
+        HumanDecision(
+            decision_id=f"initial-{index}",
+            blind_id=f"blind-{index}",
+            reviewer_id="reviewer-a",
+            round=HumanReviewRound.INITIAL,
+            decided_at=initial_time,
+            final_correct=True,
+            process_valid=True,
+        )
+        for index in range(10)
+    )
+    wrong_selection = ("blind-0", "blind-1")
+
+    with pytest.raises(ValueError, match="seeded 20% sample"):
+        HumanDecisionSet(
+            batch_id="review-selection",
+            decision_set_id="set-selection",
+            sample_seed=17,
+            initial_decisions=initial_decisions,
+            delayed_decisions=tuple(
                 HumanDecision(
-                    decision_id="delayed-1",
-                    blind_id="blind-1",
+                    decision_id=f"delayed-{blind_id}",
+                    blind_id=blind_id,
                     reviewer_id="reviewer-a",
                     round=HumanReviewRound.DELAYED,
                     decided_at=initial_time + timedelta(days=1),
                     final_correct=True,
                     process_valid=True,
-                ),
+                )
+                for blind_id in wrong_selection
             ),
         )

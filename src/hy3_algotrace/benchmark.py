@@ -20,6 +20,7 @@ from .benchmark_models import (
     LedgerIndex,
     MetricObservation,
     ObservationReplayInput,
+    SampleKind,
 )
 from .bootstrap import (
     bootstrap_metric,
@@ -147,17 +148,17 @@ class BenchmarkRunner:
         execution_kind: BenchmarkExecutionKind = BenchmarkExecutionKind.LIVE,
         replay_input: ObservationReplayInput | None = None,
     ) -> None:
-        self._config = config
+        self._config = BenchmarkConfig.model_validate(config.model_dump(mode="json"))
         self._artifacts = artifacts
         self._budget = budget
         self._ledger = ledger
         self._human_labels = human_labels
         self._execution_kind = execution_kind
         self._replay_input = replay_input
-        self._specs = {item.sample_id: item for item in config.sample_specs}
+        self._specs = {item.sample_id: item for item in self._config.sample_specs}
         self._human_label_set = (
             HumanConfirmedLabelSet(
-                benchmark_id=config.benchmark_id,
+                benchmark_id=self._config.benchmark_id,
                 labels=human_labels,
             )
             if human_labels
@@ -293,8 +294,7 @@ class BenchmarkRunner:
             complete
             and self._config.formal
             and formal_attempt_profile_valid
-            and tuple(label.sample_id for label in self._human_labels)
-            == self._config.ordered_sample_ids
+            and self._formal_human_labels_match(stable_observations)
         )
         if formal_candidate_complete:
             candidate = FormalIntegrationCandidate(
@@ -346,6 +346,29 @@ class BenchmarkRunner:
         )
         if actual != expected:
             raise ValueError("benchmark observation violates its frozen sample specification")
+        if self._config.formal and not self._formal_gold_semantics_valid(observation):
+            raise ValueError("formal observation gold semantics do not match its sample kind")
+
+    @staticmethod
+    def _formal_gold_semantics_valid(observation: MetricObservation) -> bool:
+        labels = (observation.gold_final_correct, observation.gold_process_valid)
+        expected_labels = {
+            SampleKind.GOLD: (True, True),
+            SampleKind.CONTROLLED_WRONG: (False, False),
+            SampleKind.PARADOX: (True, False),
+        }
+        if observation.sample_kind is SampleKind.NATURAL:
+            if None in labels:
+                return False
+        elif labels != expected_labels[observation.sample_kind]:
+            return False
+        has_error = (
+            observation.gold_first_error_step is not None and observation.gold_taxonomy is not None
+        )
+        has_no_error = (
+            observation.gold_first_error_step is None and observation.gold_taxonomy is None
+        )
+        return has_no_error if observation.gold_process_valid else has_error
 
     def _formal_attempt_profile_valid(self, observations: tuple[MetricObservation, ...]) -> bool:
         if (
@@ -362,6 +385,7 @@ class BenchmarkRunner:
             return False
         known = set(self._config.ordered_sample_ids)
         natural = set(self._config.generation_sample_ids)
+        arbitrated = {row.sample_id for row in observations if row.arbitration_used}
         allowed_operations = {
             self._config.generator_prompt_version,
             self._config.logic_review_prompt_version,
@@ -378,6 +402,10 @@ class BenchmarkRunner:
                     event.operation == self._config.generator_prompt_version
                     and event.sample_id not in natural
                 )
+                or (
+                    event.operation == self._config.arbiter_prompt_version
+                    and event.sample_id not in arbitrated
+                )
             ):
                 return False
         required = [
@@ -392,6 +420,9 @@ class BenchmarkRunner:
             (sample_id, self._config.generator_prompt_version)
             for sample_id in self._config.generation_sample_ids
         )
+        required.extend(
+            (sample_id, self._config.arbiter_prompt_version) for sample_id in arbitrated
+        )
         return all(
             sum(
                 event.sample_id == sample_id
@@ -403,6 +434,26 @@ class BenchmarkRunner:
             == 1
             for sample_id, operation in required
         )
+
+    def _formal_human_labels_match(self, observations: tuple[MetricObservation, ...]) -> bool:
+        if len(self._human_labels) != len(observations):
+            return False
+        for observation, label in zip(observations, self._human_labels, strict=True):
+            if (
+                label.sample_id,
+                label.final_correct,
+                label.process_valid,
+                label.first_error_step,
+                label.taxonomy,
+            ) != (
+                observation.sample_id,
+                observation.gold_final_correct,
+                observation.gold_process_valid,
+                observation.gold_first_error_step,
+                observation.gold_taxonomy,
+            ):
+                return False
+        return True
 
     @staticmethod
     def _entry(name: str, ref: ArtifactRef) -> ArtifactHashEntry:

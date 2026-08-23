@@ -114,9 +114,7 @@ def exception_graph_text(error: BaseException) -> str:
             pending.extend(current.args)
             pending.extend(vars(current).values())
             pending.extend(
-                linked
-                for linked in (current.__cause__, current.__context__)
-                if linked is not None
+                linked for linked in (current.__cause__, current.__context__) if linked is not None
             )
             traceback = current.__traceback__
             while traceback is not None:
@@ -148,11 +146,7 @@ def exception_graph_text(error: BaseException) -> str:
         slots = getattr(type(current), "__slots__", ())
         if isinstance(slots, str):
             slots = (slots,)
-        pending.extend(
-            getattr(current, slot)
-            for slot in slots
-            if hasattr(current, slot)
-        )
+        pending.extend(getattr(current, slot) for slot in slots if hasattr(current, slot))
     return "\n".join(serialized)
 
 
@@ -331,10 +325,7 @@ def test_generate_stops_after_one_failed_schema_repair(tmp_path: Path) -> None:
         client(tmp_path, handler).generate(problem())
 
     assert calls == 2
-    assert (
-        getattr(captured.value, "error_taxonomy", None)
-        is ErrorTaxonomy.FORMAT_SCHEMA
-    )
+    assert getattr(captured.value, "error_taxonomy", None) is ErrorTaxonomy.FORMAT_SCHEMA
 
 
 def test_transient_status_is_retried_before_success(tmp_path: Path) -> None:
@@ -387,9 +378,7 @@ def test_transport_errors_do_not_retain_secret_in_exception_chain(tmp_path: Path
             continue
         reachable.append(error)
         pending.extend(
-            linked
-            for linked in (error.__cause__, error.__context__)
-            if linked is not None
+            linked for linked in (error.__cause__, error.__context__) if linked is not None
         )
 
     serialized = "\n".join(
@@ -450,9 +439,7 @@ def test_failed_repair_traceback_locals_do_not_retain_api_key(tmp_path: Path) ->
         client(tmp_path, handler, api_key=secret).generate(problem())
 
     assert secret not in exception_graph_text(captured.value)
-    assert (
-        captured.value.error_taxonomy is ErrorTaxonomy.FORMAT_SCHEMA
-    )
+    assert captured.value.error_taxonomy is ErrorTaxonomy.FORMAT_SCHEMA
 
 
 def test_schema_repair_request_redacts_secret_from_response_and_validation_error(
