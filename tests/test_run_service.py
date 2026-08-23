@@ -37,7 +37,12 @@ from hy3_algotrace.contracts import (
     TestCase as ContractTestCase,
 )
 from hy3_algotrace.evaluator import EvidenceFusion, ReviewOutcome
-from hy3_algotrace.executor import InProcessBackgroundExecutor, SynchronousExecutor
+from hy3_algotrace.executor import (
+    ExecutorTaskFailure,
+    ExecutorTaskHealth,
+    InProcessBackgroundExecutor,
+    SynchronousExecutor,
+)
 from hy3_algotrace.rules import RuleEngine
 from hy3_algotrace.run_service import (
     InvalidRunHistoryError,
@@ -183,7 +188,8 @@ class HoldingExecutor:
     def __init__(self) -> None:
         self.tasks: list[Callable[[], None]] = []
 
-    def submit(self, task: Callable[[], None]) -> None:
+    def submit(self, task: Callable[[], None], *, task_id: str | None = None) -> None:
+        del task_id
         self.tasks.append(task)
 
 
@@ -505,10 +511,22 @@ def test_background_executor_runs_in_process_and_can_shutdown() -> None:
     calls: list[str] = []
     executor = InProcessBackgroundExecutor(max_workers=1)
 
-    executor.submit(lambda: calls.append("ran"))
+    executor.submit(lambda: calls.append("ran"), task_id="direct-success")
     executor.shutdown()
 
     assert calls == ["ran"]
+    assert executor.active_task_ids() == ()
+    assert executor.failure_for("direct-success") is None
+    assert executor.task_health("direct-success") is ExecutorTaskHealth.UNKNOWN
+
+
+def test_background_executor_rejects_an_unmonitorable_task() -> None:
+    executor = InProcessBackgroundExecutor(max_workers=1)
+    try:
+        with pytest.raises(ValueError, match="task ID"):
+            executor.submit(lambda: None)
+    finally:
+        executor.shutdown()
 
 
 def test_nonformal_catalog_object_is_rejected_before_any_run_artifact(tmp_path: Path) -> None:
@@ -789,3 +807,40 @@ def test_failure_transition_persistence_error_is_exposed_without_false_terminal_
     history = run_service.get_transition_history("run-failure-write")
     assert history[-1].transition.event is RunTransitionEvent.RUNNING
     assert all(item.transition.event is not RunTransitionEvent.FAILED for item in history)
+
+
+def test_background_terminal_persistence_failure_is_observable_and_safely_degraded(
+    tmp_path: Path,
+) -> None:
+    raw_secret = "background-secret-HY3_API_KEY"
+    bundle = formal_bundle()
+    store = FailOnceAtPathStore(tmp_path / "artifacts", "000003.json")
+    executor = InProcessBackgroundExecutor(max_workers=1)
+    run_service, _, _ = service(
+        tmp_path,
+        store=store,
+        generator=FakeGenerator(bundle.gold_trace, RuntimeError(raw_secret)),
+        executor=executor,
+        id_factory=lambda: "run-background-failure",
+    )
+
+    accepted = run_service.submit(
+        RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a")
+    )
+    executor.shutdown()
+
+    worker_failure = executor.failure_for(accepted.run_id)
+    assert worker_failure == ExecutorTaskFailure(task_id=accepted.run_id)
+    assert executor.task_health(accepted.run_id) is ExecutorTaskHealth.FAILED
+    assert executor.active_task_ids() == ()
+    result = run_service.get_run(accepted.run_id)
+    history = run_service.get_transition_history(accepted.run_id)
+    serialized = result.model_dump_json()
+    assert result.status is RunStatus.RUNNING
+    assert result.failure is None
+    assert result.degraded_failure is not None
+    assert result.degraded_failure.code is RunFailureCode.INTERNAL_FAILURE
+    assert history[-1].transition.event is RunTransitionEvent.RUNNING
+    assert raw_secret not in serialized
+    assert "RuntimeError" not in serialized
+    assert "publication failure" not in serialized
