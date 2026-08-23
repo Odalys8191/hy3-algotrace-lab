@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier, Event, Thread
 from typing import Any
 
 import pytest
@@ -37,7 +39,12 @@ from hy3_algotrace.contracts import (
 from hy3_algotrace.evaluator import EvidenceFusion, ReviewOutcome
 from hy3_algotrace.executor import InProcessBackgroundExecutor, SynchronousExecutor
 from hy3_algotrace.rules import RuleEngine
-from hy3_algotrace.run_service import ProblemNotFoundError, RunService
+from hy3_algotrace.run_service import (
+    InvalidRunHistoryError,
+    ProblemNotFoundError,
+    RunFailurePersistenceError,
+    RunService,
+)
 
 
 def formal_bundle(*, problem_id: str = "cf-123-a") -> ProblemBundle:
@@ -148,8 +155,10 @@ class FakeGenerator:
 class FakeJudge:
     def __init__(self, verdict: JudgeStatus = JudgeStatus.AC) -> None:
         self.verdict = verdict
+        self.calls = 0
 
     def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+        self.calls += 1
         compile_status = (
             JudgeStatus.INFRASTRUCTURE_ERROR
             if self.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
@@ -188,6 +197,55 @@ class FailInternalReportStore(ArtifactStore):
     ):  # type: ignore[no-untyped-def]
         if "internal-report" in str(relative_path):
             raise ArtifactStoreError("/private/tmp/secret should not escape")
+        return super().write_json(relative_path, payload, expected_hash=expected_hash)
+
+
+class FailOnceAtPathStore(ArtifactStore):
+    def __init__(self, root: Path, failing_suffix: str) -> None:
+        super().__init__(root)
+        self._failing_suffix = failing_suffix
+        self._failed = False
+
+    def write_json(
+        self,
+        relative_path: Path | str,
+        payload: Any,
+        *,
+        expected_hash: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        if not self._failed and str(relative_path).endswith(self._failing_suffix):
+            self._failed = True
+            raise ArtifactStoreError("injected publication failure")
+        return super().write_json(relative_path, payload, expected_hash=expected_hash)
+
+
+class BlockingGenerator(FakeGenerator):
+    def __init__(self, trace: SolutionTrace) -> None:
+        super().__init__(trace)
+        self.started = Event()
+        self.release = Event()
+
+    def generate(self, problem: ProblemRecord) -> SolutionTrace:
+        self.calls += 1
+        self.started.set()
+        assert self.release.wait(timeout=5)
+        return self.trace
+
+
+class BarrierTransitionStore(ArtifactStore):
+    def __init__(self, root: Path, barrier: Barrier) -> None:
+        super().__init__(root)
+        self._barrier = barrier
+
+    def write_json(
+        self,
+        relative_path: Path | str,
+        payload: Any,
+        *,
+        expected_hash: str | None = None,
+    ):  # type: ignore[no-untyped-def]
+        if str(relative_path).endswith("000002.json"):
+            self._barrier.wait(timeout=5)
         return super().write_json(relative_path, payload, expected_hash=expected_hash)
 
 
@@ -316,7 +374,7 @@ def test_wa_is_a_completed_audit_not_an_infrastructure_failure(tmp_path: Path) -
     assert result.status is RunStatus.COMPLETED
     assert result.failure is None
     assert result.report is not None
-    assert result.report.audit["final_correct"] is False
+    assert result.report.audit.final_correct is False
 
 
 def test_artifact_failure_after_queue_is_recorded_as_failed(tmp_path: Path) -> None:
@@ -438,9 +496,9 @@ def test_ac_with_material_reasoning_error_completes_as_paradox(tmp_path: Path) -
 
     assert result.status is RunStatus.COMPLETED
     assert result.report is not None
-    assert result.report.audit["final_correct"] is True
-    assert result.report.audit["process_valid"] is False
-    assert result.report.audit["final_error_taxonomy"] == "algorithm_logic"
+    assert result.report.audit.final_correct is True
+    assert result.report.audit.process_valid is False
+    assert result.report.audit.final_error_taxonomy is ErrorTaxonomy.ALGORITHM_LOGIC
 
 
 def test_background_executor_runs_in_process_and_can_shutdown() -> None:
@@ -505,3 +563,229 @@ def test_review_failure_is_failed_without_persisting_exception_text(tmp_path: Pa
     assert result.failure.code is RunFailureCode.REVIEW_FAILED
     assert "private/tmp/secret" not in persisted
     assert "key-value" not in persisted
+
+
+@pytest.mark.parametrize(
+    "failing_suffix",
+    (
+        "000000.json",
+        "000001.json",
+        "run-index/run-partial.json",
+    ),
+)
+def test_restart_discovers_partial_run_without_index_and_marks_it_abandoned(
+    tmp_path: Path,
+    failing_suffix: str,
+) -> None:
+    failing_store = FailOnceAtPathStore(tmp_path / "artifacts", failing_suffix)
+    first, _, _ = service(
+        tmp_path,
+        store=failing_store,
+        executor=HoldingExecutor(),
+        id_factory=lambda: "run-partial",
+    )
+    with pytest.raises(ArtifactStoreError, match="publication"):
+        first.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    recovered_store = ArtifactStore(tmp_path / "artifacts")
+    second, _, _ = service(tmp_path, store=recovered_store)
+
+    reconciled = second.reconcile_abandoned_runs()
+    result = second.get_run("run-partial")
+
+    assert reconciled == ("run-partial",)
+    assert result.status is RunStatus.FAILED
+    assert result.failure is not None
+    assert result.failure.code is RunFailureCode.ABANDONED_ON_RESTART
+
+
+def test_restart_fails_fast_on_a_disconnected_transition_chain(tmp_path: Path) -> None:
+    holding = HoldingExecutor()
+    run_service, _, artifacts = service(
+        tmp_path,
+        executor=holding,
+        id_factory=lambda: "run-corrupt",
+    )
+    run_service.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    queued_path = artifacts.root / "runs/run-corrupt/transitions/000001.json"
+    payload = json.loads(queued_path.read_text(encoding="utf-8"))
+    payload["previous_transition_hash"] = "0" * 64
+    queued_path.write_text(json.dumps(payload), encoding="utf-8")
+    restarted, _, _ = service(tmp_path, store=artifacts)
+
+    with pytest.raises(InvalidRunHistoryError, match="disconnected"):
+        restarted.reconcile_abandoned_runs()
+
+
+def test_reconciled_queued_run_rejects_stale_worker_delivery(tmp_path: Path) -> None:
+    holding = HoldingExecutor()
+    run_service, generator, _ = service(
+        tmp_path,
+        executor=holding,
+        id_factory=lambda: "run-stale-queued",
+    )
+    run_service.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    run_service.reconcile_abandoned_runs()
+    before = run_service.get_transition_history("run-stale-queued")
+
+    holding.tasks[0]()
+
+    after = run_service.get_transition_history("run-stale-queued")
+    assert after == before
+    assert generator.calls == 0
+
+
+def test_reconciled_running_run_stops_stale_worker_before_judge_or_reports(
+    tmp_path: Path,
+) -> None:
+    bundle = formal_bundle()
+    generator = BlockingGenerator(bundle.gold_trace)
+    judge = FakeJudge()
+    holding = HoldingExecutor()
+    first, _, artifacts = service(
+        tmp_path,
+        generator=generator,
+        judge=judge,
+        executor=holding,
+        id_factory=lambda: "run-stale-running",
+    )
+    first.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    worker = Thread(target=holding.tasks[0])
+    worker.start()
+    assert generator.started.wait(timeout=5)
+    restarted, _, _ = service(
+        tmp_path,
+        store=ArtifactStore(artifacts.root),
+    )
+
+    assert restarted.reconcile_abandoned_runs() == ("run-stale-running",)
+    generator.release.set()
+    worker.join(timeout=5)
+
+    history = restarted.get_transition_history("run-stale-running")
+    assert [item.transition.event for item in history] == [
+        RunTransitionEvent.REQUEST,
+        RunTransitionEvent.QUEUED,
+        RunTransitionEvent.RUNNING,
+        RunTransitionEvent.FAILED,
+    ]
+    assert judge.calls == 0
+    assert not (artifacts.root / "runs/run-stale-running/internal-report.json").exists()
+    assert not (artifacts.root / "runs/run-stale-running/public-report.json").exists()
+
+
+def test_duplicate_worker_delivery_is_a_terminal_noop(tmp_path: Path) -> None:
+    holding = HoldingExecutor()
+    run_service, generator, _ = service(
+        tmp_path,
+        executor=holding,
+        id_factory=lambda: "run-duplicate",
+    )
+    run_service.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+
+    holding.tasks[0]()
+    terminal = run_service.get_transition_history("run-duplicate")
+    holding.tasks[0]()
+
+    assert run_service.get_transition_history("run-duplicate") == terminal
+    assert generator.calls == 1
+
+
+def test_two_services_compete_for_one_storage_backed_running_claim(tmp_path: Path) -> None:
+    barrier = Barrier(2)
+    root = tmp_path / "artifacts"
+    holding = HoldingExecutor()
+    first, first_generator, _ = service(
+        tmp_path,
+        store=BarrierTransitionStore(root, barrier),
+        executor=holding,
+        id_factory=lambda: "run-race",
+    )
+    first.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    second, second_generator, _ = service(
+        tmp_path,
+        store=BarrierTransitionStore(root, barrier),
+    )
+    request = RunCreateRequest(
+        mode=RunMode.SOLVE_AND_AUDIT,
+        problem_id="cf-123-a",
+    )
+    bundle = formal_bundle()
+    competing = Thread(target=second._execute, args=("run-race", request, bundle))
+    original = Thread(target=holding.tasks[0])
+
+    competing.start()
+    original.start()
+    competing.join(timeout=5)
+    original.join(timeout=5)
+
+    assert not competing.is_alive()
+    assert not original.is_alive()
+    history = first.get_transition_history("run-race")
+    assert [item.transition.event for item in history] == [
+        RunTransitionEvent.REQUEST,
+        RunTransitionEvent.QUEUED,
+        RunTransitionEvent.RUNNING,
+        RunTransitionEvent.COMPLETED,
+    ]
+    assert first_generator.calls + second_generator.calls == 1
+
+
+def test_two_services_compete_for_one_storage_backed_restart_claim(tmp_path: Path) -> None:
+    root = tmp_path / "artifacts"
+    holding = HoldingExecutor()
+    creator, _, _ = service(
+        tmp_path,
+        store=ArtifactStore(root),
+        executor=holding,
+        id_factory=lambda: "run-reconcile-race",
+    )
+    creator.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+    barrier = Barrier(2)
+    first, _, _ = service(tmp_path, store=BarrierTransitionStore(root, barrier))
+    second, _, _ = service(tmp_path, store=BarrierTransitionStore(root, barrier))
+    outcomes: list[tuple[str, ...]] = []
+    failures: list[BaseException] = []
+
+    def reconcile(run_service: RunService) -> None:
+        try:
+            outcomes.append(run_service.reconcile_abandoned_runs())
+        except BaseException as error:
+            failures.append(error)
+
+    first_thread = Thread(target=reconcile, args=(first,))
+    second_thread = Thread(target=reconcile, args=(second,))
+    first_thread.start()
+    second_thread.start()
+    first_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert failures == []
+    assert sorted(outcomes) == [(), ("run-reconcile-race",)]
+    history = creator.get_transition_history("run-reconcile-race")
+    assert [item.transition.event for item in history] == [
+        RunTransitionEvent.REQUEST,
+        RunTransitionEvent.QUEUED,
+        RunTransitionEvent.FAILED,
+    ]
+
+
+def test_failure_transition_persistence_error_is_exposed_without_false_terminal_state(
+    tmp_path: Path,
+) -> None:
+    bundle = formal_bundle()
+    store = FailOnceAtPathStore(tmp_path / "artifacts", "000003.json")
+    run_service, _, _ = service(
+        tmp_path,
+        store=store,
+        generator=FakeGenerator(bundle.gold_trace, RuntimeError("generation down")),
+        id_factory=lambda: "run-failure-write",
+    )
+
+    with pytest.raises(RunFailurePersistenceError, match="persist"):
+        run_service.submit(RunCreateRequest(mode=RunMode.SOLVE_AND_AUDIT, problem_id="cf-123-a"))
+
+    history = run_service.get_transition_history("run-failure-write")
+    assert history[-1].transition.event is RunTransitionEvent.RUNNING
+    assert all(item.transition.event is not RunTransitionEvent.FAILED for item in history)

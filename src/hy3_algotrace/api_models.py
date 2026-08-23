@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from datetime import datetime
 from enum import StrEnum
-from types import MappingProxyType
 from typing import Literal, Self
 
-from pydantic import (
-    BaseModel,
-    ConfigDict,
-    Field,
-    JsonValue,
-    field_serializer,
-    field_validator,
-    model_validator,
-)
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .contracts import AuditReport, RunManifest, RunStatus, SolutionTrace
+from .contracts import (
+    AuditReport,
+    ErrorTaxonomy,
+    JudgeStatus,
+    ReasoningStage,
+    RunManifest,
+    RunStatus,
+    SolutionTrace,
+    StepStatus,
+)
 
 type ApiSchemaVersion = Literal["1.2"]
 API_SCHEMA_VERSION: ApiSchemaVersion = "1.2"
@@ -82,24 +81,72 @@ class RunFailure(ApiModel):
     message: str = Field(min_length=1, strict=True)
 
 
+class PublicReasoningStep(ApiModel):
+    schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
+    step_id: str = Field(min_length=1, strict=True)
+    step_number: int = Field(gt=0, strict=True)
+    stage: ReasoningStage
+    claim: str = Field(strict=True)
+    rationale: str = Field(strict=True)
+    depends_on: tuple[str, ...]
+    status: StepStatus
+
+
+class PublicSolutionTrace(ApiModel):
+    schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
+    trace_id: str = Field(min_length=1, strict=True)
+    problem_id: str = Field(min_length=1, strict=True)
+    language: Literal["cpp17"]
+    steps: tuple[PublicReasoningStep, ...]
+    problem_understanding: str = Field(strict=True)
+    algorithm: str = Field(strict=True)
+    correctness_argument: str = Field(strict=True)
+    time_complexity: str = Field(strict=True)
+    space_complexity: str = Field(strict=True)
+    edge_cases: tuple[str, ...]
+    code: str = Field(strict=True)
+
+
+class PublicJudgeTestResult(ApiModel):
+    schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
+    test_number: int = Field(gt=0, strict=True)
+    status: JudgeStatus
+    time_ms: int | None = Field(default=None, ge=0, strict=True)
+    memory_kb: int | None = Field(default=None, ge=0, strict=True)
+
+
+class PublicJudgeReport(ApiModel):
+    schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
+    compile_status: JudgeStatus
+    verdict: JudgeStatus
+    tests: tuple[PublicJudgeTestResult, ...]
+
+
+class PublicAuditReport(ApiModel):
+    """Explicit allowlist of structured audit facts safe for the local UI."""
+
+    schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
+    run_id: str = Field(min_length=1, strict=True)
+    problem_id: str = Field(min_length=1, strict=True)
+    trace_id: str = Field(min_length=1, strict=True)
+    judge: PublicJudgeReport
+    final_correct: bool = Field(strict=True)
+    process_score: float = Field(ge=0.0, le=100.0, strict=True)
+    process_valid: bool = Field(strict=True)
+    final_error_taxonomy: ErrorTaxonomy | None = None
+    first_material_error_step_id: str | None = Field(default=None, min_length=1)
+    needs_human_review: bool = Field(strict=True)
+
+
 class PublicRunReport(ApiModel):
-    """A separately persisted, recursively sanitized report for API consumers."""
+    """A separately persisted, allowlisted report for API consumers."""
 
     schema_version: ApiSchemaVersion = API_SCHEMA_VERSION
     run_id: str = Field(min_length=1, strict=True)
     problem_id: str = Field(min_length=1, strict=True)
     mode: RunMode
-    trace: Mapping[str, JsonValue]
-    audit: Mapping[str, JsonValue]
-
-    @field_validator("trace", "audit")
-    @classmethod
-    def freeze_json_mapping(cls, value: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
-
-    @field_serializer("trace", "audit")
-    def serialize_json_mapping(self, value: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
-        return {key: _thaw_json(item) for key, item in value.items()}
+    trace: PublicSolutionTrace
+    audit: PublicAuditReport
 
 
 class RunReadResponse(ApiModel):
@@ -211,19 +258,3 @@ class ProblemDetailResponse(ApiModel):
     memory_limit_mb: int = Field(gt=0, strict=True)
     public_tests: tuple[PublicTestInput, ...]
     content_hash: str = Field(min_length=64, max_length=64, strict=True)
-
-
-def _freeze_json(value: JsonValue) -> JsonValue:
-    if isinstance(value, dict):
-        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})  # type: ignore[return-value]
-    if isinstance(value, list):
-        return tuple(_freeze_json(item) for item in value)  # type: ignore[return-value]
-    return value
-
-
-def _thaw_json(value: JsonValue) -> JsonValue:
-    if isinstance(value, Mapping):
-        return {str(key): _thaw_json(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_thaw_json(item) for item in value]
-    return value
