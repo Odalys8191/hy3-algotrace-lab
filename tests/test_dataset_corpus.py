@@ -33,6 +33,7 @@ from hy3_algotrace.corpus import (
     AuthoredBundleEntry,
     AuthoringAttestation,
     CorpusDataError,
+    CorpusManifest,
     CorpusSample,
     CorpusSampleKind,
     CorpusStatus,
@@ -45,7 +46,22 @@ from hy3_algotrace.corpus import (
     lint_corpus_manifest,
     lint_project_bundles,
 )
-from hy3_algotrace.dataset_models import FrozenSelectionEntry, FrozenSelectionManifest
+from hy3_algotrace.dataset_models import (
+    AcquisitionAsset,
+    AcquisitionManifest,
+    CandidateReview,
+    CheckerKind,
+    ConversionTool,
+    DatasetFormat,
+    FrozenSelectionEntry,
+    FrozenSelectionManifest,
+    VerifiedSelectionChain,
+    build_quota_report,
+    convert_codecontests_file,
+    freeze_selection,
+    validate_acquired_assets,
+    verify_frozen_selection_chain,
+)
 from hy3_algotrace.differential import (
     DifferentialDataError,
     FormalCorpusJudgeValidationReport,
@@ -77,7 +93,10 @@ def _problem_record(
         title=f"Problem {contest_id}",
         statement_en="Print the input integer.",
         source_url=f"https://codeforces.com/problemset/problem/{contest_id}/A",
-        attribution=f"Codeforces; CodeContests {source_split} split.",
+        attribution=(
+            f"Codeforces problem {contest_id}A; metadata imported from "
+            f"CodeContests {source_split} split."
+        ),
         cf_contest_id=contest_id,
         cf_index="A",
         cf_tags=(topic_tag,),
@@ -146,6 +165,116 @@ def _selection() -> FrozenSelectionManifest:
         entries=tuple(entries),
         content_hash=sha256_json(payload),
     )
+
+
+def _verified_selection_chain(
+    root: Path,
+) -> tuple[VerifiedSelectionChain, dict[str, ProblemRecord]]:
+    template = _selection()
+    rows: dict[str, list[dict[str, object]]] = {"validation": [], "test": []}
+    reviews: dict[str, list[CandidateReview]] = {"validation": [], "test": []}
+    records: dict[str, ProblemRecord] = {}
+    topic_tags = {
+        Topic.CONSTRUCTION_SIMULATION: "implementation",
+        Topic.GREEDY: "greedy",
+        Topic.BINARY_SEARCH: "binary search",
+        Topic.DYNAMIC_PROGRAMMING: "dp",
+        Topic.GRAPH: "graphs",
+    }
+    for entry in template.entries:
+        contest_id = int(entry.problem_id.split("-")[1])
+        records[entry.problem_id] = _problem_record(
+            problem_id=entry.problem_id,
+            source_split=entry.source_split,
+            topic=entry.topic,
+            rating=entry.rating,
+        )
+        rows[entry.source_split].append(
+            {
+                "name": f"Problem {contest_id}",
+                "description": "Print the input integer.",
+                "source": 2,
+                "cf_contest_id": contest_id,
+                "cf_index": "A",
+                "cf_rating": entry.rating,
+                "cf_tags": [topic_tags[entry.topic]],
+                "is_description_translated": False,
+                "untranslated_description": "",
+                "time_limit": {"seconds": "1", "nanos": 0},
+                "memory_limit_bytes": 268435456,
+                "input_file": "",
+                "output_file": "",
+                "public_tests": [{"input": "1\n", "output": "1\n"}],
+                "private_tests": [{"input": "2\n", "output": "2\n"}],
+                "generated_tests": [{"input": "3\n", "output": "3\n"}],
+            }
+        )
+        reviews[entry.source_split].append(
+            CandidateReview(
+                problem_id=entry.problem_id,
+                checker_reviewed=True,
+                checker_kind=CheckerKind.STANDARD,
+                reviewer="formal-chain-curator",
+                reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
+                evidence_url=f"https://codeforces.com/problemset/problem/{contest_id}/A",
+            )
+        )
+    paths = {split: root / f"formal-chain-{split}.json" for split in ("validation", "test")}
+    for split in ("validation", "test"):
+        paths[split].write_text(json.dumps(rows[split]), encoding="utf-8")
+    converter = ConversionTool(name="formal-chain-json", version="1")
+    assets = tuple(
+        AcquisitionAsset(
+            split=split,
+            url=f"https://example.invalid/codecontests-{split}.json",
+            byte_length=len(paths[split].read_bytes()),
+            sha256=hashlib.sha256(paths[split].read_bytes()).hexdigest(),
+            license="CC-BY-4.0 plus third-party terms",
+            attribution="Google DeepMind CodeContests and Codeforces",
+        )
+        for split in ("validation", "test")
+    )
+    acquisition = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=assets,
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    acquisition_validation = validate_acquired_assets(
+        acquisition,
+        paths,
+        logical_ids={
+            "validation": "formal-chain-validation",
+            "test": "formal-chain-test",
+        },
+    )
+    conversions = tuple(
+        convert_codecontests_file(
+            paths[split],
+            split=split,
+            data_format=DatasetFormat.JSON,
+            reviews=reviews[split],
+            converter=converter,
+            acquisition_validation=acquisition_validation,
+        )
+        for split in ("validation", "test")
+    )
+    quota = build_quota_report(conversions)
+    selection = freeze_selection(
+        tuple(records),
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=acquisition_validation,
+    )
+    chain = verify_frozen_selection_chain(
+        selection.model_dump(mode="json"),
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=acquisition_validation,
+    )
+    return chain, records
 
 
 def _write_ref(
@@ -639,10 +768,8 @@ def test_pending_corpus_proves_30_60_15_and_reports_natural_60_pending(tmp_path:
         )
 
 
-def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
-    tmp_path: Path,
-) -> None:
-    """Formal eligibility is emitted only for the exact hash-linked 105-case set."""
+def test_corpus_model_rejects_self_rehashed_natural_selection_link(tmp_path: Path) -> None:
+    """A persisted corpus cannot point its natural run at a different selection."""
 
     selection = _selection()
     bundle_manifest = build_project_bundle_manifest(selection, _bundle_entries(tmp_path, selection))
@@ -653,15 +780,35 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
         natural_run_config=_natural_config(selection),
         status=CorpusStatus.PENDING_CREDENTIALS,
     )
-    records = {
-        entry.problem_id: _problem_record(
-            problem_id=entry.problem_id,
-            source_split=entry.source_split,
-            topic=entry.topic,
-            rating=entry.rating,
-        )
-        for entry in selection.entries
-    }
+    payload = manifest.model_dump(mode="json")
+    natural_payload = payload["natural_run_config"]
+    natural_payload["selection_manifest_hash"] = "f" * 64
+    natural_payload["content_hash"] = sha256_json(
+        {key: value for key, value in natural_payload.items() if key != "content_hash"}
+    )
+    payload["content_hash"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "content_hash"}
+    )
+
+    with pytest.raises(ValidationError, match="natural.*selection"):
+        CorpusManifest.model_validate_json(json.dumps(payload))
+
+
+def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
+    tmp_path: Path,
+) -> None:
+    """Formal eligibility is emitted only for the exact hash-linked 105-case set."""
+
+    selection_chain, records = _verified_selection_chain(tmp_path)
+    selection = selection_chain.selection
+    bundle_manifest = build_project_bundle_manifest(selection, _bundle_entries(tmp_path, selection))
+    manifest = build_corpus_manifest(
+        selection=selection,
+        bundle_manifest=bundle_manifest,
+        samples=_controlled_samples(tmp_path, selection, bundle_manifest),
+        natural_run_config=_natural_config(selection),
+        status=CorpusStatus.PENDING_CREDENTIALS,
+    )
     controlled_kinds = {
         CorpusSampleKind.GOLD: JudgeCaseKind.GOLD,
         CorpusSampleKind.CONTROLLED_WRONG: JudgeCaseKind.MUTANT,
@@ -684,7 +831,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
 
     result = validate_formal_corpus_judge_cases(
         corpus=manifest,
-        selection=selection,
+        selection_chain=selection_chain,
         bundle_manifest=bundle_manifest,
         cases=cases,
         judge=SemanticJudge(),
@@ -707,7 +854,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     replayed = validate_persisted_formal_judge_evidence(
         report.model_dump(mode="json"),
         corpus=manifest,
-        selection=selection,
+        selection_chain=selection_chain,
         bundle_manifest=bundle_manifest,
         cases=cases,
         raw_evidence=raw_evidence,
@@ -732,7 +879,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
         validate_persisted_formal_judge_evidence(
             replaced_evidence,
             corpus=manifest,
-            selection=selection,
+            selection_chain=selection_chain,
             bundle_manifest=bundle_manifest,
             cases=cases,
             raw_evidence=raw_evidence,
@@ -747,7 +894,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
         validate_persisted_formal_judge_evidence(
             replaced_chain,
             corpus=manifest,
-            selection=selection,
+            selection_chain=selection_chain,
             bundle_manifest=bundle_manifest,
             cases=cases,
             raw_evidence=raw_evidence,
@@ -755,9 +902,30 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     with pytest.raises(DifferentialDataError, match="exactly match"):
         validate_formal_corpus_judge_cases(
             corpus=manifest,
-            selection=selection,
+            selection_chain=selection_chain,
             bundle_manifest=bundle_manifest,
             cases=cases[:-1],
+            judge=SemanticJudge(),
+        )
+
+    forged_bundle_payload = bundle_manifest.model_dump(mode="json")
+    forged_bundle_payload["selection_manifest_hash"] = "f" * 64
+    forged_bundle_payload["content_hash"] = sha256_json(
+        {key: value for key, value in forged_bundle_payload.items() if key != "content_hash"}
+    )
+    forged_bundle = ProjectBundleManifest.model_validate_json(json.dumps(forged_bundle_payload))
+    forged_corpus_payload = manifest.model_dump(mode="json")
+    forged_corpus_payload["bundle_manifest_hash"] = forged_bundle.content_hash
+    forged_corpus_payload["content_hash"] = sha256_json(
+        {key: value for key, value in forged_corpus_payload.items() if key != "content_hash"}
+    )
+    forged_corpus = CorpusManifest.model_validate_json(json.dumps(forged_corpus_payload))
+    with pytest.raises(DifferentialDataError, match="bundle.*selection"):
+        validate_formal_corpus_judge_cases(
+            corpus=forged_corpus,
+            selection_chain=selection_chain,
+            bundle_manifest=forged_bundle,
+            cases=cases,
             judge=SemanticJudge(),
         )
 

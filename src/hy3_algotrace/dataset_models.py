@@ -16,6 +16,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import weakref
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -249,6 +250,13 @@ class CandidateAssessment(DatasetModel):
     reasons: tuple[str, ...] = ()
     reason_detail: str = Field(default="", max_length=2_000)
 
+    @field_validator("raw_row_hash")
+    @classmethod
+    def reject_zero_raw_row_hash(cls, value: str) -> str:
+        if value == "0" * 64:
+            raise ValueError("raw row hash cannot be all-zero")
+        return value
+
     @model_validator(mode="after")
     def validate_outcome(self) -> Self:
         if self.eligible:
@@ -348,6 +356,13 @@ class FrozenSelectionEntry(DatasetModel):
     record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     review_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @field_validator("raw_row_hash", "review_hash")
+    @classmethod
+    def reject_zero_evidence_hash(cls, value: str) -> str:
+        if value == "0" * 64:
+            raise ValueError("selection evidence hashes cannot be all-zero")
+        return value
+
     @model_validator(mode="after")
     def validate_rating_band(self) -> Self:
         expected = (
@@ -404,6 +419,34 @@ class FrozenSelectionManifest(DatasetModel):
         payload = self.model_dump(mode="json")
         del payload["content_hash"]
         return sha256_json(payload)
+
+
+_VERIFIED_SELECTION_TOKEN = object()
+_VERIFIED_SELECTION_CAPABILITIES: weakref.WeakSet[Any] = weakref.WeakSet()
+
+
+class VerifiedSelectionChain:
+    """Ephemeral capability issued only after replaying the complete source chain."""
+
+    __slots__ = ("selection", "__weakref__")
+    selection: FrozenSelectionManifest
+
+    def __init__(
+        self,
+        *,
+        selection: FrozenSelectionManifest,
+        _verification_token: object,
+    ) -> None:
+        if _verification_token is not _VERIFIED_SELECTION_TOKEN:
+            raise ValueError("verified selection requires complete chain replay")
+        object.__setattr__(self, "selection", selection)
+        _VERIFIED_SELECTION_CAPABILITIES.add(self)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("verified selection capabilities are immutable")
+
+    def _is_verified(self) -> bool:
+        return self in _VERIFIED_SELECTION_CAPABILITIES
 
 
 def validate_acquired_assets(
@@ -677,6 +720,29 @@ def validate_frozen_selection(
     if manifest.content_hash != expected.content_hash:
         raise DatasetDataError("selection content hash does not match current inputs")
     return manifest
+
+
+def verify_frozen_selection_chain(
+    payload: Mapping[str, Any],
+    *,
+    conversions: Iterable[CandidateConversionReport],
+    quota: EligibilityQuotaReport,
+    acquisition: AcquisitionManifest,
+    acquisition_validation: AcquisitionValidationReport,
+) -> VerifiedSelectionChain:
+    """Replay acquisition through selection and issue an in-memory capability."""
+
+    manifest = validate_frozen_selection(
+        payload,
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=acquisition_validation,
+    )
+    return VerifiedSelectionChain(
+        selection=manifest,
+        _verification_token=_VERIFIED_SELECTION_TOKEN,
+    )
 
 
 def _assess_row(
@@ -1017,35 +1083,59 @@ def _convert_riegeli_rows(contents: bytes, converter_argv: Sequence[str] | None)
     if resolved_executable is None or not os.access(resolved_executable, os.X_OK):
         raise DatasetDataError(f"external converter executable is unavailable: {executable}")
     with tempfile.TemporaryDirectory(prefix="hy3-codecontests-") as directory:
-        source = Path(directory) / "source.riegeli"
-        source.write_bytes(contents)
-        output = Path(directory) / "converted.jsonl"
-        argv = [
-            str(source) if part == "{input}" else str(output) if part == "{output}" else part
-            for part in converter_argv
-        ]
         try:
-            completed = subprocess.run(
-                argv,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=300,
-                shell=False,
+            directory_fd = os.open(directory, _DIRECTORY_OPEN_FLAGS)
+        except OSError as error:
+            raise DatasetDataError("cannot open converter temporary directory") from error
+        try:
+            source_name = "source.riegeli"
+            output_name = "converted.jsonl"
+            try:
+                source_fd = os.open(
+                    source_name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise DatasetDataError("cannot create converter source file") from error
+            try:
+                remaining = memoryview(contents)
+                while remaining:
+                    written = os.write(source_fd, remaining)
+                    if written <= 0:
+                        raise DatasetDataError("cannot write converter source file")
+                    remaining = remaining[written:]
+            finally:
+                os.close(source_fd)
+            source = Path(directory) / source_name
+            output = Path(directory) / output_name
+            argv = [
+                str(source) if part == "{input}" else str(output) if part == "{output}" else part
+                for part in converter_argv
+            ]
+            try:
+                completed = subprocess.run(
+                    argv,
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=300,
+                    shell=False,
+                )
+            except (OSError, subprocess.TimeoutExpired) as error:
+                raise DatasetDataError("external Riegeli converter could not complete") from error
+            if completed.returncode != 0:
+                raise DatasetDataError("external Riegeli converter failed")
+            converted = read_trusted_relative(
+                directory_fd,
+                output_name,
+                logical_id="converted-riegeli-jsonl",
+                max_bytes=256 * 1024 * 1024,
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise DatasetDataError("external Riegeli converter could not complete") from error
-        if completed.returncode != 0:
-            diagnostics = _bounded_text(completed.stderr)
-            raise DatasetDataError(
-                f"external Riegeli converter failed with exit {completed.returncode}: {diagnostics}"
-            )
-        converted = read_trusted_file(
-            output,
-            logical_id="converted-riegeli-jsonl",
-            max_bytes=256 * 1024 * 1024,
-        )
-        return _load_jsonl_rows(converted.contents, converted.logical_id)
+            return _load_jsonl_rows(converted.contents, converted.logical_id)
+        finally:
+            os.close(directory_fd)
 
 
 def read_trusted_file(

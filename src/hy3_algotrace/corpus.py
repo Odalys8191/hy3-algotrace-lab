@@ -490,6 +490,8 @@ class CorpusManifest(DatasetModel):
         )
         if self.natural_run_config.status is not expected_run_status:
             raise ValueError("corpus and natural run statuses must agree")
+        if self.natural_run_config.selection_manifest_hash != self.selection_manifest_hash:
+            raise ValueError("corpus natural run does not match selection")
         if self.content_hash != self.expected_content_hash():
             raise ValueError("corpus manifest content_hash does not match")
         return self
@@ -666,6 +668,10 @@ def validate_corpus_bundle_links(
 
     if corpus.bundle_manifest_hash != bundle_manifest.content_hash:
         raise CorpusDataError("corpus does not match project bundle manifest")
+    if bundle_manifest.selection_manifest_hash != corpus.selection_manifest_hash:
+        raise CorpusDataError("bundle manifest does not match corpus selection")
+    if corpus.natural_run_config.selection_manifest_hash != corpus.selection_manifest_hash:
+        raise CorpusDataError("natural run config does not match corpus selection")
     samples_by_problem: dict[str, list[CorpusSample]] = {}
     for sample in corpus.samples:
         samples_by_problem.setdefault(sample.problem_id, []).append(sample)

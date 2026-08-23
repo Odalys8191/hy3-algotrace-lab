@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -293,6 +294,31 @@ def test_acquisition_models_reject_coercion_duplicate_splits_and_unpinned_urls()
         )
 
 
+def test_candidate_assessment_rejects_all_zero_raw_row_hash(tmp_path: Path) -> None:
+    """A persisted row assessment cannot use the conventional missing-hash sentinel."""
+
+    source = tmp_path / "validation.json"
+    source.write_text(json.dumps([_raw_problem(1010)]), encoding="utf-8")
+    converter = ConversionTool(name="json-reader", version="1")
+    report = convert_codecontests_file(
+        source,
+        split="validation",
+        data_format=DatasetFormat.JSON,
+        reviews=(_review(1010),),
+        converter=converter,
+        acquisition_validation=_validated_source(
+            source,
+            split="validation",
+            converter=converter,
+        ),
+    )
+    payload = report.assessments[0].model_dump()
+    payload["raw_row_hash"] = "0" * 64
+
+    with pytest.raises(ValidationError, match="all-zero"):
+        type(report.assessments[0]).model_validate(payload)
+
+
 def test_json_and_jsonl_conversion_report_row_reasons_and_reviewed_override(
     tmp_path: Path,
 ) -> None:
@@ -457,6 +483,68 @@ def test_optional_parquet_and_riegeli_dependencies_fail_actionably(
             ),
             converter_argv=("/definitely/missing/riegeli-converter", "{input}", "{output}"),
         )
+
+
+def test_riegeli_converter_reads_output_from_default_temporary_directory(
+    tmp_path: Path,
+) -> None:
+    """The trusted output read must not traverse macOS's /var compatibility symlink."""
+
+    riegeli = tmp_path / "rows.riegeli"
+    riegeli.write_bytes(b"verified riegeli bytes")
+    row_jsonl = json.dumps(_raw_problem(2450)) + "\n"
+    converter_script = tmp_path / "converter.py"
+    converter_script.write_text(
+        "import pathlib, sys\n"
+        f"pathlib.Path(sys.argv[2]).write_text({row_jsonl!r}, encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+
+    report = convert_codecontests_file(
+        riegeli,
+        split="validation",
+        data_format=DatasetFormat.RIEGELI,
+        reviews=(_review(2450),),
+        converter=ConversionTool(name="riegeli-jsonl", version="1"),
+        acquisition_validation=_validated_source(
+            riegeli,
+            split="validation",
+            converter=ConversionTool(name="riegeli-jsonl", version="1"),
+        ),
+        converter_argv=(sys.executable, str(converter_script), "{input}", "{output}"),
+    )
+
+    assert [assessment.problem_id for assessment in report.eligible] == ["cf-2450-a"]
+
+
+def test_riegeli_converter_failure_does_not_expose_stderr(tmp_path: Path) -> None:
+    """Direct callers receive one fixed error without converter-controlled diagnostics."""
+
+    riegeli = tmp_path / "rows.riegeli"
+    riegeli.write_bytes(b"verified riegeli bytes")
+    converter_script = tmp_path / "failing-converter.py"
+    converter_script.write_text(
+        "import sys\nsys.stderr.write('SECRET-CONVERTER-DIAGNOSTIC\\n')\nraise SystemExit(9)\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DatasetDataError) as captured:
+        convert_codecontests_file(
+            riegeli,
+            split="validation",
+            data_format=DatasetFormat.RIEGELI,
+            reviews=(),
+            converter=ConversionTool(name="riegeli-jsonl", version="1"),
+            acquisition_validation=_validated_source(
+                riegeli,
+                split="validation",
+                converter=ConversionTool(name="riegeli-jsonl", version="1"),
+            ),
+            converter_argv=(sys.executable, str(converter_script), "{input}", "{output}"),
+        )
+
+    assert str(captured.value) == "external Riegeli converter failed"
+    assert "SECRET-CONVERTER-DIAGNOSTIC" not in str(captured.value)
 
 
 def test_quota_report_has_all_fifteen_cells_and_never_pads(tmp_path: Path) -> None:

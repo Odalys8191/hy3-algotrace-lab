@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from hy3_algotrace.artifacts import sha256_json
 from hy3_algotrace.contracts import Topic
@@ -19,11 +21,13 @@ from hy3_algotrace.dataset_models import (
     DatasetFormat,
     FrozenSelectionManifest,
     QuotaStatus,
+    VerifiedSelectionChain,
     build_quota_report,
     convert_codecontests_file,
     freeze_selection,
     validate_acquired_assets,
     validate_frozen_selection,
+    verify_frozen_selection_chain,
 )
 
 _TOPIC_TAG = {
@@ -170,6 +174,16 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
         )
         == manifest
     )
+    verified_chain = verify_frozen_selection_chain(
+        manifest.model_dump(mode="json"),
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=validation,
+    )
+    assert verified_chain.selection == manifest
+    with pytest.raises(TypeError):
+        VerifiedSelectionChain(selection=manifest)
 
     payload = manifest.model_dump(mode="json")
     payload["entries"][0]["review_hash"] = "b" * 64
@@ -178,6 +192,17 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
     )
     with pytest.raises(DatasetDataError, match="candidate hashes"):
         validate_frozen_selection(
+            payload,
+            conversions=conversions,
+            quota=quota,
+            acquisition=acquisition,
+            acquisition_validation=validation,
+        )
+    forged_manifest = FrozenSelectionManifest.model_validate_json(json.dumps(payload))
+    with pytest.raises((TypeError, ValueError)):
+        replace(verified_chain, selection=forged_manifest)
+    with pytest.raises(DatasetDataError, match="candidate hashes"):
+        verify_frozen_selection_chain(
             payload,
             conversions=conversions,
             quota=quota,
@@ -217,6 +242,29 @@ def test_freeze_selection_refuses_underfilled_or_duplicate_choice(tmp_path: Path
             acquisition=sparse_acquisition,
             acquisition_validation=sparse_validation,
         )
+
+
+@pytest.mark.parametrize("hash_field", ("raw_row_hash", "review_hash"))
+def test_selection_entry_rejects_all_zero_evidence_hashes(
+    tmp_path: Path,
+    hash_field: str,
+) -> None:
+    """Sentinel hashes cannot cross a frozen-selection model boundary."""
+
+    conversions, acquisition, validation = _fulfilled_chain(tmp_path)
+    quota = build_quota_report(conversions)
+    manifest = freeze_selection(
+        tuple(item.problem_id for item in conversions[0].eligible),
+        conversions=conversions,
+        quota=quota,
+        acquisition=acquisition,
+        acquisition_validation=validation,
+    )
+    payload = manifest.entries[0].model_dump()
+    payload[hash_field] = "0" * 64
+
+    with pytest.raises(ValidationError, match="all-zero"):
+        type(manifest.entries[0]).model_validate(payload)
 
 
 def test_freeze_selection_rejects_conversion_not_pinned_by_acquisition(tmp_path: Path) -> None:

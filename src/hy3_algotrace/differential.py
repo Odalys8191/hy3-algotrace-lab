@@ -23,7 +23,7 @@ from hy3_algotrace.corpus import (
 from hy3_algotrace.dataset_models import (
     DATASET_SCHEMA_VERSION,
     DatasetModel,
-    FrozenSelectionManifest,
+    VerifiedSelectionChain,
 )
 from hy3_algotrace.judge import Judge
 
@@ -249,7 +249,7 @@ def validate_judge_cases(
 def validate_formal_corpus_judge_cases(
     *,
     corpus: CorpusManifest,
-    selection: FrozenSelectionManifest,
+    selection_chain: VerifiedSelectionChain,
     bundle_manifest: ProjectBundleManifest,
     cases: Iterable[JudgeSourceCase],
     judge: Judge,
@@ -258,7 +258,7 @@ def validate_formal_corpus_judge_cases(
 
     materialized = _validate_formal_case_chain(
         corpus=corpus,
-        selection=selection,
+        selection_chain=selection_chain,
         bundle_manifest=bundle_manifest,
         cases=cases,
     )
@@ -288,13 +288,13 @@ def validate_formal_corpus_judge_cases(
         "schema_version": DATASET_SCHEMA_VERSION,
         "kind": "formal_corpus_judge_evidence",
         "corpus_manifest_hash": corpus.content_hash,
-        "selection_manifest_hash": selection.content_hash,
+        "selection_manifest_hash": selection_chain.selection.content_hash,
         "bundle_manifest_hash": bundle_manifest.content_hash,
         "cases": [case.model_dump(mode="json") for case in persisted_cases],
     }
     manifest = FormalCorpusJudgeValidationReport(
         corpus_manifest_hash=corpus.content_hash,
-        selection_manifest_hash=selection.content_hash,
+        selection_manifest_hash=selection_chain.selection.content_hash,
         bundle_manifest_hash=bundle_manifest.content_hash,
         cases=persisted_cases,
         content_hash=sha256_json(payload),
@@ -309,7 +309,7 @@ def validate_persisted_formal_judge_evidence(
     payload: Mapping[str, Any],
     *,
     corpus: CorpusManifest,
-    selection: FrozenSelectionManifest,
+    selection_chain: VerifiedSelectionChain,
     bundle_manifest: ProjectBundleManifest,
     cases: Iterable[JudgeSourceCase],
     raw_evidence: Mapping[str, JudgeEvidence],
@@ -324,13 +324,13 @@ def validate_persisted_formal_judge_evidence(
         raise DifferentialDataError("formal judge evidence manifest is invalid") from error
     if (
         manifest.corpus_manifest_hash != corpus.content_hash
-        or manifest.selection_manifest_hash != selection.content_hash
+        or manifest.selection_manifest_hash != selection_chain.selection.content_hash
         or manifest.bundle_manifest_hash != bundle_manifest.content_hash
     ):
         raise DifferentialDataError("formal judge evidence chain hashes do not match")
     materialized = _validate_formal_case_chain(
         corpus=corpus,
-        selection=selection,
+        selection_chain=selection_chain,
         bundle_manifest=bundle_manifest,
         cases=cases,
     )
@@ -359,12 +359,22 @@ def validate_persisted_formal_judge_evidence(
 def _validate_formal_case_chain(
     *,
     corpus: CorpusManifest,
-    selection: FrozenSelectionManifest,
+    selection_chain: VerifiedSelectionChain,
     bundle_manifest: ProjectBundleManifest,
     cases: Iterable[JudgeSourceCase],
 ) -> tuple[JudgeSourceCase, ...]:
+    if (
+        not isinstance(selection_chain, VerifiedSelectionChain)
+        or not selection_chain._is_verified()
+    ):
+        raise DifferentialDataError("formal judge validation requires verified selection chain")
+    selection = selection_chain.selection
     if corpus.selection_manifest_hash != selection.content_hash:
         raise DifferentialDataError("corpus does not match frozen selection")
+    if bundle_manifest.selection_manifest_hash != selection.content_hash:
+        raise DifferentialDataError("bundle manifest does not match frozen selection")
+    if corpus.natural_run_config.selection_manifest_hash != selection.content_hash:
+        raise DifferentialDataError("natural run config does not match frozen selection")
     try:
         validate_corpus_bundle_links(corpus, bundle_manifest)
     except ValueError as error:
