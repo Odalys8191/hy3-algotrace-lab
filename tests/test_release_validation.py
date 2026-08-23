@@ -8,6 +8,7 @@ import pytest
 
 from hy3_algotrace.release_validation import (
     ReleaseValidationError,
+    _runtime_lock_hash,
     validate_release_files,
     validate_release_tree,
     validate_rendered_compose,
@@ -337,5 +338,28 @@ def test_release_validation_rejects_incomplete_runtime_lock() -> None:
                 "docker/release-runtime-lock.json": json.dumps(
                     {"schema_version": 1, "lock_kind": "immutable_runtime_image", "python": "3.12"}
                 ),
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "distribution",
+    ("pip", "watchdog", "pathspec", "pluggy", "trove-classifiers"),
+)
+def test_release_validation_requires_every_release_runtime_closure_distribution(
+    distribution: str,
+) -> None:
+    """A recomputed hash cannot turn a partial runtime closure into a valid release lock."""
+
+    lock = json.loads((REPOSITORY_ROOT / "docker/release-runtime-lock.json").read_text())
+    del lock["distributions"][distribution]
+    lock["content_sha256"] = _runtime_lock_hash(lock)
+
+    with pytest.raises(ReleaseValidationError, match="runtime lock"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "docker/release-runtime-lock.json": json.dumps(lock),
             }
         )

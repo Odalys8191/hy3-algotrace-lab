@@ -44,11 +44,13 @@ _RUNTIME_LOCK_REQUIRED_DISTRIBUTIONS = frozenset(
         "hatchling",
         "httpx",
         "pathspec",
+        "pip",
         "pluggy",
         "pydantic",
         "streamlit",
         "trove-classifiers",
         "uvicorn",
+        "watchdog",
     }
 )
 _PINNED_VERSION = re.compile(r"\d+(?:[A-Za-z0-9.+!_-]*\d)?\Z")
