@@ -1,1 +1,1 @@
-{"accepted_algorithm":"linear in-place reversal","complexity_ceiling":"O(n)"}
+{"accepted_algorithm_families":["project-authored fixture"],"adversarial_cases":["Hidden fixture case."],"complexity_ceiling":"O(n)","decisive_facts":["No third-party provenance is claimed."],"key_invariants":["Fixture output matches its authored behavior."],"known_traps":["Synthetic fixture: excluded from formal metrics."],"problem_id":"pilot-reverse-text","reference_solution_hash":"1fd1ae2a973d89e478b621b9f92b1300d9a678915c2a556a1e596b18ed585840","schema_version":"1.2"}

@@ -1,1 +1,1 @@
-{"accepted_algorithm":"integer addition","complexity_ceiling":"O(1)"}
+{"accepted_algorithm_families":["project-authored fixture"],"adversarial_cases":["Hidden fixture case."],"complexity_ceiling":"O(n)","decisive_facts":["No third-party provenance is claimed."],"key_invariants":["Fixture output matches its authored behavior."],"known_traps":["Synthetic fixture: excluded from formal metrics."],"problem_id":"pilot-sum-pair","reference_solution_hash":"51cf06547d29ffdb6233cefb2a352f029fc0103bc9329a5fb7d1e7ffba7044f8","schema_version":"1.2"}

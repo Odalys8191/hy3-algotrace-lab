@@ -1,1 +1,1 @@
-{"accepted_algorithm":"modulo parity check","complexity_ceiling":"O(1)"}
+{"accepted_algorithm_families":["project-authored fixture"],"adversarial_cases":["Hidden fixture case."],"complexity_ceiling":"O(n)","decisive_facts":["No third-party provenance is claimed."],"key_invariants":["Fixture output matches its authored behavior."],"known_traps":["Synthetic fixture: excluded from formal metrics."],"problem_id":"pilot-parity","reference_solution_hash":"daf892b480a60b4ff8361b260881595f4ee18764bcb8efca7ed5409c5da2a9df","schema_version":"1.2"}

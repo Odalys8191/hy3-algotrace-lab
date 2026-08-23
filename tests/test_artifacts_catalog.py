@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -21,6 +22,7 @@ from hy3_algotrace.catalog import (
 )
 from hy3_algotrace.codecontests import (
     CodeContestsImportError,
+    build_selection_manifest,
     load_codecontests_json,
     select_formal_problems,
     validate_selection_manifest,
@@ -90,6 +92,16 @@ def record_payload(
 
 def record(**changes: object) -> ProblemRecord:
     payload = record_payload()
+    problem_id = changes.get("problem_id")
+    if isinstance(problem_id, str):
+        match = re.fullmatch(r"cf-(\d+)-(.+)", problem_id)
+        if match:
+            contest_id, index = match.groups()
+            payload["cf_contest_id"] = int(contest_id)
+            payload["cf_index"] = index.upper()
+            payload["source_url"] = (
+                f"https://codeforces.com/problemset/problem/{contest_id}/{index.upper()}"
+            )
     payload.update(changes)
     payload["content_hash"] = sha256_json(
         {key: value for key, value in payload.items() if key != "content_hash"}
@@ -239,47 +251,45 @@ def test_codecontests_json_and_jsonl_import_reject_invalid_entries_and_selects_q
         for rating in ratings:
             for number in range(2):
                 entries.append(
-                    record_payload(
-                        problem_id=f"cf-{topic.value}-{rating}-{number}", topic=topic, rating=rating
-                    )
+                    _formal_payload(1000 + len(entries), topic=topic, rating=rating)
                 )
     json_path = tmp_path / "records.json"
     json_path.write_text(json.dumps(entries), encoding="utf-8")
     jsonl_path = tmp_path / "records.jsonl"
     jsonl_path.write_text("\n".join(json.dumps(entry) for entry in entries), encoding="utf-8")
 
-    assert len(load_codecontests_json(json_path)) == 30
-    assert len(load_codecontests_json(jsonl_path)) == 30
-    selected = select_formal_problems(load_codecontests_json(json_path))
+    assert len(load_codecontests_json(json_path, split="validation")) == 30
+    assert len(load_codecontests_json(jsonl_path, split="validation")) == 30
+    selected = select_formal_problems(load_codecontests_json(json_path, split="validation"))
     assert len(selected) == 30
     assert {item.topic for item in selected} == set(topics)
     with pytest.raises(CodeContestsImportError, match="quota"):
         select_formal_problems(selected[:-1])
 
 
-def test_selection_manifest_must_match_the_frozen_quota_and_record_hashes() -> None:
-    records: list[ProblemRecord] = []
+def test_selection_manifest_must_match_the_frozen_quota_and_component_hashes() -> None:
+    bundles: list[ProblemBundle] = []
+    counter = 1000
     for topic in Topic:
         for rating in (1300, 1700, 2100):
-            records.extend(
-                ProblemRecord.model_validate(
-                    record_payload(
-                        problem_id=f"cf-{topic.value}-{rating}-{number}",
-                        topic=topic,
-                        rating=rating,
-                    )
-                )
-                for number in range(2)
-            )
-    selected = select_formal_problems(records)
-    manifest = {
-        "schema_version": "1.2",
-        "kind": "formal_codecontests_selection",
-        "problem_ids": [item.problem_id for item in selected],
-        "record_hashes": {item.problem_id: item.content_hash for item in selected},
-    }
+            for _ in range(2):
+                problem = ProblemRecord.model_validate(_formal_payload(counter, topic, rating))
+                bundles.append(bundle(problem))
+                counter += 1
+    manifest = build_selection_manifest(bundles).model_dump(mode="json")
 
-    assert validate_selection_manifest(manifest, records) == selected
-    manifest["problem_ids"] = manifest["problem_ids"][:-1]
-    with pytest.raises(CodeContestsImportError, match="problem IDs"):
-        validate_selection_manifest(manifest, records)
+    assert validate_selection_manifest(manifest, bundles) == tuple(bundles)
+    manifest["bundles"] = manifest["bundles"][:-1]
+    with pytest.raises(CodeContestsImportError, match="bundles"):
+        validate_selection_manifest(manifest, bundles)
+
+
+def _formal_payload(contest_id: int, topic: Topic, rating: int) -> dict[str, object]:
+    payload = record_payload(problem_id=f"cf-{contest_id}-a", topic=topic, rating=rating)
+    payload["cf_contest_id"] = contest_id
+    payload["cf_index"] = "A"
+    payload["source_url"] = f"https://codeforces.com/problemset/problem/{contest_id}/A"
+    payload["content_hash"] = sha256_json(
+        {key: value for key, value in payload.items() if key != "content_hash"}
+    )
+    return payload
