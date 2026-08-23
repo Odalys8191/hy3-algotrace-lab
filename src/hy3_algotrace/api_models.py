@@ -155,6 +155,7 @@ class RunReadResponse(ApiModel):
     status: RunStatus
     report: PublicRunReport | None = None
     failure: RunFailure | None = None
+    degraded_failure: RunFailure | None = None
 
     @model_validator(mode="after")
     def validate_terminal_payload(self) -> Self:
@@ -166,6 +167,11 @@ class RunReadResponse(ApiModel):
             raise ValueError("only completed runs expose a report")
         if self.status is not RunStatus.FAILED and self.failure is not None:
             raise ValueError("only failed runs expose a failure")
+        if self.degraded_failure is not None and (
+            self.status is not RunStatus.RUNNING
+            or self.degraded_failure.code is not RunFailureCode.INTERNAL_FAILURE
+        ):
+            raise ValueError("only a running run may expose an internal degraded failure")
         return self
 
 

@@ -72,6 +72,89 @@ def test_post_returns_202_and_get_returns_completed_report(tmp_path: Path) -> No
     assert client.get("/api/v1/runs/missing").status_code == 404
 
 
+def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_trace(
+    tmp_path: Path,
+) -> None:
+    bundle = formal_bundle()
+    trace = valid_trace().model_copy(
+        update={
+            "problem_understanding": (
+                "Keep the input invariant; quoted path is "
+                '"/private/tmp/judge workspace/solution.cpp".'
+            ),
+            "algorithm": (
+                "The symbolic token /variable stays; add exactly one to x; "
+                "cache is (/var/lib/judge cache/case file.txt)."
+            ),
+            "correctness_argument": (
+                "The arithmetic proof remains valid; "
+                "workspace=/Users/odalys/judge workspace/main.cpp; "
+                "therefore every output is correct."
+            ),
+            "edge_cases": (
+                "HY3 API KEY is natural-secret",
+                "HY3_API_KEY underscore-secret",
+                "api key\ttab-secret",
+            ),
+            "code": (
+                '#include <iostream>\n// source="/private/tmp/build dir/main.cpp"\n'
+                "// HY3 API KEY is code-secret\n"
+                "int main(){long long x;std::cin>>x;std::cout<<x+1;}"
+            ),
+        }
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    run_service = RunService(
+        catalog=ProblemCatalog((bundle,)),
+        artifacts=artifacts,
+        generator=FakeGenerator(trace),
+        judge=FakeJudge(),
+        reviews=CleanReviews(),
+        executor=SynchronousExecutor(),
+        id_factory=lambda: "run-api-redaction",
+    )
+    client = TestClient(create_app(catalog=ProblemCatalog((bundle,)), run_service=run_service))
+
+    created = client.post(
+        "/api/v1/runs",
+        json={"mode": "solve_and_audit", "problem_id": "cf-123-a"},
+    )
+    fetched = client.get("/api/v1/runs/run-api-redaction")
+
+    assert created.status_code == 202
+    assert fetched.status_code == 200
+    payload = fetched.json()
+    public_trace = payload["report"]["trace"]
+    serialized = fetched.text.casefold()
+    for normal_fragment in (
+        "keep the input invariant",
+        "add exactly one to x",
+        "/variable stays",
+        "the arithmetic proof remains valid",
+        "therefore every output is correct",
+        "#include <iostream>",
+        "std::cout<<x+1",
+    ):
+        assert normal_fragment in serialized
+    for protected_fragment in (
+        "/private/tmp",
+        "/var/lib",
+        "/users/odalys",
+        "judge workspace",
+        "judge cache",
+        "natural-secret",
+        "underscore-secret",
+        "tab-secret",
+        "code-secret",
+        "hy3 api key",
+        "hy3_api_key",
+        "api key\\t",
+    ):
+        assert protected_fragment not in serialized
+    assert "[REDACTED]" in tuple(public_trace["edge_cases"])
+    assert "[REDACTED]" in public_trace["code"]
+
+
 def test_invalid_problem_and_invalid_trace_create_no_run_artifacts(tmp_path: Path) -> None:
     bundle = formal_bundle()
     artifacts = ArtifactStore(tmp_path / "artifacts")

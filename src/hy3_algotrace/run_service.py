@@ -58,12 +58,32 @@ _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+\-/]+=*"),
     re.compile(
         r"(?i)\b(?:(?:hy3[\s_-]+)?api[\s_-]*key|authorization)"
-        r"\s*[:=]\s*[^\s,;\"']+"
+        r"\b(?:\s*(?::|=|\bis\b)\s*|\s+)"
+        r"[A-Za-z0-9._~+\-/]+=*"
     ),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
 )
-_ABSOLUTE_PATH = re.compile(
-    r"(?i)(?:^|\s)(?:/(?:users|private|tmp|var|home|opt|workspace|app|mnt)(?:/|\b)|[a-z]:\\)"
+_PATH_ROOT = (
+    r"(?:users|private|tmp|var|home|opt|workspace|app|mnt)"
+    r"(?=/|[\s,;:)\]}'\"]|$)"
+)
+_PUBLIC_PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(rf"(?i)(?P<quote>[\"'])(?:/{_PATH_ROOT}(?:/[^\"'\r\n]*)?)(?P=quote)"),
+        '"[REDACTED]"',
+    ),
+    (
+        re.compile(rf"(?i)\(\s*/{_PATH_ROOT}(?:/[^)\r\n]*)?\s*\)"),
+        "([REDACTED])",
+    ),
+    (
+        re.compile(rf"(?i)(\b[A-Za-z_][\w.-]*\s*=\s*)/{_PATH_ROOT}(?:/[^,;\r\n]*)?"),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(rf"(?i)(?<![\w])/{_PATH_ROOT}(?:/[^,;\r\n)\]}}\"']*)?"),
+        "[REDACTED]",
+    ),
 )
 _PROTECTED_KEY_PARTS = (
     "hidden",
@@ -100,6 +120,7 @@ _SAFE_FAILURE_MESSAGES: Mapping[RunFailureCode, str] = {
     RunFailureCode.EXECUTOR_FAILURE: "background executor rejected the run",
     RunFailureCode.INTERNAL_FAILURE: "run orchestration failed",
 }
+_DEGRADED_WORKER_MESSAGE = "background worker failed before terminal state was persisted"
 
 
 class ProblemNotFoundError(KeyError):
@@ -231,7 +252,10 @@ class RunService:
                 {"schema_version": "1.2", "run_id": run_id},
             )
         try:
-            self._executor.submit(lambda: self._execute(run_id, request, bundle))
+            self._executor.submit(
+                lambda: self._execute(run_id, request, bundle),
+                task_id=run_id,
+            )
         except RunFailurePersistenceError:
             raise
         except Exception:
@@ -265,6 +289,18 @@ class RunService:
                 run_id=run_id,
                 status=RunStatus.FAILED,
                 failure=latest.failure,
+            )
+        if (
+            latest.event is RunTransitionEvent.RUNNING
+            and self._executor.failure_for(run_id) is not None
+        ):
+            return RunReadResponse(
+                run_id=run_id,
+                status=RunStatus.RUNNING,
+                degraded_failure=RunFailure(
+                    code=RunFailureCode.INTERNAL_FAILURE,
+                    message=_DEGRADED_WORKER_MESSAGE,
+                ),
             )
         return RunReadResponse(run_id=run_id, status=_EVENT_STATUS[latest.event])
 
@@ -789,7 +825,7 @@ class RunService:
 
         add(bundle.reference_cpp)
         for line in bundle.reference_cpp.splitlines():
-            if len(line.strip()) >= 12:
+            if len(line.strip()) >= 12 and not line.lstrip().startswith("#include"):
                 add(line)
         for test in (*bundle.record.hidden_tests, *bundle.record.generated_tests):
             add(test.test_id)
@@ -814,7 +850,8 @@ class RunService:
         for value in oracle_values:
             words = value.split()
             if len(words) <= 1:
-                add(value)
+                if len(value) >= 16:
+                    add(value)
                 continue
             for width in range(2, len(words) + 1):
                 for start in range(len(words) - width + 1):
@@ -850,18 +887,17 @@ class RunService:
             return [cls._sanitize_public(item, protected) for item in value]
         if isinstance(value, str):
             result = cast(str, cls._sanitize_credentials(value))
-            normalized = " ".join(result.split()).casefold()
-            if _ABSOLUTE_PATH.search(result) or cls._contains_protected(normalized, protected):
-                return "[REDACTED]"
+            for pattern, replacement in _PUBLIC_PATH_PATTERNS:
+                result = pattern.sub(replacement, result)
+            for literal in protected:
+                words = literal.split()
+                if not words:
+                    continue
+                expression = r"\s+".join(re.escape(word) for word in words)
+                if words[0][0].isalnum():
+                    expression = rf"(?<!\w){expression}"
+                if words[-1][-1].isalnum():
+                    expression = rf"{expression}(?!\w)"
+                result = re.sub(expression, "[REDACTED]", result, flags=re.IGNORECASE)
             return result
         return value
-
-    @staticmethod
-    def _contains_protected(normalized: str, protected: tuple[str, ...]) -> bool:
-        for literal in protected:
-            if literal.isalnum():
-                if re.search(rf"(?<!\w){re.escape(literal)}(?!\w)", normalized):
-                    return True
-            elif literal in normalized:
-                return True
-        return False
