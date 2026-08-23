@@ -7,16 +7,22 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TypeVar, cast
+from typing import NoReturn, TypeVar, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 from pydantic import BaseModel, ValidationError
 
-from .contracts import ProblemOracle, ProblemRecord, ReviewerVerdict, SolutionTrace
+from .contracts import (
+    ErrorTaxonomy,
+    ProblemOracle,
+    ProblemRecord,
+    ReviewerVerdict,
+    SolutionTrace,
+)
 from .prompts import (
     ADVERSARIAL_REVIEW_PROMPT_VERSION,
     ADVERSARIAL_REVIEW_SYSTEM_PROMPT,
@@ -43,6 +49,21 @@ class Hy3ConfigurationError(Hy3Error):
 
 class Hy3ResponseError(Hy3Error):
     """Raised when Hy3 returns an unusable response."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_taxonomy: ErrorTaxonomy | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_taxonomy = error_taxonomy
+
+
+@dataclass(frozen=True, slots=True)
+class _SafeFailure:
+    message: str
+    error_taxonomy: ErrorTaxonomy | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +110,18 @@ def endpoint_identity(endpoint: str) -> str:
 
 def _canonical_json(value: object) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _accept_result(_result: BaseModel) -> None:
+    """Replace context-bearing validators before raising a public safe failure."""
+
+
+def _raise_safe_failure(
+    message: str, error_taxonomy: ErrorTaxonomy | None
+) -> NoReturn:
+    """Publish a sanitized error from a frame with no client or transport state."""
+
+    raise Hy3ResponseError(message, error_taxonomy=error_taxonomy)
 
 
 def build_cache_key(
@@ -191,13 +224,22 @@ class Hy3Client:
 
     def generate(self, problem: ProblemRecord) -> SolutionTrace:
         visible_input = generation_input(problem)
-        return self._structured_call(
+        outcome = self._structured_call(
             output_model=SolutionTrace,
             prompt_version=GENERATOR_PROMPT_VERSION,
             system_prompt=GENERATOR_SYSTEM_PROMPT,
             canonical_input=visible_input,
             user_payload=visible_input,
+            validate_result=lambda result: self._validate_trace_identity(
+                result, problem_id=problem.problem_id
+            ),
         )
+        if isinstance(outcome, _SafeFailure):
+            message = outcome.message
+            error_taxonomy = outcome.error_taxonomy
+            del outcome, visible_input, problem, self
+            _raise_safe_failure(message, error_taxonomy)
+        return outcome
 
     def review(
         self,
@@ -221,15 +263,22 @@ class Hy3Client:
             "oracle": oracle.model_dump(mode="json"),
             "trace": trace.model_dump(mode="json"),
         }
-        verdict = self._structured_call(
+        outcome = self._structured_call(
             output_model=ReviewerVerdict,
             prompt_version=prompt_version,
             system_prompt=system_prompt,
             canonical_input=review_payload,
             user_payload=review_payload,
+            validate_result=lambda result: self._validate_verdict_identity(
+                result, reviewer_id=reviewer_id, trace=trace
+            ),
         )
-        self._validate_verdict_identity(verdict, reviewer_id=reviewer_id, trace=trace)
-        return verdict
+        if isinstance(outcome, _SafeFailure):
+            message = outcome.message
+            error_taxonomy = outcome.error_taxonomy
+            del outcome, review_payload, problem, oracle, trace, self
+            _raise_safe_failure(message, error_taxonomy)
+        return outcome
 
     def arbitrate(
         self,
@@ -245,15 +294,27 @@ class Hy3Client:
             "trace": trace.model_dump(mode="json"),
             "primary_verdicts": [verdict.model_dump(mode="json") for verdict in primary],
         }
-        verdict = self._structured_call(
+        outcome = self._structured_call(
             output_model=ReviewerVerdict,
             prompt_version=ARBITER_PROMPT_VERSION,
             system_prompt=ARBITER_SYSTEM_PROMPT,
             canonical_input=payload,
             user_payload=payload,
+            validate_result=lambda result: self._validate_verdict_identity(
+                result, reviewer_id="arbiter", trace=trace
+            ),
         )
-        self._validate_verdict_identity(verdict, reviewer_id="arbiter", trace=trace)
-        return verdict
+        if isinstance(outcome, _SafeFailure):
+            message = outcome.message
+            error_taxonomy = outcome.error_taxonomy
+            del outcome, payload, problem, oracle, trace, primary, self
+            _raise_safe_failure(message, error_taxonomy)
+        return outcome
+
+    @staticmethod
+    def _validate_trace_identity(trace: SolutionTrace, *, problem_id: str) -> None:
+        if trace.problem_id != problem_id:
+            raise Hy3ResponseError("generation response problem identity does not match request")
 
     @staticmethod
     def _validate_verdict_identity(
@@ -262,9 +323,12 @@ class Hy3Client:
         if verdict.reviewer_id != reviewer_id or verdict.trace_id != trace.trace_id:
             raise Hy3ResponseError("review response identity does not match its request")
         known_steps = {step.step_id for step in trace.steps}
-        reviewed_steps = {review.step_id for review in verdict.per_step_reviews}
+        reviewed_step_ids = tuple(review.step_id for review in verdict.per_step_reviews)
+        reviewed_steps = set(reviewed_step_ids)
         if not reviewed_steps <= known_steps:
             raise Hy3ResponseError("review response references an unknown trace step")
+        if len(reviewed_step_ids) != len(known_steps) or reviewed_steps != known_steps:
+            raise Hy3ResponseError("review response must cover every trace step exactly once")
 
     def _structured_call(
         self,
@@ -274,7 +338,8 @@ class Hy3Client:
         system_prompt: str,
         canonical_input: object,
         user_payload: object,
-    ) -> StructuredModel:
+        validate_result: Callable[[StructuredModel], None],
+    ) -> StructuredModel | _SafeFailure:
         parameters: dict[str, object] = {"reasoning_effort": "high"}
         key = build_cache_key(
             model=self._config.model,
@@ -283,38 +348,100 @@ class Hy3Client:
             parameters=parameters,
             canonical_input=canonical_input,
         )
+        result, failure = self._obtain_validated_result(
+            key=key,
+            output_model=output_model,
+            system_prompt=system_prompt,
+            user_payload=user_payload,
+            validate_result=validate_result,
+        )
+        if failure is not None:
+            system_prompt = ""
+            canonical_input = None
+            user_payload = None
+            validate_result = _accept_result
+            return failure
+        if result is None:  # pragma: no cover - private outcome invariant
+            return _SafeFailure("Hy3 response validation produced no result")
+        if self._cache is not None:
+            self._cache.put(key, result.model_dump(mode="json"))
+        return result
+
+    def _obtain_validated_result(
+        self,
+        *,
+        key: str,
+        output_model: type[StructuredModel],
+        system_prompt: str,
+        user_payload: object,
+        validate_result: Callable[[StructuredModel], None],
+    ) -> tuple[StructuredModel | None, _SafeFailure | None]:
         if self._cache is not None:
             cached = self._cache.get(key)
             if cached is not None:
-                return output_model.model_validate(cached)
+                try:
+                    cached_result = output_model.model_validate(cached)
+                    self._ensure_secret_free(cached_result)
+                    validate_result(cached_result)
+                except Hy3ResponseError as error:
+                    return None, self._safe_failure(error)
+                except (ValidationError, TypeError, ValueError) as error:
+                    return None, _SafeFailure(
+                        self._redact(f"cached response failed schema validation: {error}"),
+                        ErrorTaxonomy.FORMAT_SCHEMA,
+                    )
+                return cached_result, None
 
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": _canonical_json(user_payload)},
         ]
-        first_content = self._completion(messages, output_model)
+        try:
+            first_content = self._completion(messages, output_model)
+        except Hy3ResponseError as error:
+            return None, self._safe_failure(error)
         try:
             result = self._validate_content(first_content, output_model)
         except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as first_error:
+            safe_content = self._content_text(self._redact_value(first_content))
+            safe_validation_error = self._redact(str(first_error))
             repair_messages = [
-                *messages,
-                {"role": "assistant", "content": self._content_text(first_content)},
+                *[
+                    {"role": message["role"], "content": self._redact(message["content"])}
+                    for message in messages
+                ],
+                {"role": "assistant", "content": safe_content},
                 {
                     "role": "user",
-                    "content": f"{SCHEMA_REPAIR_PROMPT}\nValidation error: {first_error}",
+                    "content": (
+                        f"{SCHEMA_REPAIR_PROMPT}\n"
+                        f"Validation error: {safe_validation_error}"
+                    ),
                 },
             ]
-            repaired_content = self._completion(repair_messages, output_model)
+            try:
+                repaired_content = self._completion(repair_messages, output_model)
+            except Hy3ResponseError as error:
+                return None, self._safe_failure(error)
             try:
                 result = self._validate_content(repaired_content, output_model)
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
-                raise Hy3ResponseError(
-                    self._redact(f"response failed schema validation after one repair: {error}")
-                ) from error
+                return None, _SafeFailure(
+                    self._redact(
+                        f"response failed schema validation after one repair: {error}"
+                    ),
+                    ErrorTaxonomy.FORMAT_SCHEMA,
+                )
 
-        if self._cache is not None:
-            self._cache.put(key, result.model_dump(mode="json"))
-        return result
+        try:
+            self._ensure_secret_free(result)
+            validate_result(result)
+        except Hy3ResponseError as error:
+            return None, self._safe_failure(error)
+        return result, None
+
+    def _safe_failure(self, error: Hy3ResponseError) -> _SafeFailure:
+        return _SafeFailure(self._redact(str(error)), error.error_taxonomy)
 
     def _completion(
         self, messages: list[dict[str, str]], output_model: type[BaseModel]
@@ -333,13 +460,17 @@ class Hy3Client:
             },
         }
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
+        terminal_error: Hy3ResponseError | None = None
         for attempt in range(self._config.max_attempts):
             try:
                 response = self._http.post(url, json=payload)
             except httpx.TransportError as error:
                 if attempt + 1 < self._config.max_attempts:
                     continue
-                raise Hy3ResponseError(self._redact(f"Hy3 transport failure: {error}")) from error
+                terminal_error = Hy3ResponseError(
+                    self._redact(f"Hy3 transport failure: {error}")
+                )
+                break
             if response.status_code in TRANSIENT_STATUS_CODES:
                 if attempt + 1 < self._config.max_attempts:
                     continue
@@ -351,9 +482,12 @@ class Hy3Client:
                 document = response.json()
                 return document["choices"][0]["message"]["content"]
             except (json.JSONDecodeError, KeyError, IndexError, TypeError) as error:
-                raise Hy3ResponseError(
+                terminal_error = Hy3ResponseError(
                     self._redact(f"invalid OpenAI-compatible response envelope: {error}")
-                ) from error
+                )
+                break
+        if terminal_error is not None:
+            raise terminal_error
         raise Hy3ResponseError("Hy3 request exhausted retries")
 
     @staticmethod
@@ -377,3 +511,33 @@ class Hy3Client:
             sanitized,
         )
         return sanitized
+
+    def _redact_value(self, value: object) -> object:
+        if isinstance(value, str):
+            return self._redact(value)
+        if isinstance(value, Mapping):
+            return {
+                self._redact(key) if isinstance(key, str) else key: self._redact_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [self._redact_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._redact_value(item) for item in value)
+        return value
+
+    def _ensure_secret_free(self, value: BaseModel) -> None:
+        if self._contains_secret(value.model_dump(mode="python")):
+            raise Hy3ResponseError("Hy3 response contained configured credentials")
+
+    def _contains_secret(self, value: object) -> bool:
+        if isinstance(value, str):
+            return self._config.api_key in value
+        if isinstance(value, Mapping):
+            return any(
+                self._contains_secret(key) or self._contains_secret(item)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return any(self._contains_secret(item) for item in value)
+        return False

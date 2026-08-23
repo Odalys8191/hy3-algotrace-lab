@@ -171,17 +171,6 @@ class RuleEngine:
                 )
             )
 
-        edge_text = " ".join(trace.edge_cases).lower()
-        division = re.search(r"(?<!/)/(?![/=*])", trace.code)
-        if division and not any(term in edge_text for term in ("zero", "nonzero", "divisor")):
-            findings.append(
-                self.classify_signal(
-                    RuleSignal.BOUNDARY_ERROR,
-                    step_id=self._first_step_id(trace, ReasoningStage.EDGE_CASES),
-                    evidence="division appears in code without a documented zero-divisor edge case",
-                )
-            )
-
         if re.search(r"\b(TODO|FIXME|unimplemented)\b", trace.code, re.IGNORECASE):
             findings.append(
                 self.classify_signal(
