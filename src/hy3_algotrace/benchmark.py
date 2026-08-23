@@ -346,8 +346,14 @@ class BenchmarkRunner:
         )
         if actual != expected:
             raise ValueError("benchmark observation violates its frozen sample specification")
-        if self._config.formal and not self._formal_gold_semantics_valid(observation):
-            raise ValueError("formal observation gold semantics do not match its sample kind")
+        if self._config.formal:
+            if not self._formal_gold_semantics_valid(observation):
+                raise ValueError("formal observation gold semantics do not match its sample kind")
+            agreement = observation.primary_review_agreement
+            if agreement is None or observation.arbitration_used is not (agreement is False):
+                raise ValueError(
+                    "formal primary review relationship requires agreement or arbitration"
+                )
 
     @staticmethod
     def _formal_gold_semantics_valid(observation: MetricObservation) -> bool:

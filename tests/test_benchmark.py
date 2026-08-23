@@ -21,6 +21,7 @@ from hy3_algotrace.benchmark import (
 from hy3_algotrace.benchmark_models import (
     BenchmarkConfig,
     BenchmarkParameter,
+    BenchmarkRunReport,
     BenchmarkSampleSpec,
     BenchmarkStatus,
     HumanConfirmedLabel,
@@ -202,6 +203,64 @@ def formal_human_labels(
     )
 
 
+def run_complete_formal_fixture(
+    tmp_path: Path,
+    *,
+    benchmark_id: str,
+    rows: tuple[MetricObservation, ...],
+    arbiter_sample_ids: tuple[str, ...] = (),
+) -> tuple[BenchmarkRunReport, ArtifactStore, RemoteAttemptBudget]:
+    base_config, _ = formal_profile(benchmark_id=benchmark_id)
+    attempt_budget = 390 + len(arbiter_sample_ids)
+    benchmark_config = BenchmarkConfig.model_validate(
+        {
+            **base_config.model_dump(mode="json"),
+            "remote_attempt_budget": attempt_budget,
+        }
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    ledger = ArtifactAttemptLedger(artifacts, benchmark_id=benchmark_id)
+    budget = RemoteAttemptBudget(
+        limit=attempt_budget,
+        event_sink=ledger.record,
+        benchmark_id=benchmark_id,
+    )
+    by_id = {row.sample_id: row for row in rows}
+
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
+        if sample_id in benchmark_config.generation_sample_ids:
+            observer(
+                Hy3AttemptContext(
+                    operation=benchmark_config.generator_prompt_version,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        for operation in (
+            benchmark_config.logic_review_prompt_version,
+            benchmark_config.adversarial_review_prompt_version,
+        ):
+            observer(Hy3AttemptContext(operation=operation, phase="request", retry_number=1))
+        if sample_id in arbiter_sample_ids:
+            observer(
+                Hy3AttemptContext(
+                    operation=benchmark_config.arbiter_prompt_version,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        return by_id[sample_id]
+
+    report = BenchmarkRunner(
+        config=benchmark_config,
+        artifacts=artifacts,
+        budget=budget,
+        ledger=ledger,
+        human_labels=formal_human_labels(rows),
+    ).run(execute)
+    return report, artifacts, budget
+
+
 def test_config_freezes_static_lower_bound_and_exact_formal_profile() -> None:
     frozen, _ = formal_profile()
 
@@ -346,6 +405,75 @@ def test_formal_observations_enforce_kind_gold_semantics(
         ).run(lambda current_sample_id, _observer: rows[current_sample_id])
 
 
+def test_formal_observations_require_primary_review_agreement_for_all_165_rows(
+    tmp_path: Path,
+) -> None:
+    _, source_rows = formal_profile(benchmark_id="formal-missing-agreement")
+    rows = tuple(
+        row.model_copy(update={"primary_review_agreement": None, "arbitration_used": False})
+        for row in source_rows
+    )
+
+    with pytest.raises(ValueError, match="formal primary review relationship"):
+        run_complete_formal_fixture(
+            tmp_path,
+            benchmark_id="formal-missing-agreement",
+            rows=rows,
+        )
+
+    assert not (
+        tmp_path / "artifacts/benchmarks/formal-missing-agreement/formal-candidate.json"
+    ).exists()
+
+
+def test_formal_observation_rejects_arbiter_when_primary_reviews_agreed(
+    tmp_path: Path,
+) -> None:
+    _, source_rows = formal_profile(benchmark_id="formal-spurious-agreed-arbiter")
+    arbitrated_sample_id = source_rows[0].sample_id
+    rows = (
+        source_rows[0].model_copy(
+            update={"primary_review_agreement": True, "arbitration_used": True}
+        ),
+        *source_rows[1:],
+    )
+
+    with pytest.raises(ValueError, match="formal primary review relationship"):
+        run_complete_formal_fixture(
+            tmp_path,
+            benchmark_id="formal-spurious-agreed-arbiter",
+            rows=rows,
+            arbiter_sample_ids=(arbitrated_sample_id,),
+        )
+
+    assert not (
+        tmp_path / "artifacts/benchmarks/formal-spurious-agreed-arbiter/formal-candidate.json"
+    ).exists()
+
+
+def test_formal_observation_rejects_material_disagreement_without_arbitration_flag(
+    tmp_path: Path,
+) -> None:
+    _, source_rows = formal_profile(benchmark_id="formal-unarbitrated-disagreement")
+    rows = (
+        source_rows[0].model_copy(
+            update={"primary_review_agreement": False, "arbitration_used": False}
+        ),
+        *source_rows[1:],
+    )
+
+    with pytest.raises(ValueError, match="formal primary review relationship"):
+        run_complete_formal_fixture(
+            tmp_path,
+            benchmark_id="formal-unarbitrated-disagreement",
+            rows=rows,
+        )
+
+    assert not (
+        tmp_path / "artifacts/benchmarks/formal-unarbitrated-disagreement/formal-candidate.json"
+    ).exists()
+
+
 def test_standalone_task6_cannot_turn_forged_165_sample_390_attempt_run_formal(
     tmp_path: Path,
 ) -> None:
@@ -405,6 +533,10 @@ def test_standalone_task6_cannot_turn_forged_165_sample_390_attempt_run_formal(
     assert self_authored.formal_eligible is False
     assert self_authored.formal_candidate_complete is True
     candidate = artifacts.read_json("benchmarks/formal-gated/formal-candidate.json")
+    metrics_payload = artifacts.read_json("benchmarks/formal-gated/metrics.json")
+    metrics = {item["name"]: item for item in metrics_payload["overall"]}
+    assert metrics["primary_review_agreement_rate"]["denominator"] == 165
+    assert metrics["arbitration_rate"]["denominator"] == 165
     assert "formal_eligible" not in candidate
     assert "eligible" not in candidate
     for forbidden_name in (
@@ -521,6 +653,41 @@ def test_formal_attempt_profile_requires_arbiter_request_when_observation_used_i
     assert report.formal_attempt_profile_valid is False
     assert report.formal_candidate_complete is False
     assert not (artifacts.root / "benchmarks/formal-missing-arbiter/formal-candidate.json").exists()
+
+
+def test_formal_single_material_disagreement_requires_391_attempts_and_keeps_review_denominators(
+    tmp_path: Path,
+) -> None:
+    _, source_rows = formal_profile(benchmark_id="formal-one-disagreement")
+    arbitrated_sample_id = source_rows[0].sample_id
+    rows = (
+        source_rows[0].model_copy(
+            update={"primary_review_agreement": False, "arbitration_used": True}
+        ),
+        *source_rows[1:],
+    )
+
+    report, artifacts, budget = run_complete_formal_fixture(
+        tmp_path,
+        benchmark_id="formal-one-disagreement",
+        rows=rows,
+        arbiter_sample_ids=(arbitrated_sample_id,),
+    )
+    metrics_payload = artifacts.read_json("benchmarks/formal-one-disagreement/metrics.json")
+    metrics = {item["name"]: item for item in metrics_payload["overall"]}
+
+    assert budget.used == 391
+    assert report.formal_attempt_profile_valid is True
+    assert report.formal_candidate_complete is True
+    assert report.formal_eligible is False
+    assert (
+        metrics["primary_review_agreement_rate"]["numerator"],
+        metrics["primary_review_agreement_rate"]["denominator"],
+    ) == (164.0, 165)
+    assert (
+        metrics["arbitration_rate"]["numerator"],
+        metrics["arbitration_rate"]["denominator"],
+    ) == (1.0, 165)
 
 
 def test_formal_attempt_profile_rejects_arbiter_calls_without_arbitration(
