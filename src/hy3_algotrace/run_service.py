@@ -64,6 +64,10 @@ _CREDENTIAL_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
 )
 _POSIX_PATH_TOKEN = r"[^/\s,;)\]}'\"]+"
+_BARE_FILESYSTEM_ROOT = (
+    r"(?:etc|usr|bin|sbin|lib|opt|var|tmp|home|root|dev|proc|sys|mnt|run|srv|"
+    r"Users|private|Library|Applications|Volumes|workspace|app)"
+)
 _PUBLIC_PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"(?P<quote>[\"'])/(?!/)[^\"'\r\n]*(?P=quote)"),
@@ -86,15 +90,8 @@ _PUBLIC_PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(
-            rf"(?i)(\b(?:path|directory|dir|file|root|config)\s+)"
-            rf"/(?!/){_POSIX_PATH_TOKEN}(?=\s|[,;:.)\]}}'\"]|$)"
-        ),
-        r"\1[REDACTED]",
-    ),
-    (
-        re.compile(
-            rf"(?<![\w:/])/(?!/){_POSIX_PATH_TOKEN}"
-            r"(?=[,;:.)\]}'\"]|$)"
+            rf"(?<![\w:/])/(?!/){_BARE_FILESYSTEM_ROOT}"
+            r"(?=$|[\s,;:.)\]}'\"])"
         ),
         "[REDACTED]",
     ),

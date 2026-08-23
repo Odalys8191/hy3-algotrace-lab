@@ -82,7 +82,8 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
                 "Keep the input invariant; quoted path is "
                 '"/private/tmp/judge workspace/solution.cpp" and config is '
                 '"/etc/passwd"; bare directory /etc, bare path /usr should be '
-                'hidden, and quoted root "/usr".'
+                "hidden; access /etc now; access /usr now; and quoted root "
+                '"/usr".'
             ),
             "algorithm": (
                 "The symbolic token /variable stays; add exactly one to x; "
@@ -137,6 +138,7 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
         "bare directory",
         "quoted root",
         "should be hidden",
+        "access [redacted] now",
         "add exactly one to x",
         "/variable stays",
         "the arithmetic proof remains valid",
