@@ -81,7 +81,8 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
             "problem_understanding": (
                 "Keep the input invariant; quoted path is "
                 '"/private/tmp/judge workspace/solution.cpp" and config is '
-                '"/etc/passwd".'
+                '"/etc/passwd"; bare directory /etc, bare path /usr should be '
+                'hidden, and quoted root "/usr".'
             ),
             "algorithm": (
                 "The symbolic token /variable stays; add exactly one to x; "
@@ -91,7 +92,7 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
             "correctness_argument": (
                 "The arithmetic proof remains valid; "
                 "workspace=/Users/odalys/judge workspace/main.cpp; "
-                "therefore every output is correct."
+                "root=/etc; therefore every output is correct."
             ),
             "edge_cases": (
                 "HY3 API KEY is natural-secret",
@@ -133,6 +134,9 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
     serialized = fetched.text.casefold()
     for normal_fragment in (
         "keep the input invariant",
+        "bare directory",
+        "quoted root",
+        "should be hidden",
         "add exactly one to x",
         "/variable stays",
         "the arithmetic proof remains valid",
@@ -150,6 +154,8 @@ def test_completed_run_get_redacts_path_and_credential_spans_without_erasing_tra
         "/users/odalys",
         "/etc/passwd",
         "/usr/local/bin",
+        "/etc",
+        "/usr",
         "judge workspace",
         "judge cache",
         "natural-secret",
