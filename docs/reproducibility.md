@@ -9,7 +9,10 @@ selection, bundle, corpus, **and persisted/raw formal Judge evidence**. The fina
 derive its capability in memory from the complete hash-bound chain and prove exactly 30 gold,
 60 mutant, and 15 paradox cases. A persisted receipt cannot rehydrate eligibility; a
 `CorpusAuditReport` with pending evidence exits `3`. `scripts/formal-release-gate.sh` turns
-that not-ready signal into a release-blocking failure.
+that not-ready signal into release-blocking exit `1`. The replay receipt and corpus audit paths
+are create-only outputs: they must be absent before the command begins, and an existing path is
+never overwritten. `scripts/docker-smoke.sh` similarly returns `64` for missing immutable CI
+inputs rather than substituting a mutable default.
 
 Only original-English Codeforces records with standard stdin/stdout, source attribution,
 acquisition hashes, conversion/reviewer linkage, and 15-cell quota evidence can progress. The

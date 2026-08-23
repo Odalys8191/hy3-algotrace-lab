@@ -4,7 +4,7 @@
   "python": "3.12",
   "runtime_image_identity": "registry.invalid/hy3-algotrace/runtime@sha256:0000000000000000000000000000000000000000000000000000000000000000",
   "docker_cli_package": "docker.io=UNATTESTED",
-  "content_sha256": "2d6bea88060149363a5546347461aade3d748aa71672f4a9066f0b5f336b022d",
+  "content_sha256": "e512a41ec685359bc5b7363eeb0ddc5b2f03e3e8f92e9ce7007946a5a5acb1be",
   "distributions": {
     "altair": "6.2.2",
     "annotated-doc": "0.0.5",
@@ -32,6 +32,7 @@
     "packaging": "26.3",
     "pandas": "3.0.5",
     "pillow": "12.3.0",
+    "pip": "25.0.1",
     "protobuf": "7.36.0",
     "pyarrow": "25.0.1",
     "pydantic": "2.13.4",
@@ -50,6 +51,7 @@
     "typing-inspection": "0.4.4",
     "urllib3": "2.7.0",
     "uvicorn": "0.52.4",
+    "watchdog": "6.0.0",
     "websockets": "16.1.1"
   }
 }

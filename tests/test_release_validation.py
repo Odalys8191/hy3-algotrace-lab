@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,94 @@ def test_release_validation_detects_generic_credential_assignment() -> None:
                 "README.md": "个人活动实战作品，非腾讯官方发布\n",
             }
         )
+
+
+def test_release_validation_rejects_secret_suffixed_to_a_placeholder_prefix() -> None:
+    """A marker must be an exact placeholder, not a prefix that hides a credential."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": "api_key=YOUR_API_KEY_live-secret-suffix\n",
+            }
+        )
+
+
+def test_release_validation_rejects_secret_after_environment_expansion() -> None:
+    """An environment placeholder is safe only when it is the entire assigned value."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": "api_key=${HY3_API_KEY}sk-proj-appended-secret\n",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "api_key=${HY3_API_KEY}",
+        "api_key=${HY3_API_KEY:-YOUR_HY3_API_KEY}",
+        "api_key=${HY3_API_KEY:?Set the authorised credential locally.}",
+        "token=${{ github.token }}",
+    ),
+)
+def test_release_validation_accepts_only_complete_runtime_expressions(assignment: str) -> None:
+    """Nonliteral CI/Compose expressions are safe only as a complete assigned value."""
+
+    report = validate_release_files(
+        {
+            "README.md": "个人活动实战作品，非腾讯官方发布\n",
+            "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+            "notes.py": f"{assignment}\n",
+        }
+    )
+
+    assert report.secret_findings == ()
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "api_key=${HY3_API_KEY}sk-proj-appended-secret",
+        "api_key=${HY3_API_KEY:-YOUR_HY3_API_KEY}sk-proj-appended-secret",
+        "api_key=${HY3_API_KEY:-sk-proj-default-secret}",
+        "api_key=${HY3_API_KEY:?Set the authorised credential locally.}sk-proj-appended-secret",
+        "token=${{ github.token }}sk-proj-appended-secret",
+    ),
+)
+def test_release_validation_rejects_secret_after_complete_runtime_expression(
+    assignment: str,
+) -> None:
+    """A complete expression cannot be followed by a real secret."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": f"{assignment}\n",
+            }
+        )
+
+
+def test_gitleaks_config_extends_defaults_with_anchored_placeholder_allowlist() -> None:
+    """The custom allowlist supplements official rules and cannot match a longer secret."""
+
+    config = tomllib.loads((REPOSITORY_ROOT / ".gitleaks.toml").read_text(encoding="utf-8"))
+
+    assert config["extend"]["useDefault"] is True
+    allowlist = config["allowlist"]
+    assert allowlist["regexTarget"] == "match"
+    assert all(
+        expression.startswith("^") and expression.endswith("$")
+        for expression in allowlist["regexes"]
+    )
 
 
 def test_release_validation_fixture_allowlist_requires_exact_path_identifier_and_value() -> None:

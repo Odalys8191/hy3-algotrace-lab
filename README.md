@@ -61,8 +61,10 @@ scripts/formal-readiness.sh # exits 3 while the persisted Task 7 Judge replay is
 scripts/formal-release-gate.sh # turns that pending state into a release-blocking failure
 ```
 
-The last command exits `3` while the Task 7 data layer or its frozen inputs are absent. That is
-the intended, honest not-ready signal.
+`formal-readiness.sh` exits `3` while Task 7 data/replay inputs are absent or the formal Judge
+bridge is unavailable; `formal-release-gate.sh` converts that pending state to release-blocking
+exit `1`. `docker-smoke.sh` exits `64` when immutable CI image inputs are missing. These are
+intended, honest not-ready signals, not successful verification.
 
 ## Local Compose build and run
 

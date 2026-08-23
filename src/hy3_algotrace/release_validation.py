@@ -33,7 +33,7 @@ _SECRET_NAME = r"(?:API(?:_)?KEY|TOKEN|SECRET|PASSWORD|PRIVATE(?:_)?KEY|CREDENTI
 _SECRET_ASSIGNMENT = re.compile(
     rf"(?mi)^\s*(?:export\s+)?((?:[A-Z][A-Z0-9_]*_)?{_SECRET_NAME})\s*"
     r"(?:=|:(?!\s*[A-Za-z_][A-Za-z0-9_]*\s*=))\s*"
-    r"[\"']?([^\s#\"']+)"
+    r"(.*?)\s*(?:#.*)?$"
 )
 _AUTHORIZATION_VALUE = re.compile(r"(?mi)^\s*authorization\s*[:=]\s*bearer\s+([^\s#]+)")
 _SKIP_DIRECTORIES = frozenset({".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv"})
@@ -44,6 +44,14 @@ _RUNTIME_LOCK_REQUIRED_DISTRIBUTIONS = frozenset(
 _PINNED_VERSION = re.compile(r"\d+(?:[A-Za-z0-9.+!_-]*\d)?\Z")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$")
 _DOCKER_CLI_PACKAGE = re.compile(r"^docker\.io=[A-Za-z0-9][A-Za-z0-9.+:~_-]*$")
+_NAMED_PLACEHOLDER = re.compile(
+    r"^(?:your|replace)_(?:[a-z0-9]+_)*(?:api_?key|token|secret|password|private_?key|credential)$"
+)
+_ENVIRONMENT_PLACEHOLDER = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+_COMPOSE_INTERPOLATION = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([-?])([^}]*))?\}$")
+_GITHUB_EXPRESSION = re.compile(
+    r"^\$\{\{\s*(?:github|secrets|vars|inputs|env)(?:\.[A-Za-z_][A-Za-z0-9_]*)+\s*\}\}$"
+)
 # A deliberate redaction fixture proves that an asynchronous exception cannot publish a raw
 # secret. It is the only static source fixture exemption: the exact path, identifier, and
 # SHA-256 of the literal must all match.  Keeping only a hash here prevents normal validation
@@ -288,7 +296,8 @@ def _runtime_lock_hash(payload: Mapping[object, object]) -> str:
 def _find_secret_assignments(files: Mapping[str, str]) -> tuple[str, ...]:
     findings: set[str] = set()
     for path, text in files.items():
-        for name, value in _SECRET_ASSIGNMENT.findall(text):
+        for name, raw_value in _SECRET_ASSIGNMENT.findall(text):
+            value = _unquote_assignment_value(raw_value.strip())
             expected_hash = _CONTROLLED_TEST_SECRET_FIXTURE_HASHES.get((path, name.casefold()))
             if expected_hash is not None and (
                 hashlib.sha256(value.encode("utf-8")).hexdigest() in expected_hash
@@ -305,14 +314,30 @@ def _find_secret_assignments(files: Mapping[str, str]) -> tuple[str, ...]:
 
 
 def _is_placeholder(value: str) -> bool:
+    value = value.strip()
     normalized = value.casefold()
+    compose_match = _COMPOSE_INTERPOLATION.fullmatch(value)
     return (
         normalized in {"", "changeme", "placeholder", "redacted"}
-        or normalized.startswith("your_")
-        or normalized.startswith("replace_")
-        or normalized.startswith("<")
-        or normalized.startswith("${")
+        or _NAMED_PLACEHOLDER.fullmatch(normalized) is not None
+        or (normalized.startswith("<") and normalized.endswith(">"))
+        or _ENVIRONMENT_PLACEHOLDER.fullmatch(value) is not None
+        or _GITHUB_EXPRESSION.fullmatch(value) is not None
+        or (
+            compose_match is not None
+            and (
+                compose_match.group(2) is None
+                or compose_match.group(2) == "?"
+                or _is_placeholder(compose_match.group(3))
+            )
+        )
     )
+
+
+def _unquote_assignment_value(value: str) -> str:
+    if len(value) >= 2 and value[:1] == value[-1:] and value[:1] in {'"', "'"}:
+        return value[1:-1]
+    return value
 
 
 def _is_nonliteral_assignment(value: str) -> bool:

@@ -16,23 +16,41 @@ for required in \
     "${HY3_FORMAL_QUOTA:-}" \
     "${HY3_FORMAL_BUNDLES:-}" \
     "${HY3_FORMAL_CORPUS:-}" \
-    "${HY3_FORMAL_CORPUS_AUDIT:-}" \
     "${HY3_FORMAL_JUDGE_EVIDENCE:-}" \
     "${HY3_FORMAL_JUDGE_RAW_EVIDENCE:-}" \
     "${HY3_FORMAL_VALIDATION_RAW:-}" \
     "${HY3_FORMAL_TEST_RAW:-}" \
-    "${HY3_FORMAL_VALIDATION_FORMAT:-}" \
-    "${HY3_FORMAL_TEST_FORMAT:-}" \
     "${HY3_FORMAL_VALIDATION_REVIEWS:-}" \
     "${HY3_FORMAL_TEST_REVIEWS:-}" \
     "${HY3_FORMAL_REVIEW_MANIFEST:-}" \
-    "${HY3_FORMAL_SELECTION_REPLAY_RECEIPT:-}" \
     "${HY3_FORMAL_DATA_ROOT:-}"; do
     if [ -z "$required" ] || [ ! -e "$required" ]; then
         printf '%s\n' 'formal data inputs are absent; formal readiness is not ready' >&2
         exit 3
     fi
 done
+
+for output in \
+    "${HY3_FORMAL_SELECTION_REPLAY_RECEIPT:-}" \
+    "${HY3_FORMAL_CORPUS_AUDIT:-}"; do
+    case "$output" in
+        */*) output_parent=${output%/*}; [ -n "$output_parent" ] || output_parent=/ ;;
+        *) output_parent=. ;;
+    esac
+    if [ -z "$output" ] || [ -e "$output" ] || [ ! -d "$output_parent" ]; then
+        printf '%s\n' 'formal create-only output is absent, already exists, or parent directory is not a directory; formal readiness is not ready' >&2
+        exit 3
+    fi
+done
+
+case "${HY3_FORMAL_VALIDATION_FORMAT:-}" in json|jsonl|parquet|riegeli) ;; *)
+    printf '%s\n' 'formal validation format is invalid; formal readiness is not ready' >&2
+    exit 3
+esac
+case "${HY3_FORMAL_TEST_FORMAT:-}" in json|jsonl|parquet|riegeli) ;; *)
+    printf '%s\n' 'formal test format is invalid; formal readiness is not ready' >&2
+    exit 3
+esac
 
 python -m hy3_algotrace.dataset_cli validate-selection-preliminary "$HY3_FORMAL_SELECTION" \
     --conversion "$HY3_FORMAL_CONVERSION_VALIDATION" \

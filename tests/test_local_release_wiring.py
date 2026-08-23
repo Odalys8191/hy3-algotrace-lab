@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -134,6 +135,7 @@ def test_docker_integration_runs_built_api_with_controlled_http_fixture() -> Non
     script = (REPOSITORY_ROOT / "scripts/docker-smoke.sh").read_text(encoding="utf-8")
     assert '--build-arg "HY3_APP_RUNTIME_IMAGE=$HY3_APP_RUNTIME_IMAGE"' in script
     assert '--build-arg "HY3_DOCKER_CLI_PACKAGE=$HY3_DOCKER_CLI_PACKAGE"' in script
+    assert "--tag hy3-algotrace-local:dev" in script
     assert "docker compose $compose_args up --detach --no-build api" in script
     assert "ci_stub_app" in script
     assert "http://127.0.0.1:8000/api/v1/problems" in script
@@ -168,6 +170,120 @@ def test_task7_combined_tree_contract_uses_current_secure_selection_commands() -
     data_lint = (REPOSITORY_ROOT / "scripts/data-lint.sh").read_text(encoding="utf-8")
     assert "validate-acquisition" in data_lint
     assert "--validation-id" not in data_lint
+
+
+def test_formal_readiness_creates_current_task7_outputs_without_overwrite(
+    tmp_path: Path,
+) -> None:
+    """The combined-tree path may create receipts/audits once, never treat them as inputs."""
+
+    package_root = tmp_path / "src" / "hy3_algotrace"
+    package_root.mkdir(parents=True)
+    (package_root / "__init__.py").write_text("", encoding="utf-8")
+    (package_root / "dataset_cli.py").write_text(
+        "from pathlib import Path\n"
+        "import sys\n"
+        "arguments = sys.argv[1:]\n"
+        "if '--output' in arguments:\n"
+        "    output = Path(arguments[arguments.index('--output') + 1])\n"
+        "    if output.exists():\n"
+        "        raise SystemExit(2)\n"
+        "    output.write_text(arguments[0], encoding='utf-8')\n",
+        encoding="utf-8",
+    )
+    formal_root = tmp_path / "formal"
+    formal_root.mkdir()
+    output_audit = formal_root / "corpus-audit.json"
+    output_receipt = formal_root / "selection-replay-receipt.json"
+    input_names = (
+        "selection",
+        "acquisition",
+        "acquisition-validation",
+        "conversion-validation",
+        "conversion-test",
+        "quota",
+        "bundles",
+        "corpus",
+        "judge-evidence",
+        "judge-raw-evidence",
+        "validation-raw",
+        "test-raw",
+        "validation-reviews",
+        "test-reviews",
+        "review-manifest",
+    )
+    inputs = {name: formal_root / f"{name}.json" for name in input_names}
+    for path in inputs.values():
+        path.write_text("input", encoding="utf-8")
+    environment = {
+        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
+        "PYTHONPATH": str(tmp_path / "src"),
+        "HY3_FORMAL_SELECTION": str(inputs["selection"]),
+        "HY3_FORMAL_ACQUISITION": str(inputs["acquisition"]),
+        "HY3_FORMAL_ACQUISITION_VALIDATION": str(inputs["acquisition-validation"]),
+        "HY3_FORMAL_CONVERSION_VALIDATION": str(inputs["conversion-validation"]),
+        "HY3_FORMAL_CONVERSION_TEST": str(inputs["conversion-test"]),
+        "HY3_FORMAL_QUOTA": str(inputs["quota"]),
+        "HY3_FORMAL_BUNDLES": str(inputs["bundles"]),
+        "HY3_FORMAL_CORPUS": str(inputs["corpus"]),
+        "HY3_FORMAL_JUDGE_EVIDENCE": str(inputs["judge-evidence"]),
+        "HY3_FORMAL_JUDGE_RAW_EVIDENCE": str(inputs["judge-raw-evidence"]),
+        "HY3_FORMAL_VALIDATION_RAW": str(inputs["validation-raw"]),
+        "HY3_FORMAL_TEST_RAW": str(inputs["test-raw"]),
+        "HY3_FORMAL_VALIDATION_FORMAT": "json",
+        "HY3_FORMAL_TEST_FORMAT": "jsonl",
+        "HY3_FORMAL_VALIDATION_REVIEWS": str(inputs["validation-reviews"]),
+        "HY3_FORMAL_TEST_REVIEWS": str(inputs["test-reviews"]),
+        "HY3_FORMAL_REVIEW_MANIFEST": str(inputs["review-manifest"]),
+        "HY3_FORMAL_SELECTION_REPLAY_RECEIPT": str(output_receipt),
+        "HY3_FORMAL_CORPUS_AUDIT": str(output_audit),
+        "HY3_FORMAL_DATA_ROOT": str(formal_root),
+    }
+    script = REPOSITORY_ROOT / "scripts/formal-readiness.sh"
+
+    first = subprocess.run(
+        ["sh", str(script)],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert first.returncode == 3
+    assert output_receipt.read_text(encoding="utf-8") == "verify-selection-chain"
+    assert output_audit.read_text(encoding="utf-8") == "lint-corpus"
+
+    second = subprocess.run(
+        ["sh", str(script)],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert second.returncode == 3
+    assert output_receipt.read_text(encoding="utf-8") == "verify-selection-chain"
+    assert output_audit.read_text(encoding="utf-8") == "lint-corpus"
+
+    missing_output_parent = formal_root / "missing-output-parent"
+    environment["HY3_FORMAL_SELECTION_REPLAY_RECEIPT"] = str(
+        missing_output_parent / "selection-replay-receipt.json"
+    )
+    environment["HY3_FORMAL_CORPUS_AUDIT"] = str(missing_output_parent / "corpus-audit.json")
+    missing_parent = subprocess.run(
+        ["sh", str(script)],
+        cwd=tmp_path,
+        env=environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert missing_parent.returncode == 3
+    assert "parent directory" in missing_parent.stderr
+    assert not missing_output_parent.exists()
 
 
 def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates() -> None:

@@ -50,7 +50,7 @@ docker build \
     --file docker/app/Dockerfile \
     --build-arg "HY3_APP_RUNTIME_IMAGE=$HY3_APP_RUNTIME_IMAGE" \
     --build-arg "HY3_DOCKER_CLI_PACKAGE=$HY3_DOCKER_CLI_PACKAGE" \
-    --tag hy3-algotrace-local:ci .
+    --tag hy3-algotrace-local:dev .
 
 validator_repository=${HY3_JUDGE_VALIDATOR_IMAGE%@sha256:*}
 validator_digest=${HY3_JUDGE_VALIDATOR_IMAGE#*@sha256:}
