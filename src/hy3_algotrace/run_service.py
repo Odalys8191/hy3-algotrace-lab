@@ -84,6 +84,20 @@ _PUBLIC_PATH_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
         ),
         "[REDACTED]",
     ),
+    (
+        re.compile(
+            rf"(?i)(\b(?:path|directory|dir|file|root|config)\s+)"
+            rf"/(?!/){_POSIX_PATH_TOKEN}(?=\s|[,;:.)\]}}'\"]|$)"
+        ),
+        r"\1[REDACTED]",
+    ),
+    (
+        re.compile(
+            rf"(?<![\w:/])/(?!/){_POSIX_PATH_TOKEN}"
+            r"(?=[,;:.)\]}'\"]|$)"
+        ),
+        "[REDACTED]",
+    ),
 )
 _PROTECTED_KEY_PARTS = (
     "hidden",
