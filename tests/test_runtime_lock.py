@@ -57,11 +57,14 @@ def test_runtime_lock_hash_covers_the_image_identity(monkeypatch: pytest.MonkeyP
 
 
 def test_linux_runtime_lock_includes_streamlit_watcher_and_build_pip() -> None:
-    """The Linux production image closure covers Streamlit's watcher and Dockerfile pip."""
+    """The Linux production image closure covers Streamlit and Hatchling runtime needs."""
 
     lock = json.loads((REPOSITORY_ROOT / "docker/release-runtime-lock.json").read_text())
 
     assert lock["distributions"]["watchdog"] == "6.0.0"
     assert lock["distributions"]["pip"] == "25.0.1"
+    assert lock["distributions"]["pathspec"] == "1.1.1"
+    assert lock["distributions"]["pluggy"] == "1.6.0"
+    assert lock["distributions"]["trove-classifiers"] == "2026.6.1.19"
     dockerfile = (REPOSITORY_ROOT / "docker/app/Dockerfile").read_text(encoding="utf-8")
     assert "python -m pip install" in dockerfile

@@ -39,18 +39,39 @@ _AUTHORIZATION_VALUE = re.compile(r"(?mi)^\s*authorization\s*[:=]\s*bearer\s+([^
 _SKIP_DIRECTORIES = frozenset({".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv"})
 _TEXT_SUFFIXES = frozenset({"", ".example", ".json", ".md", ".py", ".sh", ".toml", ".yaml", ".yml"})
 _RUNTIME_LOCK_REQUIRED_DISTRIBUTIONS = frozenset(
-    {"fastapi", "hatchling", "httpx", "pydantic", "streamlit", "uvicorn"}
+    {
+        "fastapi",
+        "hatchling",
+        "httpx",
+        "pathspec",
+        "pluggy",
+        "pydantic",
+        "streamlit",
+        "trove-classifiers",
+        "uvicorn",
+    }
 )
 _PINNED_VERSION = re.compile(r"\d+(?:[A-Za-z0-9.+!_-]*\d)?\Z")
 _IMAGE_REFERENCE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$")
 _DOCKER_CLI_PACKAGE = re.compile(r"^docker\.io=[A-Za-z0-9][A-Za-z0-9.+:~_-]*$")
 _NAMED_PLACEHOLDER = re.compile(
-    r"^(?:your|replace)_(?:[a-z0-9]+_)*(?:api_?key|token|secret|password|private_?key|credential)$"
+    r"^(?:your|replace)_(?:hy3_)?(?:api_?key|token|secret|password|private_?key|credential)$"
 )
 _ENVIRONMENT_PLACEHOLDER = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
 _COMPOSE_INTERPOLATION = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([-?])([^}]*))?\}$")
 _GITHUB_EXPRESSION = re.compile(
     r"^\$\{\{\s*(?:github|secrets|vars|inputs|env)(?:\.[A-Za-z_][A-Za-z0-9_]*)+\s*\}\}$"
+)
+_COMPOSE_SECRET_REQUIRED_MESSAGES = frozenset({"Set the authorised Hy3 credential locally."})
+_ENVIRONMENT_VARIABLE_LITERAL = r"[\"'][A-Za-z_][A-Za-z0-9_]*[\"']"
+_SAFE_NONLITERAL_SECRET_ASSIGNMENT = re.compile(
+    rf"^(?:"
+    rf"os\.getenv\(\s*{_ENVIRONMENT_VARIABLE_LITERAL}\s*\)"
+    rf"|os\.environ\.get\(\s*{_ENVIRONMENT_VARIABLE_LITERAL}"
+    rf"\s*(?:,\s*(?:None|[\"'][\"']))?\s*\)"
+    rf"|os\.environ\[\s*{_ENVIRONMENT_VARIABLE_LITERAL}\s*\]"
+    rf"|field\(\s*repr\s*=\s*False\s*\)"
+    rf")$"
 )
 # A deliberate redaction fixture proves that an asynchronous exception cannot publish a raw
 # secret. It is the only static source fixture exemption: the exact path, identifier, and
@@ -317,20 +338,20 @@ def _is_placeholder(value: str) -> bool:
     value = value.strip()
     normalized = value.casefold()
     compose_match = _COMPOSE_INTERPOLATION.fullmatch(value)
+    compose_is_safe = compose_match is not None and (
+        compose_match.group(2) is None
+        or (
+            compose_match.group(2) == "?"
+            and compose_match.group(3) in _COMPOSE_SECRET_REQUIRED_MESSAGES
+        )
+        or (compose_match.group(2) == "-" and _is_placeholder(compose_match.group(3)))
+    )
     return (
         normalized in {"", "changeme", "placeholder", "redacted"}
         or _NAMED_PLACEHOLDER.fullmatch(normalized) is not None
-        or (normalized.startswith("<") and normalized.endswith(">"))
         or _ENVIRONMENT_PLACEHOLDER.fullmatch(value) is not None
         or _GITHUB_EXPRESSION.fullmatch(value) is not None
-        or (
-            compose_match is not None
-            and (
-                compose_match.group(2) is None
-                or compose_match.group(2) == "?"
-                or _is_placeholder(compose_match.group(3))
-            )
-        )
+        or compose_is_safe
     )
 
 
@@ -343,7 +364,7 @@ def _unquote_assignment_value(value: str) -> str:
 def _is_nonliteral_assignment(value: str) -> bool:
     """Do not mistake a source expression which fetches a secret for a literal secret."""
 
-    return value.startswith(("os.", "field(", "getenv(", "environ["))
+    return _SAFE_NONLITERAL_SECRET_ASSIGNMENT.fullmatch(value) is not None
 
 
 def _release_files(root: Path) -> tuple[Path, ...]:

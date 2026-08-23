@@ -115,7 +115,7 @@ def test_release_validation_rejects_secret_after_environment_expansion() -> None
     (
         "api_key=${HY3_API_KEY}",
         "api_key=${HY3_API_KEY:-YOUR_HY3_API_KEY}",
-        "api_key=${HY3_API_KEY:?Set the authorised credential locally.}",
+        "api_key=${HY3_API_KEY:?Set the authorised Hy3 credential locally.}",
         "token=${{ github.token }}",
     ),
 )
@@ -147,6 +147,78 @@ def test_release_validation_rejects_secret_after_complete_runtime_expression(
     assignment: str,
 ) -> None:
     """A complete expression cannot be followed by a real secret."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": f"{assignment}\n",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        "api_key=${HY3_API_KEY:?sk-proj-message-secret}",
+        "api_key=${HY3_API_KEY:?random-credential-message}",
+        "api_key=<YOUR_API_KEY><credential-suffix>",
+        "api_key=YOUR_CREDENTIAL_API_KEY",
+    ),
+)
+def test_release_validation_rejects_credential_disguised_as_a_placeholder(
+    assignment: str,
+) -> None:
+    """Only exact, repository-approved placeholder forms may suppress secret findings."""
+
+    with pytest.raises(ReleaseValidationError, match="secret-like value"):
+        validate_release_files(
+            {
+                "README.md": "个人活动实战作品，非腾讯官方发布\n",
+                "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+                "notes.py": f"{assignment}\n",
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        'api_key=os.getenv("HY3_API_KEY")',
+        'api_key=os.environ.get("HY3_API_KEY", "")',
+        'api_key=os.environ["HY3_API_KEY"]',
+        "api_key=field(repr=False)",
+    ),
+)
+def test_release_validation_accepts_only_whole_safe_secret_access_expressions(
+    assignment: str,
+) -> None:
+    """Source accessors may be nonliteral only as exact safe expressions."""
+
+    report = validate_release_files(
+        {
+            "README.md": "个人活动实战作品，非腾讯官方发布\n",
+            "compose.yaml": 'services:\n  api:\n    ports: ["127.0.0.1:8000:8000"]\n',
+            "notes.py": f"{assignment}\n",
+        }
+    )
+
+    assert report.secret_findings == ()
+
+
+@pytest.mark.parametrize(
+    "assignment",
+    (
+        'api_key=os.getenv("HY3_API_KEY") + "sk-proj-appended-secret"',
+        'api_key=os.environ.get("HY3_API_KEY", "sk-proj-default-secret")',
+        'api_key=field(repr=False) + "sk-proj-appended-secret"',
+    ),
+)
+def test_release_validation_rejects_secret_accessor_expression_composition(
+    assignment: str,
+) -> None:
+    """An accessor prefix cannot mask a literal appended or supplied as a default."""
 
     with pytest.raises(ReleaseValidationError, match="secret-like value"):
         validate_release_files(

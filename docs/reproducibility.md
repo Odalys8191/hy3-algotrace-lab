@@ -40,6 +40,14 @@ there is no obtainable attested runtime image yet, and that is a release blocker
 reproducibility claim. A changed lock, runtime digest, package version, or Judge input creates a
 new configuration; it never replaces a prior result.
 
+The Hatchling `1.27.0` official PyPI core metadata declares `packaging>=24.2`,
+`pathspec>=0.10.1`, `pluggy>=1.0.0`, and `trove-classifiers` (with `tomli` only below Python
+3.11). Accordingly, the Python 3.12 lock records `pathspec==1.1.1`, `pluggy==1.6.0`, and
+`trove-classifiers==2026.6.1.19` alongside the existing `packaging` row. This is a dependency
+declaration derived from PyPI metadata, not evidence that these wheels have been built or
+attested together in Linux; the `registry.invalid` sentinel continues to block release until
+that independent runtime attestation exists.
+
 Reserve every remote model attempt before sending it; record transport failure and response
 hash afterwards. Cache hits cost zero. A run that exceeds 500 reserved attempts, lacks a ledger
 entry, or has a broken artifact linkage is immutable partial evidence and cannot be called a
