@@ -1,1 +1,1 @@
-{"accepted_algorithm":"linear scan","complexity_ceiling":"O(n)"}
+{"accepted_algorithm_families":["project-authored fixture"],"adversarial_cases":["Hidden fixture case."],"complexity_ceiling":"O(n)","decisive_facts":["No third-party provenance is claimed."],"key_invariants":["Fixture output matches its authored behavior."],"known_traps":["Synthetic fixture: excluded from formal metrics."],"problem_id":"pilot-count-positive","reference_solution_hash":"9d0785f7df9230a9615eca4d1fac5a3056961ee0dc985ca2442a0d82dc1d93fa","schema_version":"1.2"}

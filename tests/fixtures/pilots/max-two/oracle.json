@@ -1,1 +1,1 @@
-{"accepted_algorithm":"single comparison","complexity_ceiling":"O(1)"}
+{"accepted_algorithm_families":["project-authored fixture"],"adversarial_cases":["Hidden fixture case."],"complexity_ceiling":"O(n)","decisive_facts":["No third-party provenance is claimed."],"key_invariants":["Fixture output matches its authored behavior."],"known_traps":["Synthetic fixture: excluded from formal metrics."],"problem_id":"pilot-max-two","reference_solution_hash":"3fcec2c1f1c657385d095d2f96cfd918b98a89901891a70df2042f06eb64075b","schema_version":"1.2"}
