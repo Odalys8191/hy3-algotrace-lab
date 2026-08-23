@@ -5,6 +5,9 @@ import json
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
+
+import hy3_algotrace.dataset_models as dataset_models
 from hy3_algotrace.dataset_cli import main
 from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
@@ -12,11 +15,50 @@ from hy3_algotrace.dataset_models import (
     CandidateReview,
     CheckerKind,
     ConversionTool,
+    validate_acquired_assets,
 )
 
 
 def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _write_validation_report(
+    tmp_path: Path,
+    source: Path,
+    *,
+    split: str,
+    converter: ConversionTool,
+) -> Path:
+    other_split = "test" if split == "validation" else "validation"
+    other = tmp_path / f"{other_split}-raw.json"
+    other.write_text("[]", encoding="utf-8")
+    paths = {split: source, other_split: other}
+    assets = tuple(
+        AcquisitionAsset(
+            split=item,
+            url=f"https://example.invalid/{item}.json",
+            byte_length=len(paths[item].read_bytes()),
+            sha256=hashlib.sha256(paths[item].read_bytes()).hexdigest(),
+            license="CC-BY-4.0 plus third-party terms",
+            attribution="Google DeepMind CodeContests and Codeforces",
+        )
+        for item in ("validation", "test")
+    )
+    manifest = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=assets,
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    report = validate_acquired_assets(
+        manifest,
+        paths,
+        logical_ids={"validation": "validation-raw", "test": "test-raw"},
+    )
+    output = tmp_path / f"{split}-validation-report.json"
+    _write_json(output, report.model_dump(mode="json"))
+    return output
 
 
 def test_cli_validates_external_acquisition_and_writes_create_only_report(
@@ -63,6 +105,10 @@ def test_cli_validates_external_acquisition_and_writes_create_only_report(
         str(valid_path),
         "--test",
         str(test_path),
+        "--validation-id",
+        "official-validation",
+        "--test-id",
+        "official-test",
         "--output",
         str(output),
     ]
@@ -71,6 +117,80 @@ def test_cli_validates_external_acquisition_and_writes_create_only_report(
     assert json.loads(output.read_text(encoding="utf-8"))["valid"] is True
     assert main(argv) == 2
     assert "create-only" in capsys.readouterr().err
+
+
+def test_cli_reads_manifest_from_one_trusted_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CLI input path swap after open cannot replace the parsed manifest bytes."""
+
+    validation_bytes = b"validation"
+    test_bytes = b"test"
+    validation_path = tmp_path / "validation.riegeli"
+    test_path = tmp_path / "test.riegeli"
+    validation_path.write_bytes(validation_bytes)
+    test_path.write_bytes(test_bytes)
+    manifest = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=(
+            AcquisitionAsset(
+                split="validation",
+                url="https://example.invalid/validation.riegeli",
+                byte_length=len(validation_bytes),
+                sha256=hashlib.sha256(validation_bytes).hexdigest(),
+                license="CC-BY-4.0 plus third-party terms",
+                attribution="Google DeepMind CodeContests and Codeforces",
+            ),
+            AcquisitionAsset(
+                split="test",
+                url="https://example.invalid/test.riegeli",
+                byte_length=len(test_bytes),
+                sha256=hashlib.sha256(test_bytes).hexdigest(),
+                license="CC-BY-4.0 plus third-party terms",
+                attribution="Google DeepMind CodeContests and Codeforces",
+            ),
+        ),
+        converter=ConversionTool(name="riegeli", version="1"),
+        third_party_terms_acknowledged=True,
+    )
+    manifest_path = tmp_path / "acquisition.json"
+    _write_json(manifest_path, manifest.model_dump(mode="json"))
+    saved = tmp_path / "acquisition-before-swap.json"
+    attacker = tmp_path / "attacker.json"
+    attacker.write_text("{}", encoding="utf-8")
+    real_open = dataset_models.os.open
+    swapped = False
+
+    def swap_after_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        file_fd = real_open(path, *args, **kwargs)
+        if path == manifest_path.name and kwargs.get("dir_fd") is not None and not swapped:
+            manifest_path.rename(saved)
+            manifest_path.symlink_to(attacker)
+            swapped = True
+        return file_fd
+
+    monkeypatch.setattr(dataset_models.os, "open", swap_after_open)
+
+    exit_code = main(
+        [
+            "validate-acquisition",
+            str(manifest_path),
+            "--validation",
+            str(validation_path),
+            "--test",
+            str(test_path),
+            "--validation-id",
+            "validation-raw",
+            "--test-id",
+            "test-raw",
+            "--output",
+            str(tmp_path / "report.json"),
+        ]
+    )
+
+    assert swapped is True
+    assert exit_code == 0
 
 
 def test_cli_conversion_and_quota_preserve_unfulfilled_status(tmp_path: Path, capsys) -> None:  # type: ignore[no-untyped-def]
@@ -107,6 +227,13 @@ def test_cli_conversion_and_quota_preserve_unfulfilled_status(tmp_path: Path, ca
     reviews = tmp_path / "reviews.json"
     _write_json(reviews, [review.model_dump(mode="json")])
     conversion = tmp_path / "conversion.json"
+    converter = ConversionTool(name="json-reader", version="1")
+    validation_report = _write_validation_report(
+        tmp_path,
+        source,
+        split="validation",
+        converter=converter,
+    )
 
     assert (
         main(
@@ -123,6 +250,8 @@ def test_cli_conversion_and_quota_preserve_unfulfilled_status(tmp_path: Path, ca
                 "json-reader",
                 "--converter-version",
                 "1",
+                "--validation-report",
+                str(validation_report),
                 "--output",
                 str(conversion),
             ]
@@ -146,6 +275,12 @@ def test_cli_errors_are_sanitized_and_do_not_echo_hidden_row_content(
     source.write_text('{"private_tests":"DO_NOT_PRINT"', encoding="utf-8")
     reviews = tmp_path / "reviews.json"
     _write_json(reviews, [])
+    validation_report = _write_validation_report(
+        tmp_path,
+        source,
+        split="test",
+        converter=ConversionTool(name="json-reader", version="1"),
+    )
 
     assert (
         main(
@@ -162,6 +297,8 @@ def test_cli_errors_are_sanitized_and_do_not_echo_hidden_row_content(
                 "json-reader",
                 "--converter-version",
                 "1",
+                "--validation-report",
+                str(validation_report),
                 "--output",
                 str(tmp_path / "out.json"),
             ]

@@ -20,6 +20,7 @@ from hy3_algotrace.corpus import (
 )
 from hy3_algotrace.dataset_models import (
     AcquisitionManifest,
+    AcquisitionValidationReport,
     CandidateConversionReport,
     CandidateReview,
     ConversionTool,
@@ -31,6 +32,7 @@ from hy3_algotrace.dataset_models import (
     build_quota_report,
     convert_codecontests_file,
     freeze_selection,
+    read_trusted_file,
     validate_acquired_assets,
     validate_frozen_selection,
 )
@@ -74,6 +76,8 @@ def _parser() -> argparse.ArgumentParser:
     acquisition.add_argument("manifest", type=Path)
     acquisition.add_argument("--validation", type=Path, required=True)
     acquisition.add_argument("--test", type=Path, required=True)
+    acquisition.add_argument("--validation-id", required=True)
+    acquisition.add_argument("--test-id", required=True)
     acquisition.add_argument("--output", type=Path, required=True)
     acquisition.set_defaults(handler=_validate_acquisition)
 
@@ -88,6 +92,7 @@ def _parser() -> argparse.ArgumentParser:
     convert.add_argument("--reviews", type=Path, required=True)
     convert.add_argument("--converter-name", required=True)
     convert.add_argument("--converter-version", required=True)
+    convert.add_argument("--validation-report", type=Path, required=True)
     convert.add_argument("--converter-arg", action="append", default=[])
     convert.add_argument("--output", type=Path, required=True)
     convert.set_defaults(handler=_convert)
@@ -102,6 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     freeze.add_argument("--conversion", type=Path, action="append", required=True)
     freeze.add_argument("--quota", type=Path, required=True)
     freeze.add_argument("--acquisition", type=Path, required=True)
+    freeze.add_argument("--validation-report", type=Path, required=True)
     freeze.add_argument("--output", type=Path, required=True)
     freeze.set_defaults(handler=_freeze_selection)
 
@@ -110,6 +116,7 @@ def _parser() -> argparse.ArgumentParser:
     selection.add_argument("--conversion", type=Path, action="append", required=True)
     selection.add_argument("--quota", type=Path, required=True)
     selection.add_argument("--acquisition", type=Path, required=True)
+    selection.add_argument("--validation-report", type=Path, required=True)
     selection.set_defaults(handler=_validate_selection)
 
     bundles = commands.add_parser("lint-bundles")
@@ -133,6 +140,10 @@ def _validate_acquisition(arguments: argparse.Namespace) -> int:
     report = validate_acquired_assets(
         manifest,
         {"validation": arguments.validation, "test": arguments.test},
+        logical_ids={
+            "validation": arguments.validation_id,
+            "test": arguments.test_id,
+        },
     )
     _write_model(arguments.output, report)
     print(arguments.output)
@@ -154,6 +165,10 @@ def _convert(arguments: argparse.Namespace) -> int:
         converter=ConversionTool(
             name=arguments.converter_name,
             version=arguments.converter_version,
+        ),
+        acquisition_validation=_read_model(
+            AcquisitionValidationReport,
+            arguments.validation_report,
         ),
         converter_argv=tuple(arguments.converter_arg) or None,
     )
@@ -183,11 +198,16 @@ def _freeze_selection(arguments: argparse.Namespace) -> int:
     )
     quota = _read_model(EligibilityQuotaReport, arguments.quota)
     acquisition = _read_model(AcquisitionManifest, arguments.acquisition)
+    validation = _read_model(
+        AcquisitionValidationReport,
+        arguments.validation_report,
+    )
     manifest = freeze_selection(
         selected_ids,
         conversions=conversions,
         quota=quota,
         acquisition=acquisition,
+        acquisition_validation=validation,
     )
     _write_model(arguments.output, manifest)
     print(arguments.output)
@@ -201,11 +221,16 @@ def _validate_selection(arguments: argparse.Namespace) -> int:
     )
     quota = _read_model(EligibilityQuotaReport, arguments.quota)
     acquisition = _read_model(AcquisitionManifest, arguments.acquisition)
+    validation = _read_model(
+        AcquisitionValidationReport,
+        arguments.validation_report,
+    )
     manifest = validate_frozen_selection(
         payload,
         conversions=conversions,
         quota=quota,
         acquisition=acquisition,
+        acquisition_validation=validation,
     )
     print(manifest.content_hash)
     return 0
@@ -256,9 +281,15 @@ def _read_json(path: Path) -> Any:
 
 
 def _read_text(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise DatasetDataError("input must be a regular non-symlink file")
-    return path.read_text(encoding="utf-8")
+    snapshot = read_trusted_file(
+        path,
+        logical_id="cli-input",
+        max_bytes=256 * 1024 * 1024,
+    )
+    try:
+        return snapshot.contents.decode("utf-8")
+    except UnicodeError as error:
+        raise DatasetDataError("input must be valid UTF-8") from error
 
 
 def _write_model(path: Path, model: BaseModel) -> None:

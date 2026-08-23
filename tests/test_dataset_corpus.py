@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
 
 import pytest
 from pydantic import ValidationError
 
+import hy3_algotrace.dataset_models as dataset_models
 from hy3_algotrace.artifacts import canonical_json_bytes, sha256_json
 from hy3_algotrace.catalog import problem_content_hash
 from hy3_algotrace.contracts import (
@@ -29,6 +31,7 @@ from hy3_algotrace.corpus import (
     ArtifactProvenance,
     ArtifactRef,
     AuthoredBundleEntry,
+    AuthoringAttestation,
     CorpusDataError,
     CorpusSample,
     CorpusSampleKind,
@@ -45,9 +48,12 @@ from hy3_algotrace.corpus import (
 from hy3_algotrace.dataset_models import FrozenSelectionEntry, FrozenSelectionManifest
 from hy3_algotrace.differential import (
     DifferentialDataError,
+    FormalCorpusJudgeValidationReport,
+    FormalCorpusJudgeValidationResult,
     JudgeCaseKind,
     JudgeSourceCase,
     validate_formal_corpus_judge_cases,
+    validate_persisted_formal_judge_evidence,
 )
 
 
@@ -129,11 +135,13 @@ def _selection() -> FrozenSelectionManifest:
         "schema_version": "1.2",
         "kind": "formal_codecontests_selection_v2",
         "acquisition_manifest_hash": "d" * 64,
+        "acquisition_validation_hash": "9" * 64,
         "quota_report_hash": "e" * 64,
         "entries": [entry.model_dump(mode="json") for entry in entries],
     }
     return FrozenSelectionManifest(
         acquisition_manifest_hash="d" * 64,
+        acquisition_validation_hash="9" * 64,
         quota_report_hash="e" * 64,
         entries=tuple(entries),
         content_hash=sha256_json(payload),
@@ -218,7 +226,16 @@ def _bundle_entries(
                 oracle=oracle,
                 gold_trace=gold,
                 mutants=mutants,
-                authoring_attestation="project_authored",
+                authoring_attestation=AuthoringAttestation.create(
+                    reviewer="project-reviewer",
+                    reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
+                    evidence_logical_id=f"review-{selected.problem_id}",
+                    evidence_sha256=sha256_json(f"human review evidence:{selected.problem_id}"),
+                    source_provenance="project_authored_no_submitted_code",
+                    source_provenance_sha256=sha256_json(
+                        f"project source provenance:{selected.problem_id}"
+                    ),
+                ),
                 third_party_submitted_code_included=False,
             )
         )
@@ -465,6 +482,78 @@ def test_project_bundle_lint_binds_selection_authorship_and_file_bytes(tmp_path:
         AuthoredBundleEntry.model_validate_json(json.dumps(invalid))
 
 
+def test_bundle_lint_reads_each_artifact_from_one_openat_descriptor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Replacing an artifact pathname with a symlink after open cannot alter lint bytes."""
+
+    selection = _selection()
+    entries = _bundle_entries(tmp_path, selection)
+    manifest = build_project_bundle_manifest(selection, entries)
+    reference = tmp_path / entries[0].reference_cpp.path
+    saved = tmp_path / "reference-before-swap.cpp"
+    replacement = tmp_path / "attacker.cpp"
+    replacement.write_text("attacker replacement", encoding="utf-8")
+    real_open = dataset_models.os.open
+    swapped = False
+
+    def swap_after_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        file_fd = real_open(path, *args, **kwargs)
+        if path == "reference.cpp" and kwargs.get("dir_fd") is not None and not swapped:
+            reference.rename(saved)
+            reference.symlink_to(replacement)
+            swapped = True
+        return file_fd
+
+    monkeypatch.setattr(dataset_models.os, "open", swap_after_open)
+
+    validated = lint_project_bundles(
+        manifest.model_dump(mode="json"),
+        root=tmp_path,
+        selection=selection,
+    )
+
+    assert swapped is True
+    assert validated == manifest
+
+
+def test_bundle_lint_requires_human_attestation_and_rejects_provenance_markers(
+    tmp_path: Path,
+) -> None:
+    """Self-consistent source bytes still fail on hidden/submission provenance markers."""
+
+    selection = _selection()
+    entries = _bundle_entries(tmp_path, selection)
+    assert entries[0].authoring_attestation.human_review_required is True
+    invalid_attestation = entries[0].authoring_attestation.model_dump(mode="json")
+    invalid_attestation["content_hash"] = "f" * 64
+    with pytest.raises(ValidationError, match="content_hash"):
+        AuthoringAttestation.model_validate_json(json.dumps(invalid_attestation))
+
+    mutant = entries[0].mutants[0]
+    marker_bytes = b"// generated_tests copied metadata\nint main() { return 1; }\n"
+    (tmp_path / mutant.path).write_bytes(marker_bytes)
+    marker_ref = mutant.model_copy(
+        update={
+            "byte_length": len(marker_bytes),
+            "sha256": hashlib.sha256(marker_bytes).hexdigest(),
+        }
+    )
+    changed_entry = entries[0].model_copy(update={"mutants": (marker_ref, entries[0].mutants[1])})
+    marker_manifest = build_project_bundle_manifest(
+        selection,
+        (changed_entry, *entries[1:]),
+    )
+
+    with pytest.raises(CorpusDataError, match="forbidden provenance marker"):
+        lint_project_bundles(
+            marker_manifest.model_dump(mode="json"),
+            root=tmp_path,
+            selection=selection,
+        )
+
+
 def test_pending_corpus_proves_30_60_15_and_reports_natural_60_pending(tmp_path: Path) -> None:
     """Missing credentials may defer natural outputs but cannot alter controlled counts."""
 
@@ -593,7 +682,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
             verdict = JudgeStatus.WA if "mutant" in cpp_source else JudgeStatus.AC
             return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=verdict)
 
-    report = validate_formal_corpus_judge_cases(
+    result = validate_formal_corpus_judge_cases(
         corpus=manifest,
         selection=selection,
         bundle_manifest=bundle_manifest,
@@ -601,8 +690,68 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
         judge=SemanticJudge(),
     )
 
-    assert report.formal_eligibility is True
-    assert report.validation.counts == {"gold": 30, "mutant": 60, "paradox": 15}
+    assert result.formal_eligibility is True
+    report = result.evidence_manifest
+    serialized = report.model_dump_json()
+    assert "formal_eligibility" not in serialized
+    assert len(report.cases) == 105
+    with pytest.raises(TypeError):
+        FormalCorpusJudgeValidationResult(evidence_manifest=report)
+    raw_evidence = {
+        case.case_id: JudgeEvidence(
+            compile_status=JudgeStatus.AC,
+            verdict=JudgeStatus.WA if case.kind is JudgeCaseKind.MUTANT else JudgeStatus.AC,
+        )
+        for case in cases
+    }
+    replayed = validate_persisted_formal_judge_evidence(
+        report.model_dump(mode="json"),
+        corpus=manifest,
+        selection=selection,
+        bundle_manifest=bundle_manifest,
+        cases=cases,
+        raw_evidence=raw_evidence,
+    )
+    assert replayed.formal_eligibility is True
+    assert replayed.evidence_manifest == report
+
+    forged = report.model_dump(mode="json")
+    forged["cases"][0]["judge_evidence_hash"] = "0" * 64
+    forged["content_hash"] = sha256_json(
+        {key: value for key, value in forged.items() if key != "content_hash"}
+    )
+    with pytest.raises(ValidationError):
+        FormalCorpusJudgeValidationReport.model_validate_json(json.dumps(forged))
+
+    replaced_evidence = report.model_dump(mode="json")
+    replaced_evidence["cases"][0]["judge_evidence_hash"] = "f" * 64
+    replaced_evidence["content_hash"] = sha256_json(
+        {key: value for key, value in replaced_evidence.items() if key != "content_hash"}
+    )
+    with pytest.raises(DifferentialDataError, match="evidence hash mismatch"):
+        validate_persisted_formal_judge_evidence(
+            replaced_evidence,
+            corpus=manifest,
+            selection=selection,
+            bundle_manifest=bundle_manifest,
+            cases=cases,
+            raw_evidence=raw_evidence,
+        )
+
+    replaced_chain = report.model_dump(mode="json")
+    replaced_chain["bundle_manifest_hash"] = "f" * 64
+    replaced_chain["content_hash"] = sha256_json(
+        {key: value for key, value in replaced_chain.items() if key != "content_hash"}
+    )
+    with pytest.raises(DifferentialDataError, match="chain hashes"):
+        validate_persisted_formal_judge_evidence(
+            replaced_chain,
+            corpus=manifest,
+            selection=selection,
+            bundle_manifest=bundle_manifest,
+            cases=cases,
+            raw_evidence=raw_evidence,
+        )
     with pytest.raises(DifferentialDataError, match="exactly match"):
         validate_formal_corpus_judge_cases(
             corpus=manifest,

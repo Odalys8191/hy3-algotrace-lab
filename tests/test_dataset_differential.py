@@ -224,10 +224,10 @@ def test_differential_interface_rejects_duplicate_cases_and_runner_failure() -> 
             return DifferentialExecution(
                 status=DifferentialExecutionStatus.RUNTIME_ERROR,
                 stdout="",
-                diagnostics="runner failed",
+                diagnostics="RAW_RUNNER_SECRET_DO_NOT_PRINT",
             )
 
-    with pytest.raises(DifferentialDataError, match="runner failed"):
+    with pytest.raises(DifferentialDataError, match="runner failed") as captured:
         run_differential_tests(
             problem_id="cf-6000-a",
             reference_cpp="// reference",
@@ -236,3 +236,5 @@ def test_differential_interface_rejects_duplicate_cases_and_runner_failure() -> 
             time_limit_ms=1000,
             memory_limit_mb=256,
         )
+    assert str(captured.value) == "differential runner failed for same"
+    assert "RAW_RUNNER_SECRET_DO_NOT_PRINT" not in str(captured.value)

@@ -13,9 +13,12 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +42,9 @@ from hy3_algotrace.contracts import ProblemRecord, RatingBand, Topic
 DATASET_SCHEMA_VERSION: Final[Literal["1.2"]] = "1.2"
 _PROBLEM_ID_PATTERN = re.compile(r"^cf-(?P<contest>[1-9][0-9]*)-(?P<index>[a-z0-9]+)$")
 _MAX_CONVERTER_DIAGNOSTICS = 2_000
+_DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
+_LOGICAL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._:-]{0,127}$")
 
 _TOPIC_TAGS: Mapping[Topic, frozenset[str]] = {
     Topic.CONSTRUCTION_SIMULATION: frozenset({"constructive algorithms", "implementation"}),
@@ -57,6 +63,16 @@ class DatasetModel(BaseModel):
     """Strict base for Task 7 artifacts without changing shared contracts."""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+
+@dataclass(frozen=True, slots=True)
+class TrustedFileSnapshot:
+    """Bytes and observations obtained from one already-open regular file."""
+
+    logical_id: str
+    contents: bytes
+    byte_length: int
+    sha256: str
 
 
 class DatasetFormat(StrEnum):
@@ -150,7 +166,7 @@ class AcquisitionManifest(DatasetModel):
 
 class ValidatedAsset(DatasetModel):
     split: Literal["validation", "test"]
-    path: str = Field(min_length=1)
+    logical_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$")
     byte_length: int = Field(gt=0)
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
 
@@ -161,6 +177,22 @@ class AcquisitionValidationReport(DatasetModel):
     manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     valid: Literal[True] = True
     assets: tuple[ValidatedAsset, ...] = Field(min_length=2, max_length=2)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_report(self) -> Self:
+        if [asset.split for asset in self.assets] != ["validation", "test"]:
+            raise ValueError("validated assets must contain validation and test in order")
+        if len({asset.logical_id for asset in self.assets}) != 2:
+            raise ValueError("validated asset logical identifiers must be unique")
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("acquisition validation content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
 
 
 class CandidateReview(DatasetModel):
@@ -234,8 +266,10 @@ class CandidateConversionReport(DatasetModel):
     kind: Literal["codecontests_candidate_conversion"] = "codecontests_candidate_conversion"
     split: Literal["validation", "test"]
     data_format: DatasetFormat
+    source_logical_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$")
     source_byte_length: int = Field(gt=0)
     source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acquisition_validation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     converter: ConversionTool
     assessments: tuple[CandidateAssessment, ...]
 
@@ -334,6 +368,7 @@ class FrozenSelectionManifest(DatasetModel):
     schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
     kind: Literal["formal_codecontests_selection_v2"] = "formal_codecontests_selection_v2"
     acquisition_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    acquisition_validation_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     quota_report_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     entries: tuple[FrozenSelectionEntry, ...] = Field(min_length=30, max_length=30)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -374,37 +409,56 @@ class FrozenSelectionManifest(DatasetModel):
 def validate_acquired_assets(
     manifest: AcquisitionManifest,
     asset_paths: Mapping[str, Path | str],
+    *,
+    logical_ids: Mapping[str, str] | None = None,
 ) -> AcquisitionValidationReport:
     """Verify external bytes against the frozen acquisition manifest."""
 
     if set(asset_paths) != {"validation", "test"}:
         raise DatasetDataError("asset paths must contain exactly validation and test")
+    identifiers = logical_ids or {"validation": "validation", "test": "test"}
+    if set(identifiers) != {"validation", "test"}:
+        raise DatasetDataError("logical IDs must contain exactly validation and test")
     validated: list[ValidatedAsset] = []
     by_split = {asset.split: asset for asset in manifest.assets}
     for split in ("validation", "test"):
-        path = Path(asset_paths[split])
-        if path.is_symlink() or not path.is_file():
-            raise DatasetDataError(f"{split} asset must be a regular non-symlink file")
         expected = by_split[split]
-        size = path.stat().st_size
-        if size != expected.byte_length:
-            raise DatasetDataError(
-                f"{split} asset byte length mismatch: expected {expected.byte_length}, found {size}"
+        try:
+            observed = read_trusted_file(
+                asset_paths[split],
+                logical_id=identifiers[split],
+                max_bytes=expected.byte_length,
             )
-        digest = _sha256_file(path)
-        if digest != expected.sha256:
+        except DatasetDataError as error:
+            if "byte limit" in str(error):
+                raise DatasetDataError(f"{split} asset byte length mismatch") from error
+            raise
+        if observed.byte_length != expected.byte_length:
+            raise DatasetDataError(
+                f"{split} asset byte length mismatch: expected {expected.byte_length}, "
+                f"found {observed.byte_length}"
+            )
+        if observed.sha256 != expected.sha256:
             raise DatasetDataError(f"{split} asset SHA-256 mismatch")
         validated.append(
             ValidatedAsset(
                 split=split,
-                path=str(path),
-                byte_length=size,
-                sha256=digest,
+                logical_id=observed.logical_id,
+                byte_length=observed.byte_length,
+                sha256=observed.sha256,
             )
         )
+    payload: dict[str, Any] = {
+        "schema_version": DATASET_SCHEMA_VERSION,
+        "kind": "codecontests_acquisition_validation",
+        "manifest_hash": manifest.content_hash,
+        "valid": True,
+        "assets": [asset.model_dump(mode="json") for asset in validated],
+    }
     return AcquisitionValidationReport(
         manifest_hash=manifest.content_hash,
         assets=tuple(validated),
+        content_hash=sha256_json(payload),
     )
 
 
@@ -415,19 +469,40 @@ def convert_codecontests_file(
     data_format: DatasetFormat,
     reviews: Iterable[CandidateReview],
     converter: ConversionTool,
+    acquisition_validation: AcquisitionValidationReport,
     converter_argv: Sequence[str] | None = None,
 ) -> CandidateConversionReport:
     """Convert one verified source file and retain a reason for every rejected row."""
 
-    source = Path(path)
-    if source.is_symlink() or not source.is_file():
-        raise DatasetDataError(f"dataset input must be a regular non-symlink file: {source}")
+    try:
+        trusted_validation = AcquisitionValidationReport.model_validate_json(
+            acquisition_validation.model_dump_json()
+        )
+    except ValidationError as error:
+        raise DatasetDataError("acquisition validation report is invalid") from error
+    observed_asset = next(
+        (asset for asset in trusted_validation.assets if asset.split == split), None
+    )
+    if observed_asset is None:
+        raise DatasetDataError("acquisition validation report is missing the split")
+    source = read_trusted_file(
+        path,
+        logical_id=observed_asset.logical_id,
+        max_bytes=observed_asset.byte_length,
+    )
+    if source.byte_length != observed_asset.byte_length or source.sha256 != observed_asset.sha256:
+        raise DatasetDataError("raw source does not match acquisition validation report")
     review_by_id: dict[str, CandidateReview] = {}
     for review in reviews:
         if review.problem_id in review_by_id:
             raise DatasetDataError(f"duplicate checker review: {review.problem_id}")
         review_by_id[review.problem_id] = review
-    rows = _load_rows(source, data_format=data_format, converter_argv=converter_argv)
+    rows = _load_rows(
+        source.contents,
+        source_label=source.logical_id,
+        data_format=data_format,
+        converter_argv=converter_argv,
+    )
     assessments: list[CandidateAssessment] = []
     seen_ids: set[str] = set()
     for row_number, row in enumerate(rows, start=1):
@@ -454,8 +529,10 @@ def convert_codecontests_file(
     return CandidateConversionReport(
         split=split,
         data_format=data_format,
-        source_byte_length=source.stat().st_size,
-        source_sha256=_sha256_file(source),
+        source_logical_id=source.logical_id,
+        source_byte_length=source.byte_length,
+        source_sha256=source.sha256,
+        acquisition_validation_hash=trusted_validation.content_hash,
         converter=converter,
         assessments=tuple(assessments),
     )
@@ -511,11 +588,16 @@ def freeze_selection(
     conversions: Iterable[CandidateConversionReport],
     quota: EligibilityQuotaReport,
     acquisition: AcquisitionManifest,
+    acquisition_validation: AcquisitionValidationReport,
 ) -> FrozenSelectionManifest:
     """Freeze an explicit curator choice after, and only after, quota proof."""
 
     materialized = tuple(conversions)
-    _validate_conversion_acquisition(materialized, acquisition)
+    _validate_conversion_acquisition(
+        materialized,
+        acquisition,
+        acquisition_validation,
+    )
     if quota.status is not QuotaStatus.FULFILLED:
         raise DatasetDataError("cannot freeze selection while status is unfulfilled_quota")
     if quota.source_conversion_hash != _conversion_set_hash(materialized):
@@ -548,11 +630,13 @@ def freeze_selection(
         "schema_version": DATASET_SCHEMA_VERSION,
         "kind": "formal_codecontests_selection_v2",
         "acquisition_manifest_hash": acquisition.content_hash,
+        "acquisition_validation_hash": acquisition_validation.content_hash,
         "quota_report_hash": quota.content_hash,
         "entries": [entry.model_dump(mode="json") for entry in entries],
     }
     return FrozenSelectionManifest(
         acquisition_manifest_hash=acquisition.content_hash,
+        acquisition_validation_hash=acquisition_validation.content_hash,
         quota_report_hash=quota.content_hash,
         entries=entries,
         content_hash=sha256_json(payload),
@@ -565,6 +649,7 @@ def validate_frozen_selection(
     conversions: Iterable[CandidateConversionReport],
     quota: EligibilityQuotaReport,
     acquisition: AcquisitionManifest,
+    acquisition_validation: AcquisitionValidationReport,
 ) -> FrozenSelectionManifest:
     """Validate a disk manifest against current pinned rows and reviews."""
 
@@ -576,11 +661,14 @@ def validate_frozen_selection(
         raise DatasetDataError("frozen selection manifest is invalid") from error
     if manifest.acquisition_manifest_hash != acquisition.content_hash:
         raise DatasetDataError("selection acquisition manifest hash does not match")
+    if manifest.acquisition_validation_hash != acquisition_validation.content_hash:
+        raise DatasetDataError("selection acquisition validation hash does not match")
     expected = freeze_selection(
         (entry.problem_id for entry in manifest.entries),
         conversions=conversions,
         quota=quota,
         acquisition=acquisition,
+        acquisition_validation=acquisition_validation,
     )
     if manifest.entries != expected.entries:
         raise DatasetDataError("selection candidate hashes do not match reviewed rows")
@@ -700,7 +788,16 @@ def _conversion_set_hash(conversions: tuple[CandidateConversionReport, ...]) -> 
 def _validate_conversion_acquisition(
     conversions: tuple[CandidateConversionReport, ...],
     acquisition: AcquisitionManifest,
+    acquisition_validation: AcquisitionValidationReport,
 ) -> None:
+    try:
+        trusted_validation = AcquisitionValidationReport.model_validate_json(
+            acquisition_validation.model_dump_json()
+        )
+    except ValidationError as error:
+        raise DatasetDataError("acquisition validation report is invalid") from error
+    if trusted_validation.manifest_hash != acquisition.content_hash:
+        raise DatasetDataError("acquisition validation report does not match manifest")
     if tuple(conversion.split for conversion in conversions) != ("validation", "test"):
         raise DatasetDataError(
             "formal freeze requires exactly one validation and one test conversion in order"
@@ -708,13 +805,27 @@ def _validate_conversion_acquisition(
     if any(conversion.converter != acquisition.converter for conversion in conversions):
         raise DatasetDataError("conversion tool/version does not match acquisition manifest")
     asset_by_split = {asset.split: asset for asset in acquisition.assets}
+    validated_by_split = {asset.split: asset for asset in trusted_validation.assets}
     for conversion in conversions:
         asset = asset_by_split[conversion.split]
-        if conversion.source_byte_length != asset.byte_length:
+        validated = validated_by_split[conversion.split]
+        if validated.byte_length != asset.byte_length or validated.sha256 != asset.sha256:
+            raise DatasetDataError(
+                f"{conversion.split} validation report does not match acquisition asset"
+            )
+        if conversion.acquisition_validation_hash != trusted_validation.content_hash:
+            raise DatasetDataError(
+                f"{conversion.split} conversion validation linkage does not match"
+            )
+        if conversion.source_logical_id != validated.logical_id:
+            raise DatasetDataError(
+                f"{conversion.split} conversion logical ID is not validation-pinned"
+            )
+        if conversion.source_byte_length != validated.byte_length:
             raise DatasetDataError(
                 f"{conversion.split} conversion source byte length is not acquisition-pinned"
             )
-        if conversion.source_sha256 != asset.sha256:
+        if conversion.source_sha256 != validated.sha256:
             raise DatasetDataError(
                 f"{conversion.split} conversion source SHA-256 is not acquisition-pinned"
             )
@@ -825,27 +936,28 @@ def _test_collection_length(value: Any) -> int:
 
 
 def _load_rows(
-    source: Path,
+    contents: bytes,
     *,
+    source_label: str,
     data_format: DatasetFormat,
     converter_argv: Sequence[str] | None,
 ) -> list[Any]:
     if data_format is DatasetFormat.JSON:
-        return _load_json_rows(source)
+        return _load_json_rows(contents, source_label)
     if data_format is DatasetFormat.JSONL:
-        return _load_jsonl_rows(source)
+        return _load_jsonl_rows(contents, source_label)
     if data_format is DatasetFormat.PARQUET:
-        return _load_parquet_rows(source)
+        return _load_parquet_rows(contents, source_label)
     if data_format is DatasetFormat.RIEGELI:
-        return _convert_riegeli_rows(source, converter_argv)
+        return _convert_riegeli_rows(contents, converter_argv)
     raise DatasetDataError(f"unsupported dataset format: {data_format}")
 
 
-def _load_json_rows(source: Path) -> list[Any]:
+def _load_json_rows(contents: bytes, source_label: str) -> list[Any]:
     try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise DatasetDataError(f"invalid JSON dataset input: {source}") from error
+        payload = json.loads(contents.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise DatasetDataError(f"invalid JSON dataset input: {source_label}") from error
     if isinstance(payload, list):
         return payload
     if isinstance(payload, Mapping) and isinstance(payload.get("problems"), list):
@@ -853,25 +965,23 @@ def _load_json_rows(source: Path) -> list[Any]:
     raise DatasetDataError("JSON input must be an array or an object with a problems array")
 
 
-def _load_jsonl_rows(source: Path) -> list[Any]:
+def _load_jsonl_rows(contents: bytes, source_label: str) -> list[Any]:
     rows: list[Any] = []
     try:
-        with source.open("r", encoding="utf-8") as handle:
-            for line_number, line in enumerate(handle, start=1):
-                if not line.strip():
-                    continue
-                try:
-                    rows.append(json.loads(line))
-                except json.JSONDecodeError as error:
-                    raise DatasetDataError(
-                        f"invalid JSONL dataset input at line {line_number}"
-                    ) from error
-    except (OSError, UnicodeError) as error:
-        raise DatasetDataError(f"cannot read JSONL dataset input: {source}") from error
+        text = contents.decode("utf-8")
+    except UnicodeError as error:
+        raise DatasetDataError(f"cannot read JSONL dataset input: {source_label}") from error
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            raise DatasetDataError(f"invalid JSONL dataset input at line {line_number}") from error
     return rows
 
 
-def _load_parquet_rows(source: Path) -> list[Any]:
+def _load_parquet_rows(contents: bytes, source_label: str) -> list[Any]:
     try:
         available = importlib.util.find_spec("pyarrow.parquet") is not None
     except ModuleNotFoundError:
@@ -882,14 +992,17 @@ def _load_parquet_rows(source: Path) -> list[Any]:
             "environment or export verified JSONL first"
         )
     try:
+        import pyarrow as arrow  # type: ignore[import-untyped]
         import pyarrow.parquet as parquet  # type: ignore[import-untyped]
 
-        return list(parquet.read_table(source).to_pylist())
+        return list(parquet.read_table(arrow.BufferReader(contents)).to_pylist())
     except Exception as error:
-        raise DatasetDataError(f"unable to decode verified Parquet input: {source}") from error
+        raise DatasetDataError(
+            f"unable to decode verified Parquet input: {source_label}"
+        ) from error
 
 
-def _convert_riegeli_rows(source: Path, converter_argv: Sequence[str] | None) -> list[Any]:
+def _convert_riegeli_rows(contents: bytes, converter_argv: Sequence[str] | None) -> list[Any]:
     if not converter_argv:
         raise DatasetDataError(
             "Riegeli conversion requires an external converter executable and argv "
@@ -904,6 +1017,8 @@ def _convert_riegeli_rows(source: Path, converter_argv: Sequence[str] | None) ->
     if resolved_executable is None or not os.access(resolved_executable, os.X_OK):
         raise DatasetDataError(f"external converter executable is unavailable: {executable}")
     with tempfile.TemporaryDirectory(prefix="hy3-codecontests-") as directory:
+        source = Path(directory) / "source.riegeli"
+        source.write_bytes(contents)
         output = Path(directory) / "converted.jsonl"
         argv = [
             str(source) if part == "{input}" else str(output) if part == "{output}" else part
@@ -925,20 +1040,147 @@ def _convert_riegeli_rows(source: Path, converter_argv: Sequence[str] | None) ->
             raise DatasetDataError(
                 f"external Riegeli converter failed with exit {completed.returncode}: {diagnostics}"
             )
-        if not output.is_file() or output.is_symlink():
-            raise DatasetDataError("external Riegeli converter did not create JSONL output")
-        return _load_jsonl_rows(output)
+        converted = read_trusted_file(
+            output,
+            logical_id="converted-riegeli-jsonl",
+            max_bytes=256 * 1024 * 1024,
+        )
+        return _load_jsonl_rows(converted.contents, converted.logical_id)
 
 
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
+def read_trusted_file(
+    path: Path | str,
+    *,
+    logical_id: str,
+    max_bytes: int | None = None,
+) -> TrustedFileSnapshot:
+    """Open a path without following symlinks and consume that one descriptor."""
+
+    candidate = Path(path)
+    if candidate.name in {"", ".", ".."}:
+        raise DatasetDataError("external file path must name one file")
+    with open_trusted_directory(candidate.parent) as directory_fd:
+        return read_trusted_relative(
+            directory_fd,
+            candidate.name,
+            logical_id=logical_id,
+            max_bytes=max_bytes,
+        )
+
+
+@contextmanager
+def open_trusted_directory(path: Path | str) -> Iterator[int]:
+    """Open every directory component with O_NOFOLLOW and yield its descriptor."""
+
+    candidate = Path(path)
+    parts = candidate.parts
     try:
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
+        directory_fd: int = os.open(
+            "/" if candidate.is_absolute() else ".",
+            _DIRECTORY_OPEN_FLAGS,
+        )
     except OSError as error:
-        raise DatasetDataError(f"cannot hash external dataset file: {path}") from error
-    return digest.hexdigest()
+        raise DatasetDataError("cannot open trusted external directory") from error
+    try:
+        start = 1 if candidate.is_absolute() else 0
+        for part in parts[start:]:
+            if part in {"", "."}:
+                continue
+            if part == ".." or "\x00" in part:
+                raise DatasetDataError("trusted directory traversal is forbidden")
+            try:
+                next_fd = os.open(
+                    part,
+                    _DIRECTORY_OPEN_FLAGS,
+                    dir_fd=directory_fd,
+                )
+            except OSError as error:
+                raise DatasetDataError("cannot open trusted external directory") from error
+            os.close(directory_fd)
+            directory_fd = next_fd
+        yield directory_fd
+    finally:
+        os.close(directory_fd)
+
+
+def read_trusted_relative(
+    directory_fd: int,
+    relative_path: str,
+    *,
+    logical_id: str,
+    max_bytes: int | None = None,
+) -> TrustedFileSnapshot:
+    """Read one safe relative file through openat and the same regular-file fd."""
+
+    if not _LOGICAL_ID_PATTERN.fullmatch(logical_id):
+        raise DatasetDataError("external file logical identifier is invalid")
+    candidate = Path(relative_path)
+    if candidate.is_absolute() or any(part in {"", ".", ".."} for part in candidate.parts):
+        raise DatasetDataError("external file path must be safe and relative")
+    current_fd = os.dup(directory_fd)
+    try:
+        for part in candidate.parts[:-1]:
+            try:
+                next_fd = os.open(part, _DIRECTORY_OPEN_FLAGS, dir_fd=current_fd)
+            except OSError as error:
+                raise DatasetDataError("external file directory is invalid") from error
+            os.close(current_fd)
+            current_fd = next_fd
+        try:
+            file_fd = os.open(candidate.parts[-1], _FILE_OPEN_FLAGS, dir_fd=current_fd)
+        except OSError as error:
+            raise DatasetDataError("external file must be regular and non-symlink") from error
+        try:
+            return _read_regular_fd(file_fd, logical_id=logical_id, max_bytes=max_bytes)
+        finally:
+            os.close(file_fd)
+    finally:
+        os.close(current_fd)
+
+
+def _read_regular_fd(
+    file_fd: int,
+    *,
+    logical_id: str,
+    max_bytes: int | None,
+) -> TrustedFileSnapshot:
+    before = os.fstat(file_fd)
+    if not stat.S_ISREG(before.st_mode):
+        raise DatasetDataError("external file must be a regular file")
+    if max_bytes is not None and before.st_size > max_bytes:
+        raise DatasetDataError("external file exceeds its trusted byte limit")
+    chunks: list[bytes] = []
+    digest = hashlib.sha256()
+    total = 0
+    while chunk := os.read(file_fd, 1024 * 1024):
+        total += len(chunk)
+        if max_bytes is not None and total > max_bytes:
+            raise DatasetDataError("external file exceeds its trusted byte limit")
+        chunks.append(chunk)
+        digest.update(chunk)
+    after = os.fstat(file_fd)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+        before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_size,
+        after.st_mtime_ns,
+        after.st_ctime_ns,
+    )
+    if identity_after != identity_before or total != before.st_size:
+        raise DatasetDataError("external file changed while being read")
+    return TrustedFileSnapshot(
+        logical_id=logical_id,
+        contents=b"".join(chunks),
+        byte_length=total,
+        sha256=digest.hexdigest(),
+    )
 
 
 def _bounded_text(value: str) -> str:

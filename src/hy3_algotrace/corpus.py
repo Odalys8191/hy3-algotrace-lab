@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
 from collections import Counter
 from collections.abc import Iterable, Mapping
+from datetime import datetime
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self, cast
@@ -24,12 +24,43 @@ from hy3_algotrace.contracts import (
 )
 from hy3_algotrace.dataset_models import (
     DATASET_SCHEMA_VERSION,
+    DatasetDataError,
     DatasetModel,
     FrozenSelectionManifest,
+    open_trusted_directory,
+    read_trusted_relative,
 )
 
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_FORBIDDEN_BUNDLE_PARTS = frozenset({"hidden", "hidden_tests", "private_tests", "generated_tests"})
+_FORBIDDEN_BUNDLE_PARTS = frozenset(
+    {
+        "hidden",
+        "hidden_tests",
+        "private_tests",
+        "generated_tests",
+        "submission",
+        "submissions",
+        "submitted",
+        "third_party",
+    }
+)
+_FORBIDDEN_CONTENT_MARKERS = (
+    "hidden_tests",
+    "hiddentests",
+    "private_tests",
+    "privatetests",
+    "generated_tests",
+    "generatedtests",
+    "submission_id",
+    "submissionid",
+    "third_party_submitted",
+    "thirdpartysubmitted",
+    "submitted code",
+    "accepted submission",
+    "codeforces submission",
+    "/submission/",
+    "/submissions/",
+)
 
 
 class CorpusDataError(ValueError):
@@ -97,6 +128,75 @@ class ArtifactRef(DatasetModel):
         return self
 
 
+class AuthoringAttestation(DatasetModel):
+    """Hash-linked human review; automated scans do not replace this review."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["project_authoring_attestation"] = "project_authoring_attestation"
+    reviewer: str = Field(min_length=1, max_length=256)
+    reviewed_at: datetime
+    evidence_logical_id: str = Field(pattern=r"^[a-z0-9][a-z0-9._:-]{0,127}$")
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_provenance: Literal["project_authored_no_submitted_code"]
+    source_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    human_review_required: Literal[True] = True
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("reviewer")
+    @classmethod
+    def validate_reviewer(cls, value: str) -> str:
+        if value != value.strip() or any(ord(character) < 32 for character in value):
+            raise ValueError("authoring reviewer must be a single trimmed line")
+        return value
+
+    @model_validator(mode="after")
+    def validate_attestation(self) -> Self:
+        if self.reviewed_at.tzinfo is None or self.reviewed_at.utcoffset() is None:
+            raise ValueError("authoring review timestamp must include timezone")
+        if self.evidence_sha256 == "0" * 64 or self.source_provenance_sha256 == "0" * 64:
+            raise ValueError("authoring evidence hashes cannot be all-zero")
+        if self.content_hash != self.expected_content_hash():
+            raise ValueError("authoring attestation content_hash does not match")
+        return self
+
+    def expected_content_hash(self) -> str:
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        return sha256_json(payload)
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        reviewer: str,
+        reviewed_at: datetime,
+        evidence_logical_id: str,
+        evidence_sha256: str,
+        source_provenance: Literal["project_authored_no_submitted_code"],
+        source_provenance_sha256: str,
+    ) -> AuthoringAttestation:
+        payload: dict[str, Any] = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "project_authoring_attestation",
+            "reviewer": reviewer,
+            "reviewed_at": reviewed_at.isoformat().replace("+00:00", "Z"),
+            "evidence_logical_id": evidence_logical_id,
+            "evidence_sha256": evidence_sha256,
+            "source_provenance": source_provenance,
+            "source_provenance_sha256": source_provenance_sha256,
+            "human_review_required": True,
+        }
+        return cls(
+            reviewer=reviewer,
+            reviewed_at=reviewed_at,
+            evidence_logical_id=evidence_logical_id,
+            evidence_sha256=evidence_sha256,
+            source_provenance=source_provenance,
+            source_provenance_sha256=source_provenance_sha256,
+            content_hash=sha256_json(payload),
+        )
+
+
 class AuthoredBundleEntry(DatasetModel):
     """Project-authored material linked to one selected third-party statement."""
 
@@ -106,7 +206,7 @@ class AuthoredBundleEntry(DatasetModel):
     oracle: ArtifactRef
     gold_trace: ArtifactRef
     mutants: tuple[ArtifactRef, ...] = Field(min_length=2, max_length=2)
-    authoring_attestation: Literal["project_authored"]
+    authoring_attestation: AuthoringAttestation
     third_party_submitted_code_included: Literal[False]
 
     @model_validator(mode="after")
@@ -129,7 +229,9 @@ class AuthoredBundleEntry(DatasetModel):
             parts = PurePosixPath(artifact.path).parts
             if parts[:2] != expected_prefix:
                 raise ValueError("bundle artifact path must be scoped to its problem ID")
-            if {part.casefold() for part in parts}.intersection(_FORBIDDEN_BUNDLE_PARTS):
+            if any(
+                marker in part.casefold() for part in parts for marker in _FORBIDDEN_BUNDLE_PARTS
+            ):
                 raise ValueError("public authored bundle must not contain hidden test material")
         if len({artifact.path for artifact in artifacts}) != len(artifacts):
             raise ValueError("bundle artifact paths must be unique")
@@ -449,7 +551,7 @@ def lint_project_bundles(
     expected = build_project_bundle_manifest(selection, manifest.bundles)
     if manifest != expected:
         raise CorpusDataError("bundle manifest does not match frozen selection")
-    _verify_artifacts(
+    artifact_bytes = _read_artifacts(
         root,
         (
             artifact
@@ -463,7 +565,7 @@ def lint_project_bundles(
         ),
     )
     for bundle in manifest.bundles:
-        _lint_bundle_contents(Path(root), bundle)
+        _lint_bundle_contents(artifact_bytes, bundle)
     return manifest
 
 
@@ -534,12 +636,12 @@ def lint_corpus_manifest(
     if manifest != expected:
         raise CorpusDataError("corpus manifest does not match frozen inputs")
     validate_corpus_bundle_links(manifest, bundle_manifest)
-    _verify_artifacts(
+    artifact_bytes = _read_artifacts(
         root,
         (artifact for sample in manifest.samples for artifact in (sample.trace, sample.cpp_source)),
     )
     for sample in manifest.samples:
-        _lint_sample_contents(Path(root), sample)
+        _lint_sample_contents(artifact_bytes, sample)
     counts = Counter(sample.kind.value for sample in manifest.samples)
     expected_counts = {
         "gold": 30,
@@ -625,41 +727,47 @@ def _validate_sample_distribution(
         raise CorpusDataError("corpus requires fifteen paradox samples on distinct problems")
 
 
-def _verify_artifacts(root: Path | str, artifacts: Iterable[ArtifactRef]) -> None:
-    root_path = Path(root)
-    if root_path.is_symlink() or not root_path.is_dir():
-        raise CorpusDataError("artifact root must be a regular non-symlink directory")
+def _read_artifacts(
+    root: Path | str,
+    artifacts: Iterable[ArtifactRef],
+) -> dict[str, bytes]:
     materialized = tuple(artifacts)
     paths = [artifact.path for artifact in materialized]
     if len(paths) != len(set(paths)):
         raise CorpusDataError("artifact paths must be unique across the manifest")
-    for artifact in materialized:
-        candidate = root_path
-        for part in PurePosixPath(artifact.path).parts:
-            candidate = candidate / part
-            if candidate.is_symlink():
-                raise CorpusDataError(f"artifact symlink is forbidden: {artifact.path}")
-        if not candidate.is_file():
-            raise CorpusDataError(f"artifact file is missing: {artifact.path}")
-        size = candidate.stat().st_size
-        if size != artifact.byte_length:
-            raise CorpusDataError(f"artifact byte length mismatch: {artifact.path}")
-        if _sha256_file(candidate) != artifact.sha256:
-            raise CorpusDataError(f"artifact SHA-256 mismatch: {artifact.path}")
+    contents: dict[str, bytes] = {}
+    try:
+        with open_trusted_directory(root) as root_fd:
+            for index, artifact in enumerate(materialized):
+                observed = read_trusted_relative(
+                    root_fd,
+                    artifact.path,
+                    logical_id=f"artifact-{index}",
+                    max_bytes=artifact.byte_length,
+                )
+                if observed.byte_length != artifact.byte_length:
+                    raise CorpusDataError(f"artifact byte length mismatch: {artifact.path}")
+                if observed.sha256 != artifact.sha256:
+                    raise CorpusDataError(f"artifact SHA-256 mismatch: {artifact.path}")
+                contents[artifact.path] = observed.contents
+    except DatasetDataError as error:
+        raise CorpusDataError("artifact read failed trusted-file checks") from error
+    return contents
 
 
-def _lint_bundle_contents(root: Path, bundle: AuthoredBundleEntry) -> None:
-    reference_cpp = _read_utf8_artifact(root, bundle.reference_cpp, "reference C++")
+def _lint_bundle_contents(contents: Mapping[str, bytes], bundle: AuthoredBundleEntry) -> None:
+    _scan_bundle_provenance_markers(contents, bundle)
+    reference_cpp = _read_utf8_artifact(contents, bundle.reference_cpp, "reference C++")
     if not reference_cpp.strip():
         raise CorpusDataError(f"reference C++ is empty: {bundle.problem_id}")
     oracle = _read_contract_artifact(
-        root,
+        contents,
         bundle.oracle,
         ProblemOracle,
         "oracle",
     )
     gold_trace = _read_contract_artifact(
-        root,
+        contents,
         bundle.gold_trace,
         SolutionTrace,
         "gold trace",
@@ -675,14 +783,31 @@ def _lint_bundle_contents(root: Path, bundle: AuthoredBundleEntry) -> None:
     ):
         raise CorpusDataError(f"gold trace contains an erroneous step: {bundle.problem_id}")
     for mutant in bundle.mutants:
-        if not _read_utf8_artifact(root, mutant, "mutant C++").strip():
+        if not _read_utf8_artifact(contents, mutant, "mutant C++").strip():
             raise CorpusDataError(f"mutant C++ is empty: {bundle.problem_id}")
 
 
-def _lint_sample_contents(root: Path, sample: CorpusSample) -> None:
-    cpp_source = _read_utf8_artifact(root, sample.cpp_source, "sample C++")
+def _scan_bundle_provenance_markers(
+    contents: Mapping[str, bytes], bundle: AuthoredBundleEntry
+) -> None:
+    artifacts = (bundle.reference_cpp, bundle.oracle, bundle.gold_trace, *bundle.mutants)
+    for artifact in artifacts:
+        text = _read_utf8_artifact(contents, artifact, "bundle artifact").casefold()
+        if _contains_forbidden_provenance_marker(text):
+            raise CorpusDataError(
+                f"forbidden provenance marker in authored artifact: {bundle.problem_id}"
+            )
+
+
+def _lint_sample_contents(contents: Mapping[str, bytes], sample: CorpusSample) -> None:
+    cpp_source = _read_utf8_artifact(contents, sample.cpp_source, "sample C++")
+    trace_text = _read_utf8_artifact(contents, sample.trace, "sample trace")
+    if _contains_forbidden_provenance_marker(
+        cpp_source.casefold()
+    ) or _contains_forbidden_provenance_marker(trace_text.casefold()):
+        raise CorpusDataError(f"forbidden provenance marker in corpus artifact: {sample.sample_id}")
     trace = _read_contract_artifact(
-        root,
+        contents,
         sample.trace,
         SolutionTrace,
         "sample trace",
@@ -707,35 +832,33 @@ def _lint_sample_contents(root: Path, sample: CorpusSample) -> None:
         )
 
 
-def _read_utf8_artifact(root: Path, artifact: ArtifactRef, label: str) -> str:
+def _contains_forbidden_provenance_marker(text: str) -> bool:
+    return any(marker in text for marker in _FORBIDDEN_CONTENT_MARKERS) or bool(
+        re.search(
+            r"codeforces\.com/(?:contest/[0-9]+/)?submissions?/",
+            text,
+        )
+    )
+
+
+def _read_utf8_artifact(contents: Mapping[str, bytes], artifact: ArtifactRef, label: str) -> str:
     try:
-        return (root / artifact.path).read_text(encoding="utf-8")
-    except (OSError, UnicodeError) as error:
+        return contents[artifact.path].decode("utf-8")
+    except (KeyError, UnicodeError) as error:
         raise CorpusDataError(f"{label} is not valid UTF-8: {artifact.path}") from error
 
 
 def _read_contract_artifact[ModelT: ProblemOracle | SolutionTrace](
-    root: Path,
+    contents: Mapping[str, bytes],
     artifact: ArtifactRef,
     model: type[ModelT],
     label: str,
 ) -> ModelT:
-    text = _read_utf8_artifact(root, artifact, label)
+    text = _read_utf8_artifact(contents, artifact, label)
     try:
         return cast(ModelT, model.model_validate_json(text))
     except ValidationError as error:
         raise CorpusDataError(f"{label} is invalid: {artifact.path}") from error
-
-
-def _sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    try:
-        with path.open("rb") as handle:
-            while chunk := handle.read(1024 * 1024):
-                digest.update(chunk)
-    except OSError as error:
-        raise CorpusDataError(f"cannot read artifact: {path}") from error
-    return digest.hexdigest()
 
 
 def _parse_model[ModelT: ProjectBundleManifest | CorpusManifest](

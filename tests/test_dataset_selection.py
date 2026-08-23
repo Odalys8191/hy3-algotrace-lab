@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,7 @@ from hy3_algotrace.dataset_models import (
     build_quota_report,
     convert_codecontests_file,
     freeze_selection,
+    validate_acquired_assets,
     validate_frozen_selection,
 )
 
@@ -65,7 +67,61 @@ def _review(contest_id: int) -> CandidateReview:
     )
 
 
-def _fulfilled_conversion(tmp_path: Path):  # type: ignore[no-untyped-def]
+def _fixture_chain(
+    tmp_path: Path,
+    *,
+    prefix: str = "full",
+    validation_rows: list[dict[str, object]] | None = None,
+    validation_reviews: list[CandidateReview] | None = None,
+    test_rows: list[dict[str, object]] | None = None,
+    test_reviews: list[CandidateReview] | None = None,
+):  # type: ignore[no-untyped-def]
+    converter = ConversionTool(name="test-json", version="1")
+    paths = {
+        "validation": tmp_path / f"{prefix}-validation.json",
+        "test": tmp_path / f"{prefix}-test.json",
+    }
+    paths["validation"].write_text(json.dumps(validation_rows or []), encoding="utf-8")
+    paths["test"].write_text(json.dumps(test_rows or []), encoding="utf-8")
+    assets = []
+    for split in ("validation", "test"):
+        contents = paths[split].read_bytes()
+        assets.append(
+            AcquisitionAsset(
+                split=split,
+                url=f"https://example.invalid/code_contests_{split}.json",
+                byte_length=len(contents),
+                sha256=hashlib.sha256(contents).hexdigest(),
+                license="CC-BY-4.0 plus third-party terms",
+                attribution="Google DeepMind CodeContests and Codeforces",
+            )
+        )
+    acquisition = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=tuple(assets),
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    validation = validate_acquired_assets(
+        acquisition,
+        paths,
+        logical_ids={"validation": f"{prefix}-validation", "test": f"{prefix}-test"},
+    )
+    conversions = tuple(
+        convert_codecontests_file(
+            paths[split],
+            split=split,
+            data_format=DatasetFormat.JSON,
+            reviews=(validation_reviews or []) if split == "validation" else (test_reviews or []),
+            converter=converter,
+            acquisition_validation=validation,
+        )
+        for split in ("validation", "test")
+    )
+    return conversions, acquisition, validation
+
+
+def _fulfilled_chain(tmp_path: Path):  # type: ignore[no-untyped-def]
     rows: list[dict[str, object]] = []
     reviews: list[CandidateReview] = []
     contest_id = 4000
@@ -75,53 +131,10 @@ def _fulfilled_conversion(tmp_path: Path):  # type: ignore[no-untyped-def]
                 rows.append(_row(contest_id, topic, rating))
                 reviews.append(_review(contest_id))
                 contest_id += 1
-    path = tmp_path / "records.json"
-    path.write_text(json.dumps(rows), encoding="utf-8")
-    return convert_codecontests_file(
-        path,
-        split="validation",
-        data_format=DatasetFormat.JSON,
-        reviews=reviews,
-        converter=ConversionTool(name="test-json", version="1"),
-    )
-
-
-def _empty_conversion(tmp_path: Path, split: str):  # type: ignore[no-untyped-def]
-    path = tmp_path / f"empty-{split}.json"
-    path.write_text("[]", encoding="utf-8")
-    return convert_codecontests_file(
-        path,
-        split=split,
-        data_format=DatasetFormat.JSON,
-        reviews=(),
-        converter=ConversionTool(name="test-json", version="1"),
-    )
-
-
-def _acquisition(conversions):  # type: ignore[no-untyped-def]
-    by_split = {conversion.split: conversion for conversion in conversions}
-    return AcquisitionManifest(
-        dataset="google-deepmind/code_contests",
-        assets=(
-            AcquisitionAsset(
-                split="validation",
-                url="https://example.invalid/code_contests_valid.json",
-                byte_length=by_split["validation"].source_byte_length,
-                sha256=by_split["validation"].source_sha256,
-                license="CC-BY-4.0 plus third-party terms",
-                attribution="Google DeepMind CodeContests and Codeforces",
-            ),
-            AcquisitionAsset(
-                split="test",
-                url="https://example.invalid/code_contests_test.json",
-                byte_length=by_split["test"].source_byte_length,
-                sha256=by_split["test"].source_sha256,
-                license="CC-BY-4.0 plus third-party terms",
-                attribution="Google DeepMind CodeContests and Codeforces",
-            ),
-        ),
-        converter=ConversionTool(name="test-json", version="1"),
-        third_party_terms_acknowledged=True,
+    return _fixture_chain(
+        tmp_path,
+        validation_rows=rows,
+        validation_reviews=reviews,
     )
 
 
@@ -130,9 +143,8 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
 ) -> None:
     """Changing a reviewed row after freeze must invalidate the exact 30 manifest."""
 
-    conversion = _fulfilled_conversion(tmp_path)
-    conversions = (conversion, _empty_conversion(tmp_path, "test"))
-    acquisition = _acquisition(conversions)
+    conversions, acquisition, validation = _fulfilled_chain(tmp_path)
+    conversion = conversions[0]
     quota = build_quota_report(conversions)
     selected_ids = tuple(item.problem_id for item in conversion.eligible)
 
@@ -141,10 +153,12 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
         conversions=conversions,
         quota=quota,
         acquisition=acquisition,
+        acquisition_validation=validation,
     )
 
     assert quota.status is QuotaStatus.FULFILLED
     assert len(manifest.entries) == 30
+    assert manifest.acquisition_validation_hash == validation.content_hash
     assert manifest.content_hash == manifest.expected_content_hash()
     assert (
         validate_frozen_selection(
@@ -152,6 +166,7 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
             conversions=conversions,
             quota=quota,
             acquisition=acquisition,
+            acquisition_validation=validation,
         )
         == manifest
     )
@@ -167,15 +182,15 @@ def test_freeze_selection_requires_fulfilled_quota_and_locks_all_candidate_hashe
             conversions=conversions,
             quota=quota,
             acquisition=acquisition,
+            acquisition_validation=validation,
         )
 
 
 def test_freeze_selection_refuses_underfilled_or_duplicate_choice(tmp_path: Path) -> None:
     """Selection cannot compensate for missing cells or duplicate one candidate."""
 
-    conversion = _fulfilled_conversion(tmp_path)
-    conversions = (conversion, _empty_conversion(tmp_path, "test"))
-    acquisition = _acquisition(conversions)
+    conversions, acquisition, validation = _fulfilled_chain(tmp_path)
+    conversion = conversions[0]
     quota = build_quota_report(conversions)
     ids = [item.problem_id for item in conversion.eligible]
     ids[-1] = ids[0]
@@ -185,55 +200,64 @@ def test_freeze_selection_refuses_underfilled_or_duplicate_choice(tmp_path: Path
             conversions=conversions,
             quota=quota,
             acquisition=acquisition,
+            acquisition_validation=validation,
         )
 
-    sparse_path = tmp_path / "sparse.json"
-    sparse_path.write_text(json.dumps([_row(9999, Topic.GREEDY, 1300)]), encoding="utf-8")
-    sparse = convert_codecontests_file(
-        sparse_path,
-        split="test",
-        data_format=DatasetFormat.JSON,
-        reviews=(_review(9999),),
-        converter=ConversionTool(name="test-json", version="1"),
+    sparse_conversions, sparse_acquisition, sparse_validation = _fixture_chain(
+        tmp_path,
+        prefix="sparse",
+        test_rows=[_row(9999, Topic.GREEDY, 1300)],
+        test_reviews=[_review(9999)],
     )
-    sparse_conversions = (_empty_conversion(tmp_path, "validation"), sparse)
     with pytest.raises(DatasetDataError, match="unfulfilled_quota"):
         freeze_selection(
             ("cf-9999-a",),
             conversions=sparse_conversions,
             quota=build_quota_report(sparse_conversions),
-            acquisition=_acquisition(sparse_conversions),
+            acquisition=sparse_acquisition,
+            acquisition_validation=sparse_validation,
         )
 
 
 def test_freeze_selection_rejects_conversion_not_pinned_by_acquisition(tmp_path: Path) -> None:
     """Claiming a manifest hash cannot substitute for matching both raw split digests."""
 
-    conversion = _fulfilled_conversion(tmp_path)
-    conversions = (conversion, _empty_conversion(tmp_path, "test"))
-    acquisition = _acquisition(conversions)
+    conversions, acquisition, validation = _fulfilled_chain(tmp_path)
+    conversion = conversions[0]
     payload = acquisition.model_dump(mode="json")
     payload["assets"][0]["sha256"] = "f" * 64
     mismatched = AcquisitionManifest.model_validate_json(json.dumps(payload))
-    with pytest.raises(DatasetDataError, match="source SHA-256"):
+    with pytest.raises(DatasetDataError, match="validation report"):
         freeze_selection(
             tuple(item.problem_id for item in conversion.eligible),
             conversions=conversions,
             quota=build_quota_report(conversions),
             acquisition=mismatched,
+            acquisition_validation=validation,
+        )
+
+    forged_conversion = conversion.model_copy(update={"acquisition_validation_hash": "f" * 64})
+    with pytest.raises(DatasetDataError, match="validation linkage"):
+        freeze_selection(
+            tuple(item.problem_id for item in conversion.eligible),
+            conversions=(forged_conversion, conversions[1]),
+            quota=build_quota_report((forged_conversion, conversions[1])),
+            acquisition=acquisition,
+            acquisition_validation=validation,
         )
 
 
 def test_frozen_selection_model_itself_rejects_wrong_band_and_cell_counts(tmp_path: Path) -> None:
     """Downstream readers cannot bypass quota rules by parsing a self-hashed manifest directly."""
 
-    conversion = _fulfilled_conversion(tmp_path)
-    conversions = (conversion, _empty_conversion(tmp_path, "test"))
+    conversions, acquisition, validation = _fulfilled_chain(tmp_path)
+    conversion = conversions[0]
     manifest = freeze_selection(
         tuple(item.problem_id for item in conversion.eligible),
         conversions=conversions,
         quota=build_quota_report(conversions),
-        acquisition=_acquisition(conversions),
+        acquisition=acquisition,
+        acquisition_validation=validation,
     )
     wrong_band = manifest.model_dump(mode="json")
     wrong_band["entries"][0]["rating_band"] = "1600-1900"

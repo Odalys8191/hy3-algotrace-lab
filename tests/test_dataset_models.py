@@ -4,11 +4,13 @@ import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from pydantic import ValidationError
 
 import hy3_algotrace.dataset_models as dataset_models
+from hy3_algotrace.artifacts import sha256_json
 from hy3_algotrace.contracts import RatingBand, Topic
 from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
@@ -46,6 +48,32 @@ def _manifest(valid: bytes, test: bytes) -> AcquisitionManifest:
         assets=(_asset("validation", valid), _asset("test", test)),
         converter=ConversionTool(name="verified-test-converter", version="1.0.0"),
         third_party_terms_acknowledged=True,
+    )
+
+
+def _validated_source(
+    path: Path,
+    *,
+    split: Literal["validation", "test"],
+    converter: ConversionTool,
+):  # type: ignore[no-untyped-def]
+    other_split: Literal["validation", "test"] = "test" if split == "validation" else "validation"
+    other = path.parent / f"{path.name}.{other_split}.fixture"
+    other.write_bytes(b"[]")
+    paths = {split: path, other_split: other}
+    manifest = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=(
+            _asset("validation", paths["validation"].read_bytes()),
+            _asset("test", paths["test"].read_bytes()),
+        ),
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    return validate_acquired_assets(
+        manifest,
+        paths,
+        logical_ids={"validation": "validation-fixture", "test": "test-fixture"},
     )
 
 
@@ -126,6 +154,122 @@ def test_acquisition_manifest_and_external_bytes_fail_closed(tmp_path: Path) -> 
         validate_acquired_assets(manifest, {"validation": valid_path})
 
 
+def test_acquisition_report_is_path_free_self_hashed_and_reads_one_open_fd(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pathname-to-symlink swap after open cannot change observed acquisition bytes."""
+
+    valid = b"official validation bytes"
+    test = b"official test bytes"
+    manifest = _manifest(valid, test)
+    valid_path = tmp_path / "valid.riegeli"
+    test_path = tmp_path / "test.riegeli"
+    valid_path.write_bytes(valid)
+    test_path.write_bytes(test)
+    replacement = tmp_path / "replacement.riegeli"
+    replacement.write_bytes(b"attacker replacement")
+    saved = tmp_path / "valid-before-swap.riegeli"
+    real_open = dataset_models.os.open
+    swapped = False
+
+    def swap_after_open(path: object, *args: object, **kwargs: object) -> int:
+        nonlocal swapped
+        file_fd = real_open(path, *args, **kwargs)
+        if path == valid_path.name and kwargs.get("dir_fd") is not None and not swapped:
+            valid_path.rename(saved)
+            valid_path.symlink_to(replacement)
+            swapped = True
+        return file_fd
+
+    monkeypatch.setattr(dataset_models.os, "open", swap_after_open)
+
+    report = validate_acquired_assets(
+        manifest,
+        {"validation": valid_path, "test": test_path},
+        logical_ids={"validation": "codecontests-validation", "test": "codecontests-test"},
+    )
+
+    assert swapped is True
+    assert report.manifest_hash == manifest.content_hash
+    assert report.content_hash == report.expected_content_hash()
+    assert [asset.logical_id for asset in report.assets] == [
+        "codecontests-validation",
+        "codecontests-test",
+    ]
+    serialized = report.model_dump_json()
+    assert str(tmp_path) not in serialized
+    tampered = report.model_dump(mode="json")
+    tampered["assets"][0]["sha256"] = "f" * 64
+    with pytest.raises(ValidationError, match="content_hash"):
+        type(report).model_validate_json(json.dumps(tampered))
+
+
+def test_conversion_requires_and_binds_matching_acquisition_validation(
+    tmp_path: Path,
+) -> None:
+    """A conversion cannot self-report a source digest without the observed report chain."""
+
+    source = tmp_path / "validation.json"
+    source.write_text(json.dumps([_raw_problem(1004)]), encoding="utf-8")
+    other = tmp_path / "test.json"
+    other.write_text("[]", encoding="utf-8")
+    converter = ConversionTool(name="json-reader", version="1")
+    manifest = AcquisitionManifest(
+        dataset="google-deepmind/code_contests",
+        assets=(
+            _asset("validation", source.read_bytes()),
+            _asset("test", other.read_bytes()),
+        ),
+        converter=converter,
+        third_party_terms_acknowledged=True,
+    )
+    validation = validate_acquired_assets(
+        manifest,
+        {"validation": source, "test": other},
+        logical_ids={"validation": "validation-json", "test": "test-json"},
+    )
+
+    conversion = convert_codecontests_file(
+        source,
+        split="validation",
+        data_format=DatasetFormat.JSON,
+        reviews=(_review(1004),),
+        converter=converter,
+        acquisition_validation=validation,
+    )
+
+    assert conversion.acquisition_validation_hash == validation.content_hash
+    assert conversion.source_logical_id == "validation-json"
+    forged_validation = validation.model_copy(
+        update={"content_hash": sha256_json("self-authored-report")}
+    )
+    with pytest.raises(DatasetDataError, match="validation report"):
+        convert_codecontests_file(
+            source,
+            split="validation",
+            data_format=DatasetFormat.JSON,
+            reviews=(_review(1004),),
+            converter=converter,
+            acquisition_validation=forged_validation,
+        )
+
+    replaced_payload = validation.model_dump(mode="json")
+    replaced_payload["assets"][0]["sha256"] = "f" * 64
+    replaced_payload["content_hash"] = sha256_json(
+        {key: value for key, value in replaced_payload.items() if key != "content_hash"}
+    )
+    replaced_report = type(validation).model_validate_json(json.dumps(replaced_payload))
+    with pytest.raises(DatasetDataError, match="raw source"):
+        convert_codecontests_file(
+            source,
+            split="validation",
+            data_format=DatasetFormat.JSON,
+            reviews=(_review(1004),),
+            converter=converter,
+            acquisition_validation=replaced_report,
+        )
+
+
 def test_acquisition_models_reject_coercion_duplicate_splits_and_unpinned_urls() -> None:
     """Loose integers, duplicate splits, and non-HTTPS URLs must never look pinned."""
 
@@ -177,6 +321,11 @@ def test_json_and_jsonl_conversion_report_row_reasons_and_reviewed_override(
         data_format=DatasetFormat.JSON,
         reviews=reviews,
         converter=ConversionTool(name="json-reader", version="1"),
+        acquisition_validation=_validated_source(
+            json_path,
+            split="validation",
+            converter=ConversionTool(name="json-reader", version="1"),
+        ),
     )
     from_jsonl = convert_codecontests_file(
         jsonl_path,
@@ -184,6 +333,11 @@ def test_json_and_jsonl_conversion_report_row_reasons_and_reviewed_override(
         data_format=DatasetFormat.JSONL,
         reviews=reviews,
         converter=ConversionTool(name="jsonl-reader", version="1"),
+        acquisition_validation=_validated_source(
+            jsonl_path,
+            split="validation",
+            converter=ConversionTool(name="jsonl-reader", version="1"),
+        ),
     )
 
     assert [item.problem_id for item in from_json.eligible] == ["cf-1000-a", "cf-1003-a"]
@@ -209,6 +363,11 @@ def test_unreviewed_or_nonstandard_checker_never_becomes_eligible(tmp_path: Path
         data_format=DatasetFormat.JSON,
         reviews=(),
         converter=ConversionTool(name="json-reader", version="1"),
+        acquisition_validation=_validated_source(
+            path,
+            split="test",
+            converter=ConversionTool(name="json-reader", version="1"),
+        ),
     )
     assert report.eligible == ()
     assert report.rejected[0].reasons == ("checker_review_missing",)
@@ -227,6 +386,11 @@ def test_unreviewed_or_nonstandard_checker_never_becomes_eligible(tmp_path: Path
         data_format=DatasetFormat.JSON,
         reviews=(special,),
         converter=ConversionTool(name="json-reader", version="1"),
+        acquisition_validation=_validated_source(
+            path,
+            split="test",
+            converter=ConversionTool(name="json-reader", version="1"),
+        ),
     )
     assert report.rejected[0].reasons == ("checker_not_standard",)
 
@@ -245,6 +409,11 @@ def test_original_english_requires_consistent_translation_metadata(tmp_path: Pat
         data_format=DatasetFormat.JSON,
         reviews=(_review(2001),),
         converter=ConversionTool(name="json-reader", version="1"),
+        acquisition_validation=_validated_source(
+            path,
+            split="test",
+            converter=ConversionTool(name="json-reader", version="1"),
+        ),
     )
 
     assert report.eligible == ()
@@ -266,6 +435,11 @@ def test_optional_parquet_and_riegeli_dependencies_fail_actionably(
             data_format=DatasetFormat.PARQUET,
             reviews=(),
             converter=ConversionTool(name="pyarrow", version="unavailable"),
+            acquisition_validation=_validated_source(
+                parquet,
+                split="validation",
+                converter=ConversionTool(name="pyarrow", version="unavailable"),
+            ),
         )
     riegeli = tmp_path / "rows.riegeli"
     riegeli.write_bytes(b"riegeli")
@@ -276,6 +450,11 @@ def test_optional_parquet_and_riegeli_dependencies_fail_actionably(
             data_format=DatasetFormat.RIEGELI,
             reviews=(),
             converter=ConversionTool(name="riegeli-jsonl", version="1"),
+            acquisition_validation=_validated_source(
+                riegeli,
+                split="validation",
+                converter=ConversionTool(name="riegeli-jsonl", version="1"),
+            ),
             converter_argv=("/definitely/missing/riegeli-converter", "{input}", "{output}"),
         )
 
@@ -291,6 +470,11 @@ def test_quota_report_has_all_fifteen_cells_and_never_pads(tmp_path: Path) -> No
         data_format=DatasetFormat.JSON,
         reviews=(_review(3000),),
         converter=ConversionTool(name="json-reader", version="1"),
+        acquisition_validation=_validated_source(
+            path,
+            split="validation",
+            converter=ConversionTool(name="json-reader", version="1"),
+        ),
     )
 
     quota = build_quota_report(conversion)
