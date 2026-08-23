@@ -148,7 +148,10 @@ class ArtifactStore:
         """Read JSON through no-follow file descriptors rooted at the store."""
 
         normalized = _normalize_relative_path(relative_path)
-        parent_fd, filename = self._open_parent(normalized, create=False)
+        try:
+            parent_fd, filename = self._open_parent(normalized, create=False)
+        except FileNotFoundError as error:
+            raise ArtifactStoreError(f"artifact does not exist: {normalized}") from error
         try:
             file_fd = os.open(filename, os.O_RDONLY | _NOFOLLOW, dir_fd=parent_fd)
         except FileNotFoundError as error:
@@ -178,7 +181,18 @@ class ArtifactStore:
                     raise UnsafeArtifactPathError(
                         f"unsafe artifact enumeration entry: {normalized / name}"
                     )
-                file_fd = os.open(name, os.O_RDONLY | _NOFOLLOW, dir_fd=directory_fd)
+                try:
+                    file_fd = os.open(
+                        name,
+                        os.O_RDONLY | _NOFOLLOW,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+                        raise UnsafeArtifactPathError(
+                            f"unsafe artifact enumeration entry: {normalized / name}"
+                        ) from error
+                    raise
                 try:
                     if not stat.S_ISREG(os.fstat(file_fd).st_mode):
                         raise UnsafeArtifactPathError(
@@ -186,6 +200,42 @@ class ArtifactStore:
                         )
                 finally:
                     os.close(file_fd)
+                paths.append(normalized / name)
+            return tuple(paths)
+        finally:
+            os.close(directory_fd)
+
+    def list_directories(self, relative_directory: Path | str) -> tuple[Path, ...]:
+        """Enumerate real child directories through no-follow descriptors."""
+
+        normalized = _normalize_relative_path(relative_directory)
+        try:
+            directory_fd = self._open_directory(normalized)
+        except FileNotFoundError:
+            return ()
+        try:
+            paths: list[Path] = []
+            for name in sorted(os.listdir(directory_fd)):
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise UnsafeArtifactPathError(
+                        f"unsafe artifact enumeration entry: {normalized / name}"
+                    )
+                try:
+                    child_fd = os.open(name, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR, errno.ENOENT}:
+                        raise UnsafeArtifactPathError(
+                            f"unsafe artifact enumeration entry: {normalized / name}"
+                        ) from error
+                    raise
+                try:
+                    if not stat.S_ISDIR(os.fstat(child_fd).st_mode):
+                        raise UnsafeArtifactPathError(
+                            f"unsafe artifact enumeration entry: {normalized / name}"
+                        )
+                finally:
+                    os.close(child_fd)
                 paths.append(normalized / name)
             return tuple(paths)
         finally:

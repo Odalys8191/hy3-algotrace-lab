@@ -15,7 +15,11 @@ from pydantic import ValidationError
 from .api_models import (
     InternalRunReport,
     ProblemSummaryResponse,
+    PublicAuditReport,
+    PublicJudgeReport,
+    PublicJudgeTestResult,
     PublicRunReport,
+    PublicSolutionTrace,
     RunAcceptedResponse,
     RunCreateRequest,
     RunFailure,
@@ -26,7 +30,13 @@ from .api_models import (
     RunTransitionEvent,
     StoredRunTransition,
 )
-from .artifacts import ArtifactRef, ArtifactStore, ArtifactStoreError, sha256_json
+from .artifacts import (
+    ArtifactExistsError,
+    ArtifactRef,
+    ArtifactStore,
+    ArtifactStoreError,
+    sha256_json,
+)
 from .catalog import ProblemBundle, ProblemSummary
 from .contracts import (
     AuditReport,
@@ -46,10 +56,15 @@ from .rules import RuleEngine
 _SAFE_COMPONENT = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _CREDENTIAL_PATTERNS = (
     re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+\-/]+=*"),
-    re.compile(r"(?i)\b(?:api[_-]?key|authorization)\s*[:=]\s*[^\s,;\"']+"),
+    re.compile(
+        r"(?i)\b(?:(?:hy3[\s_-]+)?api[\s_-]*key|authorization)"
+        r"\s*[:=]\s*[^\s,;\"']+"
+    ),
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}"),
 )
-_ABSOLUTE_PATH = re.compile(r"(?<![A-Za-z0-9._-])/(?:[^/\s]+/)+[^\s,;\"']*")
+_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?:^|\s)(?:/(?:users|private|tmp|var|home|opt|workspace|app|mnt)(?:/|\b)|[a-z]:\\)"
+)
 _PROTECTED_KEY_PARTS = (
     "hidden",
     "generated",
@@ -69,6 +84,13 @@ _EVENT_STATUS: Mapping[RunTransitionEvent, RunStatus] = {
     RunTransitionEvent.COMPLETED: RunStatus.COMPLETED,
     RunTransitionEvent.FAILED: RunStatus.FAILED,
 }
+_ALLOWED_NEXT: Mapping[RunTransitionEvent, frozenset[RunTransitionEvent]] = {
+    RunTransitionEvent.REQUEST: frozenset({RunTransitionEvent.QUEUED}),
+    RunTransitionEvent.QUEUED: frozenset({RunTransitionEvent.RUNNING, RunTransitionEvent.FAILED}),
+    RunTransitionEvent.RUNNING: frozenset(
+        {RunTransitionEvent.COMPLETED, RunTransitionEvent.FAILED}
+    ),
+}
 _SAFE_FAILURE_MESSAGES: Mapping[RunFailureCode, str] = {
     RunFailureCode.GENERATION_FAILED: "solution generation failed",
     RunFailureCode.JUDGE_INFRASTRUCTURE: "judge infrastructure failed",
@@ -85,11 +107,23 @@ class ProblemNotFoundError(KeyError):
 
 
 class RunNotFoundError(KeyError):
-    """The requested run has no immutable index artifact."""
+    """The requested run has no immutable request artifact."""
 
 
 class InvalidRunHistoryError(RuntimeError):
     """An immutable transition chain is missing, malformed, or disconnected."""
+
+
+class TerminalRunError(RuntimeError):
+    """A terminal immutable run cannot accept another transition."""
+
+
+class TransitionConflictError(RuntimeError):
+    """The requested transition is invalid for the latest persisted state."""
+
+
+class RunFailurePersistenceError(RuntimeError):
+    """A terminal failure could not be durably recorded."""
 
 
 class Catalog(Protocol):
@@ -168,7 +202,7 @@ class RunService:
         with self._lock:
             request_ref = self._artifacts.write_json(request_path, request_payload)
             base_hashes = {"request": request_ref.content_hash}
-            first = self._make_transition(
+            first_transition = self._make_transition(
                 run_id=run_id,
                 request=request,
                 event=RunTransitionEvent.REQUEST,
@@ -179,7 +213,7 @@ class RunService:
                 previous_hash=None,
                 artifact_hashes=base_hashes,
             )
-            first_ref = self._write_transition(first)
+            first_ref = self._write_transition(first_transition)
             queued = self._make_transition(
                 run_id=run_id,
                 request=request,
@@ -198,8 +232,15 @@ class RunService:
             )
         try:
             self._executor.submit(lambda: self._execute(run_id, request, bundle))
+        except RunFailurePersistenceError:
+            raise
         except Exception:
-            self._append_failure(run_id, request, RunFailureCode.EXECUTOR_FAILURE)
+            try:
+                self._append_failure(run_id, request, RunFailureCode.EXECUTOR_FAILURE)
+            except ArtifactStoreError as error:
+                raise RunFailurePersistenceError(
+                    "failed to persist executor failure transition"
+                ) from error
         return RunAcceptedResponse(run_id=run_id)
 
     def get_run(self, run_id: str) -> RunReadResponse:
@@ -240,15 +281,17 @@ class RunService:
         return InternalRunReport.model_validate(payload)
 
     def get_transition_history(self, run_id: str) -> tuple[StoredRunTransition, ...]:
+        history = self._load_transition_history(run_id, allow_partial=False)
+        return history
+
+    def _load_transition_history(
+        self, run_id: str, *, allow_partial: bool
+    ) -> tuple[StoredRunTransition, ...]:
         self._validate_component(run_id)
-        index_path = Path("run-index") / f"{run_id}.json"
         try:
-            index_payload = self._artifacts.read_json(index_path)
+            request_payload = self._artifacts.read_json(Path("runs") / run_id / "request.json")
         except ArtifactStoreError as error:
             raise RunNotFoundError(f"unknown run ID: {run_id}") from error
-        if not isinstance(index_payload, Mapping) or index_payload.get("run_id") != run_id:
-            raise InvalidRunHistoryError("run index identity is invalid")
-        request_payload = self._artifacts.read_json(Path("runs") / run_id / "request.json")
         request_hash = sha256_json(request_payload)
         paths = self._artifacts.list_json(Path("runs") / run_id / "transitions")
         stored: list[StoredRunTransition] = []
@@ -278,31 +321,95 @@ class RunService:
                 raise InvalidRunHistoryError("run transition hash chain is disconnected")
             stored.append(StoredRunTransition(transition=transition, content_hash=content_hash))
             previous_hash = content_hash
-        self._validate_event_chain(tuple(item.transition.event for item in stored))
+        events = tuple(item.transition.event for item in stored)
+        if allow_partial and events in {(), (RunTransitionEvent.REQUEST,)}:
+            return tuple(stored)
+        self._validate_event_chain(events)
         return tuple(stored)
 
     def reconcile_abandoned_runs(self) -> tuple[str, ...]:
         reconciled: list[str] = []
         with self._lock:
-            for index_path in self._artifacts.list_json("run-index"):
-                payload = self._artifacts.read_json(index_path)
-                if not isinstance(payload, Mapping) or not isinstance(payload.get("run_id"), str):
-                    raise InvalidRunHistoryError("run index artifact is invalid")
-                run_id = payload["run_id"]
-                history = self.get_transition_history(run_id)
+            for run_path in self._artifacts.list_directories("runs"):
+                run_id = run_path.name
+                try:
+                    self._validate_component(run_id)
+                    request = RunCreateRequest.model_validate(
+                        self._artifacts.read_json(run_path / "request.json")
+                    )
+                except (ArtifactStoreError, ValidationError, TypeError, ValueError) as error:
+                    raise InvalidRunHistoryError(
+                        f"run {run_id!r} has an invalid request artifact"
+                    ) from error
+                history = self._load_transition_history(run_id, allow_partial=True)
+                history = self._recover_partial_queue(run_id, request, history)
                 latest = history[-1].transition
                 if latest.event not in {RunTransitionEvent.QUEUED, RunTransitionEvent.RUNNING}:
                     continue
-                request = RunCreateRequest.model_validate(
-                    self._artifacts.read_json(Path("runs") / run_id / "request.json")
-                )
-                self._append_failure(
-                    run_id,
-                    request,
-                    RunFailureCode.ABANDONED_ON_RESTART,
-                )
-                reconciled.append(run_id)
+                try:
+                    stored = self._append_failure(
+                        run_id,
+                        request,
+                        RunFailureCode.ABANDONED_ON_RESTART,
+                    )
+                except TerminalRunError:
+                    continue
+                except ArtifactStoreError as error:
+                    raise RunFailurePersistenceError(
+                        "failed to persist restart failure transition"
+                    ) from error
+                if stored is not None:
+                    reconciled.append(run_id)
         return tuple(reconciled)
+
+    def _recover_partial_queue(
+        self,
+        run_id: str,
+        request: RunCreateRequest,
+        history: tuple[StoredRunTransition, ...],
+    ) -> tuple[StoredRunTransition, ...]:
+        request_payload = self._artifacts.read_json(Path("runs") / run_id / "request.json")
+        request_hash = sha256_json(request_payload)
+        if not history:
+            created_at = self._aware_now()
+            first_transition = self._make_transition(
+                run_id=run_id,
+                request=request,
+                event=RunTransitionEvent.REQUEST,
+                sequence=0,
+                occurred_at=created_at,
+                created_at=created_at,
+                request_hash=request_hash,
+                previous_hash=None,
+                artifact_hashes={"request": request_hash},
+            )
+            try:
+                self._write_transition(first_transition)
+            except ArtifactExistsError:
+                pass
+            history = self._load_transition_history(run_id, allow_partial=True)
+        if len(history) == 1:
+            first_stored = history[0]
+            queued = self._make_transition(
+                run_id=run_id,
+                request=request,
+                event=RunTransitionEvent.QUEUED,
+                sequence=1,
+                occurred_at=self._aware_now(),
+                created_at=first_stored.transition.manifest.created_at,
+                request_hash=request_hash,
+                previous_hash=first_stored.content_hash,
+                artifact_hashes={
+                    "request": request_hash,
+                    "previous_transition": first_stored.content_hash,
+                },
+            )
+            try:
+                self._write_transition(queued)
+            except ArtifactExistsError:
+                pass
+            history = self._load_transition_history(run_id, allow_partial=False)
+        return history
 
     def list_public_problems(self) -> tuple[ProblemSummaryResponse, ...]:
         responses: list[ProblemSummaryResponse] = []
@@ -334,8 +441,11 @@ class RunService:
         bundle: ProblemBundle,
     ) -> None:
         phase = "start"
+        running_claim: StoredRunTransition | None = None
         try:
-            self._append_event(run_id, request, RunTransitionEvent.RUNNING)
+            running_claim = self._append_event(run_id, request, RunTransitionEvent.RUNNING)
+            if running_claim is None:
+                return
             phase = "generation"
             if request.mode is RunMode.SOLVE_AND_AUDIT:
                 trace = self._generator.generate(bundle.record)
@@ -345,6 +455,8 @@ class RunService:
                 if request.trace is None:  # pragma: no cover - DTO invariant
                     raise ValueError("audit trace missing")
                 trace = request.trace
+            if not self._claim_is_current(run_id, running_claim.content_hash):
+                return
             phase = "judge"
             judge_evidence = self._judge.judge(bundle.record, trace.code)
             if (
@@ -352,6 +464,8 @@ class RunService:
                 or judge_evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
             ):
                 raise InfrastructureEvidenceError("judge infrastructure unavailable")
+            if not self._claim_is_current(run_id, running_claim.content_hash):
+                return
             phase = "review"
             findings = self._rules.evaluate(trace)
             reviews = self._reviews.review(bundle.record, bundle.oracle, trace)
@@ -363,12 +477,33 @@ class RunService:
                 rule_findings=findings,
                 reviews=reviews,
             )
+            if not self._claim_is_current(run_id, running_claim.content_hash):
+                return
             phase = "artifact"
-            self._complete(run_id, request, bundle, trace, audit)
+            self._complete(
+                run_id,
+                request,
+                bundle,
+                trace,
+                audit,
+                running_claim_hash=running_claim.content_hash,
+            )
+        except (TerminalRunError, TransitionConflictError):
+            return
         except ArtifactStoreError:
-            self._append_failure(run_id, request, RunFailureCode.ARTIFACT_FAILURE)
+            self._append_owned_failure(
+                run_id,
+                request,
+                RunFailureCode.ARTIFACT_FAILURE,
+                running_claim,
+            )
         except InfrastructureEvidenceError:
-            self._append_failure(run_id, request, RunFailureCode.JUDGE_INFRASTRUCTURE)
+            self._append_owned_failure(
+                run_id,
+                request,
+                RunFailureCode.JUDGE_INFRASTRUCTURE,
+                running_claim,
+            )
         except Exception:
             code = {
                 "generation": RunFailureCode.GENERATION_FAILED,
@@ -376,7 +511,7 @@ class RunService:
                 "review": RunFailureCode.REVIEW_FAILED,
                 "artifact": RunFailureCode.ARTIFACT_FAILURE,
             }.get(phase, RunFailureCode.INTERNAL_FAILURE)
-            self._append_failure(run_id, request, code)
+            self._append_owned_failure(run_id, request, code, running_claim)
 
     def _complete(
         self,
@@ -385,7 +520,11 @@ class RunService:
         bundle: ProblemBundle,
         trace: SolutionTrace,
         audit: AuditReport,
+        *,
+        running_claim_hash: str,
     ) -> None:
+        if not self._claim_is_current(run_id, running_claim_hash):
+            return
         internal_payload = InternalRunReport(
             run_id=run_id,
             problem_id=request.problem_id,
@@ -401,13 +540,32 @@ class RunService:
             run_id=run_id,
             problem_id=request.problem_id,
             mode=request.mode,
-            trace=cast(
-                dict[str, Any],
-                self._sanitize_public(trace.model_dump(mode="json"), protected),
+            trace=PublicSolutionTrace.model_validate(
+                self._sanitize_public(trace.model_dump(mode="json"), protected)
             ),
-            audit=cast(
-                dict[str, Any],
-                self._sanitize_public(audit.model_dump(mode="json"), protected),
+            audit=PublicAuditReport(
+                run_id=audit.run_id,
+                problem_id=audit.problem_id,
+                trace_id=audit.trace_id,
+                judge=PublicJudgeReport(
+                    compile_status=audit.judge_evidence.compile_status,
+                    verdict=audit.judge_evidence.verdict,
+                    tests=tuple(
+                        PublicJudgeTestResult(
+                            test_number=number,
+                            status=item.status,
+                            time_ms=item.time_ms,
+                            memory_kb=item.memory_kb,
+                        )
+                        for number, item in enumerate(audit.judge_evidence.tests, start=1)
+                    ),
+                ),
+                final_correct=audit.final_correct,
+                process_score=audit.process_score,
+                process_valid=audit.process_valid,
+                final_error_taxonomy=audit.final_error_taxonomy,
+                first_material_error_step_id=audit.first_material_error_step_id,
+                needs_human_review=audit.needs_human_review,
             ),
         )
         public_path = Path("runs") / run_id / "public-report.json"
@@ -422,19 +580,47 @@ class RunService:
                 "internal_report": internal_ref.content_hash,
                 "public_report": public_ref.content_hash,
             },
+            expected_previous_hash=running_claim_hash,
         )
+
+    def _append_owned_failure(
+        self,
+        run_id: str,
+        request: RunCreateRequest,
+        code: RunFailureCode,
+        running_claim: StoredRunTransition | None,
+    ) -> None:
+        expected_hash = None if running_claim is None else running_claim.content_hash
+        if expected_hash is not None and not self._claim_is_current(run_id, expected_hash):
+            return
+        try:
+            self._append_failure(
+                run_id,
+                request,
+                code,
+                expected_previous_hash=expected_hash,
+            )
+        except (TerminalRunError, TransitionConflictError):
+            return
+        except ArtifactStoreError as error:
+            raise RunFailurePersistenceError(
+                "failed to persist terminal failure transition"
+            ) from error
 
     def _append_failure(
         self,
         run_id: str,
         request: RunCreateRequest,
         code: RunFailureCode,
-    ) -> None:
-        self._append_event(
+        *,
+        expected_previous_hash: str | None = None,
+    ) -> StoredRunTransition | None:
+        return self._append_event(
             run_id,
             request,
             RunTransitionEvent.FAILED,
             failure=RunFailure(code=code, message=_SAFE_FAILURE_MESSAGES[code]),
+            expected_previous_hash=expected_previous_hash,
         )
 
     def _append_event(
@@ -447,10 +633,23 @@ class RunService:
         public_report_path: str | None = None,
         new_artifact_hashes: Mapping[str, str] | None = None,
         failure: RunFailure | None = None,
-    ) -> None:
+        expected_previous_hash: str | None = None,
+    ) -> StoredRunTransition | None:
         with self._lock:
             history = self.get_transition_history(run_id)
             latest = history[-1]
+            latest_event = latest.transition.event
+            if latest_event in {
+                RunTransitionEvent.COMPLETED,
+                RunTransitionEvent.FAILED,
+            }:
+                raise TerminalRunError(f"run is already terminal: {run_id}")
+            if expected_previous_hash is not None and latest.content_hash != expected_previous_hash:
+                return None
+            if event not in _ALLOWED_NEXT.get(latest_event, frozenset()):
+                raise TransitionConflictError(
+                    f"cannot append {event.value} after {latest_event.value}"
+                )
             artifact_hashes = dict(latest.transition.manifest.artifact_hashes)
             artifact_hashes["previous_transition"] = latest.content_hash
             artifact_hashes.update(new_artifact_hashes or {})
@@ -468,7 +667,24 @@ class RunService:
                 public_report_path=public_report_path,
                 failure=failure,
             )
-            self._write_transition(transition)
+            try:
+                ref = self._write_transition(transition)
+            except ArtifactExistsError:
+                competing_history = self.get_transition_history(run_id)
+                if competing_history[-1].transition.sequence >= transition.sequence:
+                    return None
+                raise
+            return StoredRunTransition(
+                transition=transition,
+                content_hash=ref.content_hash,
+            )
+
+    def _claim_is_current(self, run_id: str, claim_hash: str) -> bool:
+        latest = self.get_transition_history(run_id)[-1]
+        return (
+            latest.transition.event is RunTransitionEvent.RUNNING
+            and latest.content_hash == claim_hash
+        )
 
     def _make_transition(
         self,
@@ -523,12 +739,7 @@ class RunService:
         )
 
     def _write_transition(self, transition: RunTransition) -> ArtifactRef:
-        path = (
-            Path("runs")
-            / transition.run_id
-            / "transitions"
-            / f"{transition.sequence:06d}-{transition.event.value}.json"
-        )
+        path = Path("runs") / transition.run_id / "transitions" / f"{transition.sequence:06d}.json"
         return self._artifacts.write_json(path, transition.model_dump(mode="json"))
 
     def _get_formal_bundle(self, problem_id: str) -> ProblemBundle:
@@ -563,45 +774,52 @@ class RunService:
             RunTransitionEvent.QUEUED,
         ):
             raise InvalidRunHistoryError("run transition chain must begin request -> queued")
-        allowed = {
-            RunTransitionEvent.QUEUED: {
-                RunTransitionEvent.RUNNING,
-                RunTransitionEvent.FAILED,
-            },
-            RunTransitionEvent.RUNNING: {
-                RunTransitionEvent.COMPLETED,
-                RunTransitionEvent.FAILED,
-            },
-        }
         for previous, current in zip(events[1:], events[2:]):
-            if current not in allowed.get(previous, set()):
+            if current not in _ALLOWED_NEXT.get(previous, frozenset()):
                 raise InvalidRunHistoryError("run transition event order is invalid")
 
     @staticmethod
     def _protected_literals(bundle: ProblemBundle) -> tuple[str, ...]:
-        values: list[str] = [bundle.reference_cpp]
+        normalized: set[str] = set()
 
-        def collect(value: Any) -> None:
-            if isinstance(value, str) and value:
-                values.append(value)
+        def add(value: str) -> None:
+            compact = " ".join(value.split()).casefold()
+            if compact:
+                normalized.add(compact)
+
+        add(bundle.reference_cpp)
+        for line in bundle.reference_cpp.splitlines():
+            if len(line.strip()) >= 12:
+                add(line)
+        for test in (*bundle.record.hidden_tests, *bundle.record.generated_tests):
+            add(test.test_id)
+            add(test.input_data)
+            add(test.expected_output)
+
+        oracle_values: list[str] = []
+
+        def collect_oracle(value: Any) -> None:
+            if isinstance(value, str):
+                oracle_values.append(" ".join(value.split()).casefold())
             elif isinstance(value, Mapping):
                 for item in value.values():
-                    collect(item)
+                    collect_oracle(item)
             elif isinstance(value, (list, tuple)):
                 for item in value:
-                    collect(item)
+                    collect_oracle(item)
 
-        for test in (*bundle.record.hidden_tests, *bundle.record.generated_tests):
-            collect(test.test_id)
-            collect(test.input_data)
-            collect(test.expected_output)
-        collect(
-            bundle.oracle.model_dump(
-                mode="json",
-                exclude={"schema_version", "problem_id"},
-            )
+        collect_oracle(
+            bundle.oracle.model_dump(mode="json", exclude={"schema_version", "problem_id"})
         )
-        return tuple(sorted(set(values), key=len, reverse=True))
+        for value in oracle_values:
+            words = value.split()
+            if len(words) <= 1:
+                add(value)
+                continue
+            for width in range(2, len(words) + 1):
+                for start in range(len(words) - width + 1):
+                    add(" ".join(words[start : start + width]))
+        return tuple(sorted(normalized, key=len, reverse=True))
 
     @classmethod
     def _sanitize_credentials(cls, value: Any) -> Any:
@@ -632,7 +850,18 @@ class RunService:
             return [cls._sanitize_public(item, protected) for item in value]
         if isinstance(value, str):
             result = cast(str, cls._sanitize_credentials(value))
-            for literal in protected:
-                result = result.replace(literal, "[REDACTED]")
-            return _ABSOLUTE_PATH.sub("[REDACTED_PATH]", result)
+            normalized = " ".join(result.split()).casefold()
+            if _ABSOLUTE_PATH.search(result) or cls._contains_protected(normalized, protected):
+                return "[REDACTED]"
+            return result
         return value
+
+    @staticmethod
+    def _contains_protected(normalized: str, protected: tuple[str, ...]) -> bool:
+        for literal in protected:
+            if literal.isalnum():
+                if re.search(rf"(?<!\w){re.escape(literal)}(?!\w)", normalized):
+                    return True
+            elif literal in normalized:
+                return True
+        return False
