@@ -6,7 +6,6 @@ import argparse
 import json
 import re
 import sys
-from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -14,7 +13,8 @@ from typing import Any, Literal, Self, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from .artifacts import ArtifactExistsError, ArtifactStore, sha256_json
+from .artifacts import ArtifactExistsError, ArtifactStore, ArtifactStoreError, sha256_json
+from .benchmark import formal_attempt_profile_is_valid
 from .benchmark_models import (
     BenchmarkConfig,
     FormalIntegrationCandidate,
@@ -161,6 +161,8 @@ def qualify_formal_run(inputs: FormalQualificationInputs) -> Path:
         raise
     except FormalQualificationError:
         raise
+    except ArtifactStoreError as error:
+        raise FormalQualificationError("formal qualification failed closed") from error
     except (OSError, TypeError, ValueError, ValidationError) as error:
         raise FormalQualificationError("formal qualification failed closed") from error
 
@@ -186,9 +188,10 @@ def _qualify_formal_run(inputs: FormalQualificationInputs) -> FormalQualificatio
         root=inputs.data_root,
         selection=selection,
     )
-    corpus = _read_model(CorpusManifest, inputs.corpus_manifest_path)
+    corpus_payload = _read_mapping(inputs.corpus_manifest_path)
+    corpus = _validate_model(CorpusManifest, corpus_payload)
     audit = lint_corpus_manifest(
-        _read_mapping(inputs.corpus_manifest_path),
+        corpus_payload,
         root=inputs.data_root,
         selection=selection,
         bundle_manifest=bundle_manifest,
@@ -238,7 +241,10 @@ def _qualify_benchmark_chain(
     judge_payload: Mapping[str, Any],
     judge_result: FormalCorpusJudgeValidationResult,
 ) -> FormalQualificationReport:
-    if judge_result.formal_eligibility is not True:
+    if (
+        not isinstance(judge_result, FormalCorpusJudgeValidationResult)
+        or not judge_result._is_verified()
+    ):
         raise FormalQualificationError("ephemeral Judge replay result is absent")
     store = ArtifactStore(inputs.benchmark_artifact_root)
     candidate_payload = _read_mapping(inputs.candidate_path)
@@ -436,7 +442,14 @@ def _corpus_first_error_step(sample: CorpusSample, *, data_root: Path) -> int | 
     if sample.first_error_step_id is None:
         return None
     trace_path = data_root / sample.trace.path
-    trace = _read_model(SolutionTrace, trace_path)
+    snapshot = read_trusted_file(
+        trace_path,
+        logical_id=f"formal-trace-{sample.sample_id}",
+        max_bytes=sample.trace.byte_length,
+    )
+    if snapshot.byte_length != sample.trace.byte_length or snapshot.sha256 != sample.trace.sha256:
+        raise FormalQualificationError("corpus trace changed after validation")
+    trace = SolutionTrace.model_validate_json(snapshot.contents)
     return next(
         step.step_number for step in trace.steps if step.step_id == sample.first_error_step_id
     )
@@ -481,49 +494,8 @@ def _validate_formal_attempt_profile(
     observations: tuple[MetricObservation, ...],
     events: tuple[LedgerEvent, ...],
 ) -> None:
-    known = set(config.ordered_sample_ids)
-    natural = set(config.generation_sample_ids)
-    arbitrated = {row.sample_id for row in observations if row.arbitration_used}
-    allowed = {
-        config.generator_prompt_version,
-        config.logic_review_prompt_version,
-        config.adversarial_review_prompt_version,
-        config.arbiter_prompt_version,
-    }
-    for event in events:
-        if (
-            event.benchmark_id != config.benchmark_id
-            or event.sample_id not in known
-            or event.operation not in allowed
-            or event.phase not in {"request", "schema_repair"}
-            or (
-                event.operation == config.generator_prompt_version
-                and event.sample_id not in natural
-            )
-            or (
-                event.operation == config.arbiter_prompt_version
-                and event.sample_id not in arbitrated
-            )
-        ):
-            raise FormalQualificationError("formal attempt profile contains an invalid event")
-    required = [
-        (sample_id, config.logic_review_prompt_version) for sample_id in config.audit_sample_ids
-    ]
-    required.extend(
-        (sample_id, config.adversarial_review_prompt_version)
-        for sample_id in config.audit_sample_ids
-    )
-    required.extend(
-        (sample_id, config.generator_prompt_version) for sample_id in config.generation_sample_ids
-    )
-    required.extend((sample_id, config.arbiter_prompt_version) for sample_id in arbitrated)
-    counts = Counter(
-        (event.sample_id, event.operation)
-        for event in events
-        if event.phase == "request" and event.retry_number == 1
-    )
-    if any(counts[item] != 1 for item in required):
-        raise FormalQualificationError("formal attempt profile is missing a required request")
+    if not formal_attempt_profile_is_valid(config, observations, events):
+        raise FormalQualificationError("formal attempt profile contains an invalid event sequence")
 
 
 def _require_canonical_input_path(path: Path, *, root: Path, relative: Path) -> None:

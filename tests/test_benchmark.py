@@ -795,6 +795,118 @@ def test_schema_repair_cannot_replace_a_required_primary_review_request(
     assert report.formal_candidate_complete is False
 
 
+def test_task6_formal_attempt_profile_rejects_retry_two_before_retry_one(
+    tmp_path: Path,
+) -> None:
+    base_config, rows = formal_profile(benchmark_id="formal-retry-gap")
+    benchmark_config = BenchmarkConfig.model_validate(
+        {**base_config.model_dump(mode="json"), "remote_attempt_budget": 500}
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    ledger = ArtifactAttemptLedger(artifacts, benchmark_id=benchmark_config.benchmark_id)
+    budget = RemoteAttemptBudget(
+        limit=benchmark_config.remote_attempt_budget,
+        event_sink=ledger.record,
+        benchmark_id=benchmark_config.benchmark_id,
+    )
+    by_id = {row.sample_id: row for row in rows}
+    first_sample = benchmark_config.ordered_sample_ids[0]
+
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
+        if sample_id in benchmark_config.generation_sample_ids:
+            observer(
+                Hy3AttemptContext(
+                    operation=benchmark_config.generator_prompt_version,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        for operation in (
+            benchmark_config.logic_review_prompt_version,
+            benchmark_config.adversarial_review_prompt_version,
+        ):
+            if (
+                sample_id == first_sample
+                and operation == benchmark_config.logic_review_prompt_version
+            ):
+                observer(Hy3AttemptContext(operation=operation, phase="request", retry_number=2))
+            observer(Hy3AttemptContext(operation=operation, phase="request", retry_number=1))
+        return by_id[sample_id]
+
+    report = BenchmarkRunner(
+        config=benchmark_config,
+        artifacts=artifacts,
+        budget=budget,
+        ledger=ledger,
+        human_labels=formal_human_labels(rows),
+    ).run(execute)
+
+    assert report.remote_attempts_used == 391
+    assert report.formal_attempt_profile_valid is False
+    assert report.formal_candidate_complete is False
+    assert report.formal_eligible is False
+
+
+def test_task6_formal_attempt_profile_preserves_contiguous_retry_and_repair_block(
+    tmp_path: Path,
+) -> None:
+    base_config, rows = formal_profile(benchmark_id="formal-valid-retries")
+    benchmark_config = BenchmarkConfig.model_validate(
+        {**base_config.model_dump(mode="json"), "remote_attempt_budget": 500}
+    )
+    artifacts = ArtifactStore(tmp_path / "artifacts")
+    ledger = ArtifactAttemptLedger(artifacts, benchmark_id=benchmark_config.benchmark_id)
+    budget = RemoteAttemptBudget(
+        limit=benchmark_config.remote_attempt_budget,
+        event_sink=ledger.record,
+        benchmark_id=benchmark_config.benchmark_id,
+    )
+    by_id = {row.sample_id: row for row in rows}
+    first_sample = benchmark_config.ordered_sample_ids[0]
+
+    def execute(sample_id: str, observer: Callable[[Hy3AttemptContext], None]) -> MetricObservation:
+        if sample_id in benchmark_config.generation_sample_ids:
+            observer(
+                Hy3AttemptContext(
+                    operation=benchmark_config.generator_prompt_version,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+        for operation in (
+            benchmark_config.logic_review_prompt_version,
+            benchmark_config.adversarial_review_prompt_version,
+        ):
+            phases = (
+                (("request", 1), ("request", 2), ("schema_repair", 1), ("schema_repair", 2))
+                if sample_id == first_sample
+                and operation == benchmark_config.logic_review_prompt_version
+                else (("request", 1),)
+            )
+            for phase, retry_number in phases:
+                observer(
+                    Hy3AttemptContext(
+                        operation=operation,
+                        phase=phase,
+                        retry_number=retry_number,
+                    )
+                )
+        return by_id[sample_id]
+
+    report = BenchmarkRunner(
+        config=benchmark_config,
+        artifacts=artifacts,
+        budget=budget,
+        ledger=ledger,
+        human_labels=formal_human_labels(rows),
+    ).run(execute)
+
+    assert report.remote_attempts_used == 393
+    assert report.formal_attempt_profile_valid is True
+    assert report.formal_candidate_complete is True
+    assert report.formal_eligible is False
+
+
 def test_formal_metrics_keep_exact_kind_denominators_when_detection_quality_is_zero(
     tmp_path: Path,
 ) -> None:

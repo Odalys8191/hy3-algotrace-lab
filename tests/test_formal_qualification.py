@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import importlib
 import importlib.util
 import json
 import os
+import pickle
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -49,6 +51,8 @@ from hy3_algotrace.dataset_models import (
     validate_acquired_assets,
 )
 from hy3_algotrace.differential import (
+    FormalCorpusJudgeValidationReport,
+    FormalCorpusJudgeValidationResult,
     JudgeCaseKind,
     JudgeSourceCase,
     validate_formal_corpus_judge_cases,
@@ -83,6 +87,52 @@ class FormalFixture:
 def _write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(canonical_json_bytes(value))
+
+
+def _formal_cli_command(environment: dict[str, str]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "hy3_algotrace.formal_qualification",
+        "--selection",
+        environment["HY3_FORMAL_SELECTION"],
+        "--acquisition",
+        environment["HY3_FORMAL_ACQUISITION"],
+        "--acquisition-validation",
+        environment["HY3_FORMAL_ACQUISITION_VALIDATION"],
+        "--validation-raw",
+        environment["HY3_FORMAL_VALIDATION_RAW"],
+        "--test-raw",
+        environment["HY3_FORMAL_TEST_RAW"],
+        "--validation-format",
+        environment["HY3_FORMAL_VALIDATION_FORMAT"],
+        "--test-format",
+        environment["HY3_FORMAL_TEST_FORMAT"],
+        "--validation-reviews",
+        environment["HY3_FORMAL_VALIDATION_REVIEWS"],
+        "--test-reviews",
+        environment["HY3_FORMAL_TEST_REVIEWS"],
+        "--review-manifest",
+        environment["HY3_FORMAL_REVIEW_MANIFEST"],
+        "--bundles",
+        environment["HY3_FORMAL_BUNDLES"],
+        "--corpus",
+        environment["HY3_FORMAL_CORPUS"],
+        "--data-root",
+        environment["HY3_FORMAL_DATA_ROOT"],
+        "--judge-cases",
+        environment["HY3_FORMAL_JUDGE_CASES"],
+        "--judge-report",
+        environment["HY3_FORMAL_JUDGE_EVIDENCE"],
+        "--judge-raw-evidence",
+        environment["HY3_FORMAL_JUDGE_RAW_EVIDENCE"],
+        "--candidate",
+        environment["HY3_FORMAL_BENCHMARK_CANDIDATE"],
+        "--benchmark-root",
+        environment["HY3_FORMAL_BENCHMARK_ROOT"],
+        "--output-root",
+        environment["HY3_FORMAL_QUALIFICATION_ROOT"],
+    ]
 
 
 def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> FormalFixture:
@@ -189,7 +239,8 @@ def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> F
             problem=records[sample.problem_id],
             cpp_source=(data_root / sample.cpp_source.path).read_text(encoding="utf-8"),
         )
-        for sample in controlled
+        for sample in corpus.samples
+        if sample.kind is not CorpusSampleKind.NATURAL
     )
     raw_evidence = {
         case.case_id: JudgeEvidence(
@@ -463,6 +514,65 @@ def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> F
     )
 
 
+def _rewrite_ledger_sequence(fixture: FormalFixture, mutation: str) -> None:
+    candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+    base = fixture.benchmark_root / "benchmarks" / candidate["benchmark_id"]
+    config_path = base / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["remote_attempt_budget"] = 500
+    _write_json(config_path, config)
+    candidate["config_hash"] = sha256_json(config)
+    ledger_path = base / "ledger-index.json"
+    ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
+    events = [
+        json.loads((fixture.benchmark_root / path).read_text(encoding="utf-8"))
+        for path in ledger["event_paths"]
+    ]
+    if mutation == "retry-999":
+        retry_999 = {**events[0], "retry_number": 999}
+        events.insert(1, retry_999)
+    elif mutation == "retry-gap":
+        retry_two = {**events[0], "retry_number": 2}
+        events.insert(0, retry_two)
+    elif mutation == "repair-before-request":
+        repair = {**events[0], "phase": "schema_repair", "retry_number": 1}
+        events.insert(0, repair)
+    elif mutation == "repeated-repair":
+        repair = {**events[0], "phase": "schema_repair", "retry_number": 1}
+        events[1:1] = [repair, repair.copy()]
+    elif mutation == "operation-order":
+        events[0], events[1] = events[1], events[0]
+    else:
+        first_sample = events[0]["sample_id"]
+        first_block_end = next(
+            index for index, event in enumerate(events) if event["sample_id"] != first_sample
+        )
+        second_sample = events[first_block_end]["sample_id"]
+        second_block_end = next(
+            index
+            for index, event in enumerate(events[first_block_end:], start=first_block_end)
+            if event["sample_id"] != second_sample
+        )
+        events[:second_block_end] = (
+            events[first_block_end:second_block_end] + events[:first_block_end]
+        )
+    event_paths: list[str] = []
+    event_hashes: list[str] = []
+    relative_base = Path("benchmarks") / candidate["benchmark_id"] / "ledger"
+    for sequence, event in enumerate(events, start=1):
+        event["sequence"] = sequence
+        relative_path = relative_base / f"{sequence:06d}.json"
+        _write_json(fixture.benchmark_root / relative_path, event)
+        event_paths.append(relative_path.as_posix())
+        event_hashes.append(sha256_json(event))
+    ledger["event_paths"] = event_paths
+    ledger["event_hashes"] = event_hashes
+    _write_json(ledger_path, ledger)
+    candidate["ledger_index_hash"] = sha256_json(ledger)
+    candidate["remote_attempts_used"] = len(events)
+    _write_json(fixture.candidate_path, candidate)
+
+
 def test_complete_same_process_chain_creates_one_nonleaking_content_addressed_report(
     tmp_path: Path,
 ) -> None:
@@ -507,6 +617,110 @@ def test_report_hashes_credential_shaped_outward_benchmark_identity(tmp_path: Pa
     assert report["benchmark_hash"] == sha256_json(benchmark_id)
     assert benchmark_id not in report_path.read_text(encoding="utf-8")
     assert "benchmark_id" not in report
+
+
+def test_formal_bridge_uses_one_corpus_manifest_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    corpus_path = Path(fixture.inputs["corpus_manifest_path"])
+    original_read_json = module._read_json
+    swapped = False
+
+    def read_then_replace(path: Path) -> Any:
+        nonlocal swapped
+        payload = original_read_json(path)
+        if path == corpus_path and not swapped:
+            swapped = True
+            replacement = dict(payload)
+            replacement["content_hash"] = "f" * 64
+            _write_json(corpus_path, replacement)
+        return payload
+
+    monkeypatch.setattr(module, "_read_json", read_then_replace)
+
+    report_path = module.qualify_formal_run(fixture.bridge_inputs())
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["corpus_hash"] != "f" * 64
+
+
+def test_formal_bridge_revalidates_trace_snapshot_after_lint_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    corpus = json.loads(Path(fixture.inputs["corpus_manifest_path"]).read_text(encoding="utf-8"))
+    sample = next(item for item in corpus["samples"] if item["first_error_step_id"] is not None)
+    trace_path = Path(fixture.inputs["data_root"]) / sample["trace"]["path"]
+    original_lint = module.lint_corpus_manifest
+
+    def lint_then_replace(*args: Any, **kwargs: Any) -> Any:
+        audit = original_lint(*args, **kwargs)
+        trace = json.loads(trace_path.read_text(encoding="utf-8"))
+        trace["algorithm"] = "post-lint unvalidated replacement"
+        _write_json(trace_path, trace)
+        return audit
+
+    monkeypatch.setattr(module, "lint_corpus_manifest", lint_then_replace)
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
+@pytest.mark.parametrize("transfer", ("pickle", "copy", "deepcopy"))
+def test_formal_judge_capability_rejects_serialization_and_copy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    transfer: str,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    original_replay = module.validate_persisted_formal_judge_evidence
+    captured: list[FormalCorpusJudgeValidationResult] = []
+
+    def capture_replay(*args: Any, **kwargs: Any) -> FormalCorpusJudgeValidationResult:
+        result = original_replay(*args, **kwargs)
+        captured.append(result)
+        return result
+
+    monkeypatch.setattr(module, "validate_persisted_formal_judge_evidence", capture_replay)
+    module.qualify_formal_run(fixture.bridge_inputs())
+    capability = captured[0]
+
+    with pytest.raises(TypeError):
+        if transfer == "pickle":
+            pickle.dumps(capability)
+        elif transfer == "copy":
+            copy.copy(capability)
+        else:
+            copy.deepcopy(capability)
+
+
+def test_formal_bridge_rejects_forged_deserialized_judge_capability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    evidence_payload = json.loads(
+        Path(fixture.inputs["judge_report_path"]).read_text(encoding="utf-8")
+    )
+    forged = object.__new__(FormalCorpusJudgeValidationResult)
+    object.__setattr__(
+        forged,
+        "evidence_manifest",
+        FormalCorpusJudgeValidationReport.model_validate_json(json.dumps(evidence_payload)),
+    )
+    object.__setattr__(forged, "formal_eligibility", True)
+    monkeypatch.setattr(
+        module,
+        "validate_persisted_formal_judge_evidence",
+        lambda *args, **kwargs: forged,
+    )
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
 
 
 @pytest.mark.parametrize(
@@ -694,6 +908,97 @@ def test_formal_bridge_rejects_independent_benchmark_chain_mutations(
         _write_json(fixture.candidate_path, candidate)
     with pytest.raises(module.FormalQualificationError):
         module.qualify_formal_run(fixture.bridge_inputs())
+
+
+@pytest.mark.parametrize("mutation", ("judge-case-order", "judge-evidence-order"))
+def test_formal_bridge_rejects_reordered_controlled_judge_encodings(
+    tmp_path: Path, mutation: str
+) -> None:
+    fixture = _build_fixture(tmp_path / mutation)
+    if mutation == "judge-case-order":
+        path = Path(fixture.inputs["judge_cases_path"])
+        cases = json.loads(path.read_text(encoding="utf-8"))
+        _write_json(path, list(reversed(cases)))
+    else:
+        path = Path(fixture.inputs["judge_report_path"])
+        evidence = json.loads(path.read_text(encoding="utf-8"))
+        evidence["cases"] = list(reversed(evidence["cases"]))
+        evidence["content_hash"] = sha256_json(
+            {key: value for key, value in evidence.items() if key != "content_hash"}
+        )
+        _write_json(path, evidence)
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        config_path = (
+            fixture.benchmark_root / "benchmarks" / candidate["benchmark_id"] / "config.json"
+        )
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["verified_data_evidence"]["artifact_hash"] = sha256_json(evidence)
+        _write_json(config_path, config)
+        candidate["config_hash"] = sha256_json(config)
+        _write_json(fixture.candidate_path, candidate)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "retry-999",
+        "retry-gap",
+        "repair-before-request",
+        "repeated-repair",
+        "operation-order",
+        "sample-order",
+    ),
+)
+def test_formal_bridge_rejects_impossible_attempt_sequences(tmp_path: Path, mutation: str) -> None:
+    fixture = _build_fixture(tmp_path / mutation)
+    _rewrite_ledger_sequence(fixture, mutation)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
+def test_missing_nested_benchmark_input_is_safe_exit_two_across_public_gates(
+    tmp_path: Path,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+    config_path = fixture.benchmark_root / "benchmarks" / candidate["benchmark_id"] / "config.json"
+    config_path.unlink()
+
+    direct = subprocess.run(
+        _formal_cli_command(fixture.script_environment),
+        cwd=REPOSITORY_ROOT,
+        env=fixture.script_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    readiness = subprocess.run(
+        ["sh", "scripts/formal-readiness.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=fixture.script_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    release = subprocess.run(
+        ["sh", "scripts/formal-release-gate.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=fixture.script_environment,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    for result in (direct, readiness, release):
+        assert result.returncode == 2
+        assert "formal qualification failed closed" in result.stderr
+        assert "Traceback" not in result.stderr
 
 
 def test_formal_qualification_cli_and_release_scripts_propagate_fail_closed_statuses(

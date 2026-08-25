@@ -134,6 +134,73 @@ class ArtifactAttemptLedger:
         )
 
 
+_FORMAL_MAX_RETRIES_PER_PHASE = 3
+
+
+def formal_attempt_profile_is_valid(
+    config: BenchmarkConfig,
+    observations: tuple[MetricObservation, ...],
+    events: tuple[LedgerEvent, ...],
+) -> bool:
+    """Validate the frozen per-sample operation, retry, and repair state machine."""
+
+    if len(observations) != len(config.ordered_sample_ids):
+        return False
+    if tuple(event.sequence for event in events) != tuple(range(1, len(events) + 1)):
+        return False
+    arbitrated = {row.sample_id for row in observations if row.arbitration_used}
+    audit = set(config.audit_sample_ids)
+    natural = set(config.generation_sample_ids)
+    cursor = 0
+    for sample_id in config.ordered_sample_ids:
+        operations: list[str] = []
+        if sample_id in natural:
+            operations.append(config.generator_prompt_version)
+        if sample_id in audit:
+            operations.extend(
+                (
+                    config.logic_review_prompt_version,
+                    config.adversarial_review_prompt_version,
+                )
+            )
+        if sample_id in arbitrated:
+            operations.append(config.arbiter_prompt_version)
+        for operation in operations:
+            start = cursor
+            request_retry = 1
+            repair_retry = 1
+            repair_started = False
+            while cursor < len(events):
+                event = events[cursor]
+                if (event.sample_id, event.operation) != (sample_id, operation):
+                    break
+                if event.benchmark_id != config.benchmark_id:
+                    return False
+                if event.phase == "request":
+                    if (
+                        repair_started
+                        or event.retry_number != request_retry
+                        or event.retry_number > _FORMAL_MAX_RETRIES_PER_PHASE
+                    ):
+                        return False
+                    request_retry += 1
+                elif event.phase == "schema_repair":
+                    if (
+                        request_retry == 1
+                        or event.retry_number != repair_retry
+                        or event.retry_number > _FORMAL_MAX_RETRIES_PER_PHASE
+                    ):
+                        return False
+                    repair_started = True
+                    repair_retry += 1
+                else:
+                    return False
+                cursor += 1
+            if cursor == start:
+                return False
+    return cursor == len(events)
+
+
 class BenchmarkRunner:
     """Execute ordered samples and publish immutable complete or partial outputs."""
 
@@ -386,60 +453,7 @@ class BenchmarkRunner:
         events = self._budget.events
         if len(events) != self._budget.used or self._ledger.events != events:
             return False
-        expected_sequences = tuple(range(1, len(events) + 1))
-        if tuple(event.sequence for event in events) != expected_sequences:
-            return False
-        known = set(self._config.ordered_sample_ids)
-        natural = set(self._config.generation_sample_ids)
-        arbitrated = {row.sample_id for row in observations if row.arbitration_used}
-        allowed_operations = {
-            self._config.generator_prompt_version,
-            self._config.logic_review_prompt_version,
-            self._config.adversarial_review_prompt_version,
-            self._config.arbiter_prompt_version,
-        }
-        for event in events:
-            if (
-                event.benchmark_id != self._config.benchmark_id
-                or event.sample_id not in known
-                or event.operation not in allowed_operations
-                or event.phase not in {"request", "schema_repair"}
-                or (
-                    event.operation == self._config.generator_prompt_version
-                    and event.sample_id not in natural
-                )
-                or (
-                    event.operation == self._config.arbiter_prompt_version
-                    and event.sample_id not in arbitrated
-                )
-            ):
-                return False
-        required = [
-            (sample_id, self._config.logic_review_prompt_version)
-            for sample_id in self._config.audit_sample_ids
-        ]
-        required.extend(
-            (sample_id, self._config.adversarial_review_prompt_version)
-            for sample_id in self._config.audit_sample_ids
-        )
-        required.extend(
-            (sample_id, self._config.generator_prompt_version)
-            for sample_id in self._config.generation_sample_ids
-        )
-        required.extend(
-            (sample_id, self._config.arbiter_prompt_version) for sample_id in arbitrated
-        )
-        return all(
-            sum(
-                event.sample_id == sample_id
-                and event.operation == operation
-                and event.phase == "request"
-                and event.retry_number == 1
-                for event in events
-            )
-            == 1
-            for sample_id, operation in required
-        )
+        return formal_attempt_profile_is_valid(self._config, observations, events)
 
     def _formal_human_labels_match(self, observations: tuple[MetricObservation, ...]) -> bool:
         if len(self._human_labels) != len(observations):

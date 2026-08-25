@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import weakref
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Literal, Protocol, runtime_checkable
+from typing import Any, Literal, Never, Protocol, SupportsIndex, runtime_checkable
 
 from pydantic import Field, ValidationError, field_validator, model_validator
 
@@ -139,14 +139,15 @@ class FormalCorpusJudgeValidationReport(DatasetModel):
 
 
 _FORMAL_REPLAY_TOKEN = object()
+_FORMAL_REPLAY_CAPABILITIES: weakref.WeakSet[Any] = weakref.WeakSet()
 
 
-@dataclass(frozen=True, slots=True, init=False)
 class FormalCorpusJudgeValidationResult:
     """Ephemeral result produced only after raw evidence and chain replay."""
 
+    __slots__ = ("evidence_manifest", "formal_eligibility", "__weakref__")
     evidence_manifest: FormalCorpusJudgeValidationReport
-    formal_eligibility: Literal[True] = True
+    formal_eligibility: Literal[True]
 
     def __init__(
         self,
@@ -158,6 +159,22 @@ class FormalCorpusJudgeValidationResult:
             raise ValueError("formal eligibility requires validated evidence replay")
         object.__setattr__(self, "evidence_manifest", evidence_manifest)
         object.__setattr__(self, "formal_eligibility", True)
+        _FORMAL_REPLAY_CAPABILITIES.add(self)
+
+    def __setattr__(self, _name: str, _value: object) -> None:
+        raise AttributeError("formal Judge replay capabilities are immutable")
+
+    def __copy__(self) -> Never:
+        raise TypeError("formal Judge replay capabilities cannot be copied")
+
+    def __deepcopy__(self, _memo: dict[int, Any]) -> Never:
+        raise TypeError("formal Judge replay capabilities cannot be copied")
+
+    def __reduce_ex__(self, _protocol: SupportsIndex) -> Never:
+        raise TypeError("formal Judge replay capabilities cannot be serialized")
+
+    def _is_verified(self) -> bool:
+        return self in _FORMAL_REPLAY_CAPABILITIES
 
 
 class DifferentialCase(DatasetModel):
@@ -337,7 +354,7 @@ def validate_persisted_formal_judge_evidence(
     validation = _validate_replayed_evidence(materialized, raw_evidence)
     if validation.counts != {"gold": 30, "mutant": 60, "paradox": 15}:
         raise DifferentialDataError("formal judge evidence must be exactly 30/60/15")
-    persisted_by_id = {case.case_id: case for case in manifest.cases}
+    expected_persisted: list[PersistedJudgeCaseEvidence] = []
     for case in materialized:
         evidence = raw_evidence[case.case_id]
         expected = PersistedJudgeCaseEvidence(
@@ -348,8 +365,16 @@ def validate_persisted_formal_judge_evidence(
             problem_hash=sha256_json(case.problem.model_dump(mode="json")),
             judge_evidence_hash=sha256_json(evidence.model_dump(mode="json")),
         )
-        if persisted_by_id.get(case.case_id) != expected:
-            raise DifferentialDataError(f"persisted judge evidence hash mismatch: {case.case_id}")
+        expected_persisted.append(expected)
+    if tuple(case.case_id for case in manifest.cases) != tuple(
+        case.case_id for case in expected_persisted
+    ):
+        raise DifferentialDataError("persisted judge evidence must match canonical corpus order")
+    for observed, expected in zip(manifest.cases, expected_persisted, strict=True):
+        if observed != expected:
+            raise DifferentialDataError(
+                f"persisted judge evidence hash mismatch: {expected.case_id}"
+            )
     return FormalCorpusJudgeValidationResult(
         evidence_manifest=manifest,
         _replay_token=_FORMAL_REPLAY_TOKEN,
@@ -383,11 +408,12 @@ def _validate_formal_case_chain(
         sample for sample in corpus.samples if sample.kind is not CorpusSampleKind.NATURAL
     )
     expected_by_id = {sample.sample_id: sample for sample in controlled}
+    expected_case_ids = tuple(sample.sample_id for sample in controlled)
     materialized = tuple(cases)
-    case_ids = [case.case_id for case in materialized]
-    if len(case_ids) != len(set(case_ids)) or set(case_ids) != set(expected_by_id):
+    case_ids = tuple(case.case_id for case in materialized)
+    if case_ids != expected_case_ids:
         raise DifferentialDataError(
-            "judge case IDs must exactly match all controlled corpus samples"
+            "judge case IDs must exactly match canonical controlled corpus order"
         )
     selected_by_id = {entry.problem_id: entry for entry in selection.entries}
     expected_kinds = {
