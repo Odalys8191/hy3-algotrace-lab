@@ -84,7 +84,7 @@ _CONTROLLED_TEST_SECRET_FIXTURE_HASHES: Mapping[tuple[str, str], frozenset[str]]
         {"3026b4e31874bdeedee136f3218c8b01d582b3c5c3441abc5428abfe282a5357"}
     ),
     ("tests/test_hy3_client.py", "api_key"): frozenset(
-        {"62af8704764faf8ea82fc61ce9c4c3908b6cb97d463a634e9e587d7c885db0ef"}
+        {"c01812d1014ec17006c443cf26b23f119c8a87114ea1ab0c9ce7daccee343cee"}
     ),
     ("tests/test_hy3_client.py", "secret"): frozenset(
         {

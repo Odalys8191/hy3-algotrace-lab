@@ -2,17 +2,22 @@
 
 ## Data and readiness gates
 
-This branch does not establish that Task 7's 30-problem/165-sample data is complete. After that
-layer is independently integrated, `scripts/data-lint.sh` validates acquired validation/test
-bytes against their frozen manifest, and `scripts/formal-readiness.sh` replays acquisition,
-selection, bundle, corpus, **and persisted/raw formal Judge evidence**. The final replay must
-derive its capability in memory from the complete hash-bound chain and prove exactly 30 gold,
-60 mutant, and 15 paradox cases. A persisted receipt cannot rehydrate eligibility; a
-`CorpusAuditReport` with pending evidence exits `3`. `scripts/formal-release-gate.sh` turns
-that not-ready signal into release-blocking exit `1`. The replay receipt and corpus audit paths
-are create-only outputs: they must be absent before the command begins, and an existing path is
-never overwritten. `scripts/docker-smoke.sh` similarly returns `64` for missing immutable CI
-inputs rather than substituting a mutable default.
+This tree does not establish that the external 30-problem/165-sample data is complete.
+`scripts/data-lint.sh` validates acquired validation/test bytes against their frozen manifest.
+`scripts/formal-readiness.sh` accepts only a complete external chain and invokes the same-process
+qualification boundary; it never pre-creates selection receipts or corpus audits. The boundary
+rebuilds the verified selection capability from raw/review bytes, validates every referenced
+bundle and corpus byte, and directly replays exactly 30 gold, 60 mutant, and 15 paradox cases
+from the original `JudgeEvidence`. Only while that ephemeral result exists does it validate the
+165 ordered observations/human labels and complete contiguous call ledger. A receipt, audit,
+persisted qualification report, or boolean cannot rehydrate eligibility.
+
+Readiness exits `3` for missing inputs/format selection, `2` for invalid data or a create-only
+output conflict, and `0` only after creating
+`formal-qualification/<content_hash>.json`. `scripts/formal-release-gate.sh` converts exit `3`
+to release failure `1` and propagates other failures. `scripts/docker-smoke.sh` returns `64` for
+missing immutable CI inputs rather than substituting a mutable default. See README for the exact
+input environment list and Compose directory layout.
 
 Only original-English Codeforces records with standard stdin/stdout, source attribution,
 acquisition hashes, conversion/reviewer linkage, and 15-cell quota evidence can progress. The

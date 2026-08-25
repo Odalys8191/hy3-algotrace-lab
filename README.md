@@ -23,7 +23,7 @@ cannot be retroactively cured by a rerun.
 ## Architecture
 
 ```text
-Task 6 Streamlit client (HTTP only; integrated after its controller merge)
+Task 6 Streamlit client (HTTP only; `ui` Compose profile)
         |  HY3_API_BASE_URL=http://api:8000
         v
 Task 5 FastAPI <- local_app.create_app() zero-argument composition
@@ -33,10 +33,10 @@ Task 5 FastAPI <- local_app.create_app() zero-argument composition
         `-- DockerJudge -> separately restricted C++17 Judge image@sha256
 ```
 
-The Streamlit process is only an HTTP client. It must not read the catalog, artifact store,
-Judge socket, hidden tests, oracle, credentials, or model endpoint. The API owns those
-boundaries. Until Task 6 is merged, the `streamlit` Compose profile deliberately points at the
-anticipated `hy3_algotrace.streamlit_app` and will not start; this is not a fabricated UI.
+The Streamlit process is only an HTTP client. It cannot read the catalog, benchmark/formal
+artifact roots, Judge socket, hidden tests, oracle, credentials, or model endpoint. The API
+owns those boundaries. The separate `formal-readiness` profile receives read-only formal inputs
+and a dedicated create-only output mount.
 
 ## Clean local verification
 
@@ -57,14 +57,15 @@ python -m ruff check .
 python -m mypy src
 python -m hy3_algotrace.release_validation --root .
 scripts/security-scan.sh
-scripts/formal-readiness.sh # exits 3 while the persisted Task 7 Judge replay is absent
+scripts/formal-readiness.sh # exits 3 while any external formal input is absent
 scripts/formal-release-gate.sh # turns that pending state into a release-blocking failure
 ```
 
-`formal-readiness.sh` exits `3` while Task 7 data/replay inputs are absent or the formal Judge
-bridge is unavailable; `formal-release-gate.sh` converts that pending state to release-blocking
-exit `1`. `docker-smoke.sh` exits `64` when immutable CI image inputs are missing. These are
-intended, honest not-ready signals, not successful verification.
+`formal-readiness.sh` exits `3` only for absent inputs or invalid format selection. A present but
+invalid/tampered chain, an existing create-only report, or any qualification failure exits `2`.
+`formal-release-gate.sh` converts readiness exit `3` to release-blocking exit `1` and propagates
+other failures. `docker-smoke.sh` exits `64` when immutable CI image inputs are missing. These
+are intended, honest not-ready/failure signals, not successful verification.
 
 ## Local Compose build and run
 
@@ -93,7 +94,7 @@ existing catalog, artifact store, Hy3 client, Docker Judge, reviewer, and backgr
 It still fails closed before formal use if the catalog, `HY3_BASE_URL`, `HY3_API_KEY`,
 `HY3_MODEL`, or immutable `HY3_JUDGE_IMAGE` is unavailable.
 
-After the Task 6 controller merge supplies the anticipated module, start the client with:
+Start the HTTP-only client with:
 
 ```sh
 docker compose --profile ui up --build
@@ -114,7 +115,7 @@ closed; do not replace it with host-process execution.
 
 ## Data acquisition and formal readiness
 
-After verified Task 7 integration, use the explicit commands rather than hand-editing reports:
+Use the explicit commands rather than hand-editing reports:
 
 ```sh
 scripts/data-lint.sh
@@ -122,16 +123,46 @@ scripts/formal-readiness.sh
 ```
 
 `data-lint.sh` validates immutable validation/test acquisition bytes and hashes. Formal
-readiness additionally requires Task 7's persisted formal Judge evidence plus protected raw
-JudgeEvidence replay, which proves the frozen 30 gold / 60 mutant / 15 paradox chain in-memory.
-A `CorpusAuditReport` saying evidence is pending exits `3`; selection/bundle/corpus lint alone
-can never return formal success. Task 7 currently exposes secure
-`validate-selection-preliminary` and `verify-selection-chain` commands only; its persisted
-selection receipt expressly has `capability_persisted=false`. A combined-tree in-process formal
-Judge replay adapter is still required, so this release remains blocked. It requires paths
-supplied through documented local environment variables and does not create fake data. Only original-English,
-standard-stdin/stdout Codeforces entries with source attribution may be candidates. Project-
-authored references are allowed; raw third-party submitted solutions are not redistributed.
+readiness invokes only `hy3_algotrace.formal_qualification`. In one Python process it rebuilds
+the verified selection capability from raw validation/test bytes and pinned human reviews,
+validates all referenced bundle/corpus bytes, directly replays exactly 105 controlled source
+cases against the persisted Judge manifest and original raw `JudgeEvidence`, and—while those
+ephemeral results are live—validates the complete Task 6 benchmark chain. A selection receipt,
+corpus audit, persisted qualification report, or deserialized boolean is never authority.
+
+The shell interface requires these existing paths: `HY3_FORMAL_SELECTION`,
+`HY3_FORMAL_ACQUISITION`, `HY3_FORMAL_ACQUISITION_VALIDATION`,
+`HY3_FORMAL_VALIDATION_RAW`, `HY3_FORMAL_TEST_RAW`,
+`HY3_FORMAL_VALIDATION_REVIEWS`, `HY3_FORMAL_TEST_REVIEWS`,
+`HY3_FORMAL_REVIEW_MANIFEST`, `HY3_FORMAL_BUNDLES`, `HY3_FORMAL_CORPUS`,
+`HY3_FORMAL_DATA_ROOT`, `HY3_FORMAL_JUDGE_CASES`, `HY3_FORMAL_JUDGE_EVIDENCE`,
+`HY3_FORMAL_JUDGE_RAW_EVIDENCE`, `HY3_FORMAL_BENCHMARK_CANDIDATE`, and
+`HY3_FORMAL_BENCHMARK_ROOT`; it also requires `HY3_FORMAL_VALIDATION_FORMAT` and
+`HY3_FORMAL_TEST_FORMAT` (`json`, `jsonl`, `parquet`, or `riegeli`) and an existing
+`HY3_FORMAL_QUALIFICATION_ROOT` directory.
+
+Success creates exactly one safe report at
+`$HY3_FORMAL_QUALIFICATION_ROOT/formal-qualification/<content_hash>.json`. It contains only
+chain hashes, identities, counts, and the attempt total—never statements, tests, oracles, source,
+raw evidence, counterexamples, credentials, or endpoint details. Re-running the same chain does
+not overwrite it. This repository supplies no formal data, so the release gate remains blocking
+until maintainers externally acquire/review the 30-problem/165-sample data, preserve the 105-case
+raw Judge evidence, execute the live benchmark and human confirmation, and supply the complete
+immutable inputs. No fixture or generated substitute is allowed.
+
+For Compose, arrange `HY3_FORMAL_INPUT_ROOT_HOST` as `selection.json`, `acquisition.json`,
+`acquisition-validation.json`, `validation.raw`, `test.raw`, `validation-reviews.json`,
+`test-reviews.json`, `review-manifest.json`, `bundles.json`, `corpus.json`,
+`judge-cases.json`, `judge-evidence.json`, `judge-raw-evidence.json`, plus `data/` and
+`benchmark/`; set `HY3_FORMAL_BENCHMARK_ID`, then run:
+
+```sh
+docker compose --profile formal-readiness run --rm formal-readiness
+```
+
+Only original-English, standard-stdin/stdout Codeforces entries with source attribution may be
+candidates. Project-authored references are allowed; raw third-party submitted solutions are
+not redistributed.
 
 Protected internal dataset artifacts may be retained under access control for Judge and
 provenance replay. They must never enter a model prompt, public/API/UI response, or a run

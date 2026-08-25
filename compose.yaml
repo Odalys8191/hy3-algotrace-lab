@@ -43,5 +43,62 @@ services:
     depends_on:
       - api
 
+  formal-readiness:
+    profiles: ["formal-readiness"]
+    image: hy3-algotrace-local:dev
+    environment:
+      HY3_FORMAL_VALIDATION_FORMAT: ${HY3_FORMAL_VALIDATION_FORMAT:?Set the pinned validation format.}
+      HY3_FORMAL_TEST_FORMAT: ${HY3_FORMAL_TEST_FORMAT:?Set the pinned test format.}
+    volumes:
+      - type: bind
+        source: ${HY3_FORMAL_INPUT_ROOT_HOST:?Set the trusted complete formal-input directory.}
+        target: /formal-inputs
+        read_only: true
+      - type: bind
+        source: ${HY3_FORMAL_OUTPUT_ROOT_HOST:?Set an existing create-only output directory.}
+        target: /formal-output
+    command:
+      - python
+      - -m
+      - hy3_algotrace.formal_qualification
+      - --selection
+      - /formal-inputs/selection.json
+      - --acquisition
+      - /formal-inputs/acquisition.json
+      - --acquisition-validation
+      - /formal-inputs/acquisition-validation.json
+      - --validation-raw
+      - /formal-inputs/validation.raw
+      - --test-raw
+      - /formal-inputs/test.raw
+      - --validation-format
+      - ${HY3_FORMAL_VALIDATION_FORMAT}
+      - --test-format
+      - ${HY3_FORMAL_TEST_FORMAT}
+      - --validation-reviews
+      - /formal-inputs/validation-reviews.json
+      - --test-reviews
+      - /formal-inputs/test-reviews.json
+      - --review-manifest
+      - /formal-inputs/review-manifest.json
+      - --bundles
+      - /formal-inputs/bundles.json
+      - --corpus
+      - /formal-inputs/corpus.json
+      - --data-root
+      - /formal-inputs/data
+      - --judge-cases
+      - /formal-inputs/judge-cases.json
+      - --judge-report
+      - /formal-inputs/judge-evidence.json
+      - --judge-raw-evidence
+      - /formal-inputs/judge-raw-evidence.json
+      - --candidate
+      - /formal-inputs/benchmark/benchmarks/${HY3_FORMAL_BENCHMARK_ID:?Set the formal benchmark ID.}/formal-candidate.json
+      - --benchmark-root
+      - /formal-inputs/benchmark
+      - --output-root
+      - /formal-output
+
 volumes:
   hy3_artifacts:

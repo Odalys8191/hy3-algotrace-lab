@@ -4,7 +4,6 @@ import inspect
 import json
 import os
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -142,8 +141,8 @@ def test_docker_integration_runs_built_api_with_controlled_http_fixture() -> Non
     assert "http://127.0.0.1:8000/api/v1/runs" in script
 
 
-def test_formal_readiness_stays_pending_without_task7_judge_replay() -> None:
-    """Selection/corpus lint alone can never convert a missing Judge replay into green."""
+def test_formal_readiness_stays_pending_without_complete_qualification_inputs() -> None:
+    """Missing external inputs remain an explicit not-ready status."""
 
     result = subprocess.run(
         ["sh", "scripts/formal-readiness.sh"],
@@ -155,135 +154,37 @@ def test_formal_readiness_stays_pending_without_task7_judge_replay() -> None:
     )
 
     assert result.returncode == 3
-    assert "dataset CLI" in result.stderr
+    assert "qualification inputs are absent" in result.stderr
 
 
-def test_task7_combined_tree_contract_uses_current_secure_selection_commands() -> None:
-    """Task 8 may use Task 7's secure receipt, but cannot mistake it for eligibility."""
+def test_formal_readiness_invokes_only_the_same_process_qualification_boundary() -> None:
+    """Readiness cannot pre-create receipts/audits or split the capability across CLIs."""
 
     script = (REPOSITORY_ROOT / "scripts/formal-readiness.sh").read_text(encoding="utf-8")
-    assert "validate-selection-preliminary" in script
-    assert "verify-selection-chain" in script
-    assert "capability_persisted=false" in script
-    assert "validate_persisted_formal_judge_evidence" in script
-    assert "formal_judge_cli" not in script
+    assert "python -m hy3_algotrace.formal_qualification" in script
+    assert "dataset_cli" not in script
+    assert "SELECTION_REPLAY_RECEIPT" not in script
+    assert "CORPUS_AUDIT" not in script
     data_lint = (REPOSITORY_ROOT / "scripts/data-lint.sh").read_text(encoding="utf-8")
     assert "validate-acquisition" in data_lint
     assert "--validation-id" not in data_lint
 
 
-def test_formal_readiness_creates_current_task7_outputs_without_overwrite(
-    tmp_path: Path,
-) -> None:
-    """The combined-tree path may create receipts/audits once, never treat them as inputs."""
+def test_formal_readiness_compose_profile_is_separate_from_http_only_streamlit() -> None:
+    """Only the formal service sees formal filesystem roots; Streamlit remains HTTP-only."""
 
-    package_root = tmp_path / "src" / "hy3_algotrace"
-    package_root.mkdir(parents=True)
-    (package_root / "__init__.py").write_text("", encoding="utf-8")
-    (package_root / "dataset_cli.py").write_text(
-        "from pathlib import Path\n"
-        "import sys\n"
-        "arguments = sys.argv[1:]\n"
-        "if '--output' in arguments:\n"
-        "    output = Path(arguments[arguments.index('--output') + 1])\n"
-        "    if output.exists():\n"
-        "        raise SystemExit(2)\n"
-        "    output.write_text(arguments[0], encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    formal_root = tmp_path / "formal"
-    formal_root.mkdir()
-    output_audit = formal_root / "corpus-audit.json"
-    output_receipt = formal_root / "selection-replay-receipt.json"
-    input_names = (
-        "selection",
-        "acquisition",
-        "acquisition-validation",
-        "conversion-validation",
-        "conversion-test",
-        "quota",
-        "bundles",
-        "corpus",
-        "judge-evidence",
-        "judge-raw-evidence",
-        "validation-raw",
-        "test-raw",
-        "validation-reviews",
-        "test-reviews",
-        "review-manifest",
-    )
-    inputs = {name: formal_root / f"{name}.json" for name in input_names}
-    for path in inputs.values():
-        path.write_text("input", encoding="utf-8")
-    environment = {
-        "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
-        "PYTHONPATH": str(tmp_path / "src"),
-        "HY3_FORMAL_SELECTION": str(inputs["selection"]),
-        "HY3_FORMAL_ACQUISITION": str(inputs["acquisition"]),
-        "HY3_FORMAL_ACQUISITION_VALIDATION": str(inputs["acquisition-validation"]),
-        "HY3_FORMAL_CONVERSION_VALIDATION": str(inputs["conversion-validation"]),
-        "HY3_FORMAL_CONVERSION_TEST": str(inputs["conversion-test"]),
-        "HY3_FORMAL_QUOTA": str(inputs["quota"]),
-        "HY3_FORMAL_BUNDLES": str(inputs["bundles"]),
-        "HY3_FORMAL_CORPUS": str(inputs["corpus"]),
-        "HY3_FORMAL_JUDGE_EVIDENCE": str(inputs["judge-evidence"]),
-        "HY3_FORMAL_JUDGE_RAW_EVIDENCE": str(inputs["judge-raw-evidence"]),
-        "HY3_FORMAL_VALIDATION_RAW": str(inputs["validation-raw"]),
-        "HY3_FORMAL_TEST_RAW": str(inputs["test-raw"]),
-        "HY3_FORMAL_VALIDATION_FORMAT": "json",
-        "HY3_FORMAL_TEST_FORMAT": "jsonl",
-        "HY3_FORMAL_VALIDATION_REVIEWS": str(inputs["validation-reviews"]),
-        "HY3_FORMAL_TEST_REVIEWS": str(inputs["test-reviews"]),
-        "HY3_FORMAL_REVIEW_MANIFEST": str(inputs["review-manifest"]),
-        "HY3_FORMAL_SELECTION_REPLAY_RECEIPT": str(output_receipt),
-        "HY3_FORMAL_CORPUS_AUDIT": str(output_audit),
-        "HY3_FORMAL_DATA_ROOT": str(formal_root),
-    }
-    script = REPOSITORY_ROOT / "scripts/formal-readiness.sh"
-
-    first = subprocess.run(
-        ["sh", str(script)],
-        cwd=tmp_path,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert first.returncode == 3
-    assert output_receipt.read_text(encoding="utf-8") == "verify-selection-chain"
-    assert output_audit.read_text(encoding="utf-8") == "lint-corpus"
-
-    second = subprocess.run(
-        ["sh", str(script)],
-        cwd=tmp_path,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert second.returncode == 3
-    assert output_receipt.read_text(encoding="utf-8") == "verify-selection-chain"
-    assert output_audit.read_text(encoding="utf-8") == "lint-corpus"
-
-    missing_output_parent = formal_root / "missing-output-parent"
-    environment["HY3_FORMAL_SELECTION_REPLAY_RECEIPT"] = str(
-        missing_output_parent / "selection-replay-receipt.json"
-    )
-    environment["HY3_FORMAL_CORPUS_AUDIT"] = str(missing_output_parent / "corpus-audit.json")
-    missing_parent = subprocess.run(
-        ["sh", str(script)],
-        cwd=tmp_path,
-        env=environment,
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-
-    assert missing_parent.returncode == 3
-    assert "parent directory" in missing_parent.stderr
-    assert not missing_output_parent.exists()
+    compose = (REPOSITORY_ROOT / "compose.yaml").read_text(encoding="utf-8")
+    assert 'formal-readiness:\n    profiles: ["formal-readiness"]' in compose
+    formal_block = compose.split("  formal-readiness:", maxsplit=1)[1].split(
+        "\nvolumes:", maxsplit=1
+    )[0]
+    streamlit_block = compose.split("  streamlit:", maxsplit=1)[1].split(
+        "\n  formal-readiness:", maxsplit=1
+    )[0]
+    assert "HY3_FORMAL_INPUT_ROOT_HOST" in formal_block
+    assert "HY3_FORMAL_OUTPUT_ROOT_HOST" in formal_block
+    assert "HY3_FORMAL" not in streamlit_block
+    assert "HY3_API_BASE_URL: http://api:8000" in streamlit_block
 
 
 def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates() -> None:
@@ -293,6 +194,7 @@ def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates(
     assert 'python -m pytest -q -m "not docker_integration"' in workflow
     assert "python -m pytest -q -m docker_integration" in workflow
     assert "scripts/formal-release-gate.sh" in workflow
+    assert "expect not-ready without external inputs" in workflow
     assert "docker-release-not-ready" in workflow
     assert "--full-history --all --diff-filter=tuxdb" in workflow
 

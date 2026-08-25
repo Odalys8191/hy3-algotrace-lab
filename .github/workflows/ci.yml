@@ -20,12 +20,12 @@ jobs:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
-      - run: python -m ruff format --check src/hy3_algotrace/release_validation.py src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py src/hy3_algotrace/ci_stub_app.py docker/verify-runtime-lock.py tests/test_release_validation.py tests/test_demo_cli.py tests/test_local_release_wiring.py tests/test_runtime_lock.py tests/test_docker_judge_integration.py
+      - run: python -m ruff format --check src/hy3_algotrace/formal_qualification.py src/hy3_algotrace/release_validation.py src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py src/hy3_algotrace/ci_stub_app.py docker/verify-runtime-lock.py tests/test_formal_qualification.py tests/test_release_validation.py tests/test_demo_cli.py tests/test_local_release_wiring.py tests/test_runtime_lock.py tests/test_docker_judge_integration.py
       - run: python -m ruff check .
       - run: python -m mypy src
       - run: python -m pytest -q -m "not docker_integration"
       - run: python -m hy3_algotrace.release_validation --root .
-      - name: Report formal-data readiness honestly
+      - name: expect not-ready without external inputs
         run: |
           set +e
           scripts/formal-readiness.sh
@@ -33,7 +33,7 @@ jobs:
           test "$result" -eq 3
 
   formal-release:
-    name: Formal release gate (blocked until Task 7 evidence replay)
+    name: Formal release gate (blocked until external formal inputs exist)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

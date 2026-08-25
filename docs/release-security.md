@@ -49,6 +49,11 @@ model prompt, public/API/UI response, or run artifact. Prompts and public object
 allowlist; logs and errors must not expose credentials, absolute paths, reference code, or
 reviewer-only evidence.
 
+The formal qualification output is a create-only hash summary. It excludes statements, public
+and hidden tests, oracles, source, raw Judge evidence, diagnostics, counterexamples, credentials,
+and endpoint details. The `formal-readiness` Compose service alone receives the read-only formal
+input mount and dedicated output mount; the Streamlit service remains an HTTP-only API client.
+
 ## Secret detection
 
 The Python validator rejects non-placeholder secret-like assignments without echoing their
