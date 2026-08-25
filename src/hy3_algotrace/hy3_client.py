@@ -67,6 +67,15 @@ class _SafeFailure:
 
 
 @dataclass(frozen=True, slots=True)
+class Hy3AttemptContext:
+    """Credential-free metadata emitted immediately before one HTTP attempt."""
+
+    operation: str
+    phase: str
+    retry_number: int
+
+
+@dataclass(frozen=True, slots=True)
 class Hy3Config:
     """Environment-backed connection settings; the API key is excluded from repr."""
 
@@ -116,9 +125,7 @@ def _accept_result(_result: BaseModel) -> None:
     """Replace context-bearing validators before raising a public safe failure."""
 
 
-def _raise_safe_failure(
-    message: str, error_taxonomy: ErrorTaxonomy | None
-) -> NoReturn:
+def _raise_safe_failure(message: str, error_taxonomy: ErrorTaxonomy | None) -> NoReturn:
     """Publish a sanitized error from a frame with no client or transport state."""
 
     raise Hy3ResponseError(message, error_taxonomy=error_taxonomy)
@@ -210,9 +217,11 @@ class Hy3Client:
         *,
         cache: JsonResponseCache | None = None,
         transport: httpx.BaseTransport | None = None,
+        attempt_observer: Callable[[Hy3AttemptContext], None] | None = None,
     ) -> None:
         self._config = config
         self._cache = cache
+        self._attempt_observer = attempt_observer
         self._http = httpx.Client(
             transport=transport,
             timeout=config.timeout_seconds,
@@ -351,6 +360,7 @@ class Hy3Client:
         result, failure = self._obtain_validated_result(
             key=key,
             output_model=output_model,
+            operation=prompt_version,
             system_prompt=system_prompt,
             user_payload=user_payload,
             validate_result=validate_result,
@@ -372,6 +382,7 @@ class Hy3Client:
         *,
         key: str,
         output_model: type[StructuredModel],
+        operation: str,
         system_prompt: str,
         user_payload: object,
         validate_result: Callable[[StructuredModel], None],
@@ -397,7 +408,12 @@ class Hy3Client:
             {"role": "user", "content": _canonical_json(user_payload)},
         ]
         try:
-            first_content = self._completion(messages, output_model)
+            first_content = self._completion(
+                messages,
+                output_model,
+                operation=operation,
+                phase="request",
+            )
         except Hy3ResponseError as error:
             return None, self._safe_failure(error)
         try:
@@ -414,22 +430,24 @@ class Hy3Client:
                 {
                     "role": "user",
                     "content": (
-                        f"{SCHEMA_REPAIR_PROMPT}\n"
-                        f"Validation error: {safe_validation_error}"
+                        f"{SCHEMA_REPAIR_PROMPT}\nValidation error: {safe_validation_error}"
                     ),
                 },
             ]
             try:
-                repaired_content = self._completion(repair_messages, output_model)
+                repaired_content = self._completion(
+                    repair_messages,
+                    output_model,
+                    operation=operation,
+                    phase="schema_repair",
+                )
             except Hy3ResponseError as error:
                 return None, self._safe_failure(error)
             try:
                 result = self._validate_content(repaired_content, output_model)
             except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as error:
                 return None, _SafeFailure(
-                    self._redact(
-                        f"response failed schema validation after one repair: {error}"
-                    ),
+                    self._redact(f"response failed schema validation after one repair: {error}"),
                     ErrorTaxonomy.FORMAT_SCHEMA,
                 )
 
@@ -444,7 +462,12 @@ class Hy3Client:
         return _SafeFailure(self._redact(str(error)), error.error_taxonomy)
 
     def _completion(
-        self, messages: list[dict[str, str]], output_model: type[BaseModel]
+        self,
+        messages: list[dict[str, str]],
+        output_model: type[BaseModel],
+        *,
+        operation: str,
+        phase: str,
     ) -> object:
         payload = {
             "model": self._config.model,
@@ -462,14 +485,20 @@ class Hy3Client:
         url = f"{self._config.base_url.rstrip('/')}/chat/completions"
         terminal_error: Hy3ResponseError | None = None
         for attempt in range(self._config.max_attempts):
+            if self._attempt_observer is not None:
+                self._attempt_observer(
+                    Hy3AttemptContext(
+                        operation=operation,
+                        phase=phase,
+                        retry_number=attempt + 1,
+                    )
+                )
             try:
                 response = self._http.post(url, json=payload)
             except httpx.TransportError as error:
                 if attempt + 1 < self._config.max_attempts:
                     continue
-                terminal_error = Hy3ResponseError(
-                    self._redact(f"Hy3 transport failure: {error}")
-                )
+                terminal_error = Hy3ResponseError(self._redact(f"Hy3 transport failure: {error}"))
                 break
             if response.status_code in TRANSIENT_STATUS_CODES:
                 if attempt + 1 < self._config.max_attempts:
@@ -497,9 +526,7 @@ class Hy3Client:
         return _canonical_json(content)
 
     @staticmethod
-    def _validate_content(
-        content: object, output_model: type[StructuredModel]
-    ) -> StructuredModel:
+    def _validate_content(content: object, output_model: type[StructuredModel]) -> StructuredModel:
         payload = json.loads(content) if isinstance(content, str) else content
         return output_model.model_validate(payload)
 
