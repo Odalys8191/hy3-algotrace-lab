@@ -85,7 +85,7 @@ def _write_json(path: Path, value: Any) -> None:
     path.write_bytes(canonical_json_bytes(value))
 
 
-def _build_fixture(root: Path) -> FormalFixture:
+def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> FormalFixture:
     support = _corpus_support()
     data_root = root / "formal-data"
     data_root.mkdir(parents=True)
@@ -272,7 +272,7 @@ def _build_fixture(root: Path) -> FormalFixture:
         for sample in corpus.samples
     )
     config = BenchmarkConfig(
-        benchmark_id="formal-integration",
+        benchmark_id=benchmark_id,
         selection_hash=selection.content_hash,
         corpus_hash=corpus.content_hash,
         ordered_sample_ids=tuple(spec.sample_id for spec in specs),
@@ -472,7 +472,8 @@ def test_complete_same_process_chain_creates_one_nonleaking_content_addressed_re
     report_path = module.qualify_formal_run(fixture.bridge_inputs())
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["benchmark_id"] == "formal-integration"
+    assert report["benchmark_hash"] == sha256_json("formal-integration")
+    assert "benchmark_id" not in report
     assert report["sample_count"] == 165
     assert report["controlled_judge_case_count"] == 105
     assert report["remote_attempts_used"] == 390
@@ -493,6 +494,19 @@ def test_complete_same_process_chain_creates_one_nonleaking_content_addressed_re
         assert forbidden not in serialized
     with pytest.raises(Exception, match="already exists"):
         module.qualify_formal_run(fixture.bridge_inputs())
+
+
+def test_report_hashes_credential_shaped_outward_benchmark_identity(tmp_path: Path) -> None:
+    benchmark_id = "sk-private-formal-value"
+    fixture = _build_fixture(tmp_path, benchmark_id=benchmark_id)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    report_path = module.qualify_formal_run(fixture.bridge_inputs())
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["benchmark_hash"] == sha256_json(benchmark_id)
+    assert benchmark_id not in report_path.read_text(encoding="utf-8")
+    assert "benchmark_id" not in report
 
 
 @pytest.mark.parametrize(
@@ -563,11 +577,9 @@ def test_formal_bridge_rejects_raw_evidence_mismatch_and_incomplete_benchmark_ch
         module.qualify_formal_run(incomplete.bridge_inputs())
 
 
-def test_formal_bridge_rejects_observation_label_attempt_and_identity_mismatches(
-    tmp_path: Path,
-) -> None:
-    module = importlib.import_module("hy3_algotrace.formal_qualification")
-    for name in (
+@pytest.mark.parametrize(
+    "name",
+    (
         "observation",
         "labels",
         "label-mismatch",
@@ -575,80 +587,113 @@ def test_formal_bridge_rejects_observation_label_attempt_and_identity_mismatches
         "identity",
         "stratum",
         "natural-config",
-    ):
-        fixture = _build_fixture(tmp_path / name)
-        base = fixture.benchmark_root / "benchmarks/formal-integration"
-        if name == "observation":
-            next((base / "observations").iterdir()).unlink()
-        elif name == "labels":
-            labels_path = base / "human-labels.json"
-            labels = json.loads(labels_path.read_text(encoding="utf-8"))
-            labels["labels"].pop()
-            _write_json(labels_path, labels)
-        elif name == "label-mismatch":
-            labels_path = base / "human-labels.json"
-            labels = json.loads(labels_path.read_text(encoding="utf-8"))
-            labels["labels"][0]["final_correct"] = False
-            _write_json(labels_path, labels)
-            candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
-            candidate["human_label_hashes"] = [sha256_json(label) for label in labels["labels"]]
-            _write_json(fixture.candidate_path, candidate)
-        elif name == "attempts":
-            candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
-            candidate["remote_attempts_used"] = 501
-            _write_json(fixture.candidate_path, candidate)
-        elif name == "identity":
-            config_path = base / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["corpus_hash"] = "3" * 64
-            _write_json(config_path, config)
-        elif name == "natural-config":
-            config_path = base / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            config["model"] = "different-formal-model"
-            _write_json(config_path, config)
-            candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
-            candidate["config_hash"] = sha256_json(config)
-            _write_json(fixture.candidate_path, candidate)
-        else:
-            config_path = base / "config.json"
-            config = json.loads(config_path.read_text(encoding="utf-8"))
-            first_problem = config["sample_specs"][0]["problem_id"]
-            second_problem = next(
-                spec["problem_id"]
+        "problem-id",
+    ),
+)
+def test_formal_bridge_rejects_independent_benchmark_chain_mutations(
+    tmp_path: Path, name: str
+) -> None:
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    fixture = _build_fixture(tmp_path / name)
+    base = fixture.benchmark_root / "benchmarks/formal-integration"
+    if name == "observation":
+        next((base / "observations").iterdir()).unlink()
+    elif name == "labels":
+        labels_path = base / "human-labels.json"
+        labels = json.loads(labels_path.read_text(encoding="utf-8"))
+        labels["labels"].pop()
+        _write_json(labels_path, labels)
+    elif name == "label-mismatch":
+        labels_path = base / "human-labels.json"
+        labels = json.loads(labels_path.read_text(encoding="utf-8"))
+        labels["labels"][0]["final_correct"] = False
+        _write_json(labels_path, labels)
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        candidate["human_label_hashes"] = [sha256_json(label) for label in labels["labels"]]
+        _write_json(fixture.candidate_path, candidate)
+    elif name == "attempts":
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        candidate["remote_attempts_used"] = 501
+        _write_json(fixture.candidate_path, candidate)
+    elif name == "identity":
+        config_path = base / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["corpus_hash"] = "3" * 64
+        _write_json(config_path, config)
+    elif name == "natural-config":
+        config_path = base / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["model"] = "different-formal-model"
+        _write_json(config_path, config)
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        candidate["config_hash"] = sha256_json(config)
+        _write_json(fixture.candidate_path, candidate)
+    elif name == "stratum":
+        config_path = base / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        first_problem = config["sample_specs"][0]["problem_id"]
+        second_problem = next(
+            spec["problem_id"]
+            for spec in config["sample_specs"]
+            if spec["topic"] != config["sample_specs"][0]["topic"]
+            and spec["rating_band"] == config["sample_specs"][0]["rating_band"]
+        )
+        topics = {
+            first_problem: next(
+                spec["topic"]
                 for spec in config["sample_specs"]
-                if spec["topic"] != config["sample_specs"][0]["topic"]
-                and spec["rating_band"] == config["sample_specs"][0]["rating_band"]
+                if spec["problem_id"] == first_problem
+            ),
+            second_problem: next(
+                spec["topic"]
+                for spec in config["sample_specs"]
+                if spec["problem_id"] == second_problem
+            ),
+        }
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        for index, spec in enumerate(config["sample_specs"]):
+            if spec["problem_id"] not in topics:
+                continue
+            spec["topic"] = topics[
+                second_problem if spec["problem_id"] == first_problem else first_problem
+            ]
+            observation_path = base / "observations" / f"{spec['sample_id']}.json"
+            observation = json.loads(observation_path.read_text(encoding="utf-8"))
+            observation["topic"] = spec["topic"]
+            _write_json(observation_path, observation)
+            candidate["observation_hashes"][index] = sha256_json(observation)
+        _write_json(config_path, config)
+        candidate["config_hash"] = sha256_json(config)
+        _write_json(fixture.candidate_path, candidate)
+    else:
+        config_path = base / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        first_spec = config["sample_specs"][0]
+        first_problem = first_spec["problem_id"]
+        second_problem = next(
+            spec["problem_id"]
+            for spec in config["sample_specs"]
+            if spec["problem_id"] != first_problem
+            and spec["topic"] == first_spec["topic"]
+            and spec["rating_band"] == first_spec["rating_band"]
+        )
+        candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
+        for index, spec in enumerate(config["sample_specs"]):
+            if spec["problem_id"] not in {first_problem, second_problem}:
+                continue
+            spec["problem_id"] = (
+                second_problem if spec["problem_id"] == first_problem else first_problem
             )
-            topics = {
-                first_problem: next(
-                    spec["topic"]
-                    for spec in config["sample_specs"]
-                    if spec["problem_id"] == first_problem
-                ),
-                second_problem: next(
-                    spec["topic"]
-                    for spec in config["sample_specs"]
-                    if spec["problem_id"] == second_problem
-                ),
-            }
-            candidate = json.loads(fixture.candidate_path.read_text(encoding="utf-8"))
-            for index, spec in enumerate(config["sample_specs"]):
-                if spec["problem_id"] not in topics:
-                    continue
-                spec["topic"] = topics[
-                    second_problem if spec["problem_id"] == first_problem else first_problem
-                ]
-                observation_path = base / "observations" / f"{spec['sample_id']}.json"
-                observation = json.loads(observation_path.read_text(encoding="utf-8"))
-                observation["topic"] = spec["topic"]
-                _write_json(observation_path, observation)
-                candidate["observation_hashes"][index] = sha256_json(observation)
-            _write_json(config_path, config)
-            candidate["config_hash"] = sha256_json(config)
-            _write_json(fixture.candidate_path, candidate)
-        with pytest.raises(module.FormalQualificationError):
-            module.qualify_formal_run(fixture.bridge_inputs())
+            observation_path = base / "observations" / f"{spec['sample_id']}.json"
+            observation = json.loads(observation_path.read_text(encoding="utf-8"))
+            observation["problem_id"] = spec["problem_id"]
+            _write_json(observation_path, observation)
+            candidate["observation_hashes"][index] = sha256_json(observation)
+        _write_json(config_path, config)
+        candidate["config_hash"] = sha256_json(config)
+        _write_json(fixture.candidate_path, candidate)
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
 
 
 def test_formal_qualification_cli_and_release_scripts_propagate_fail_closed_statuses(
@@ -695,3 +740,16 @@ def test_formal_qualification_cli_and_release_scripts_propagate_fail_closed_stat
     assert not_ready.returncode == 3
     assert blocked.returncode == 1
     assert "formal release gate blocked" in blocked.stderr
+
+
+def test_public_formal_cli_help_contains_required_nonofficial_disclosure() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "hy3_algotrace.formal_qualification", "--help"],
+        cwd=REPOSITORY_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0
+    assert "personal activity project and not an official Tencent release" in result.stdout

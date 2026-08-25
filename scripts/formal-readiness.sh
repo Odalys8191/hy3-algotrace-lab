@@ -2,6 +2,8 @@
 # Exit 3 means complete external formal inputs are absent. Validation failures propagate.
 set -eu
 
+printf '%s\n' 'Hy3 AlgoTrace Lab is a personal activity project and not an official Tencent release.' >&2
+
 for required_file in \
     "${HY3_FORMAL_SELECTION:-}" \
     "${HY3_FORMAL_ACQUISITION:-}" \

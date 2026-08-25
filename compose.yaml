@@ -46,6 +46,12 @@ services:
   formal-readiness:
     profiles: ["formal-readiness"]
     image: hy3-algotrace-local:dev
+    build:
+      context: .
+      dockerfile: docker/app/Dockerfile
+      args:
+        HY3_APP_RUNTIME_IMAGE: ${HY3_APP_RUNTIME_IMAGE:?Set a locked runtime repository@sha256 image.}
+        HY3_DOCKER_CLI_PACKAGE: ${HY3_DOCKER_CLI_PACKAGE:?Set an exact docker.io=VERSION package.}
     environment:
       HY3_FORMAL_VALIDATION_FORMAT: ${HY3_FORMAL_VALIDATION_FORMAT:?Set the pinned validation format.}
       HY3_FORMAL_TEST_FORMAT: ${HY3_FORMAL_TEST_FORMAT:?Set the pinned test format.}

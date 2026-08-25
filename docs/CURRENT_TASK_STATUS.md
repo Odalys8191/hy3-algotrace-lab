@@ -24,8 +24,8 @@ Task 6、Task 7、Task 8 已汇总到 `codex/integrate-task6-8`，同进程、�
 1. 从冻结 selection、原始 validation/test 字节、格式、acquisition、独立 review 字节与 manifest 重新生成实时 `VerifiedSelectionChain`，不接受 `SelectionReplayReceipt` 作为能力。
 2. 校验 30 个 bundle 和全部引用字节、完整 165 样本 corpus 和全部引用字节、恰好 105 个 controlled Judge case、持久化 Judge manifest 与原始 `JudgeEvidence`，并在同一 Python 进程直接调用原始证据回放验证器。
 3. 仅在临时选择/Judge 能力仍存在时，校验 Task 6 candidate、config、165 个 observation、按冻结顺序排列的 165 个人工确认标签、ledger index 与每个 ledger event。
-4. 重算全部哈希，绑定 selection/corpus/bundle/Judge/benchmark/generation 身份、样本 strata 与 gold 字段，要求账本路径安全唯一且序号连续，并同时执行 config 预算与 500 次硬上限。
-5. 完整链通过后，只创建一次 `formal-qualification/<content_hash>.json`。报告只含身份、哈希、计数和尝试次数，不含题面、测试、oracle、源码、原始 Judge 证据、诊断、反例、凭据或 endpoint。
+4. 重算全部哈希，绑定 selection/corpus/bundle/Judge/benchmark/generation 身份、样本 strata、每个 corpus sample 的精确 problem ID 与 gold 字段，要求账本路径安全唯一且序号连续，并同时执行 config 预算与 500 次硬上限。
+5. 完整链通过后，只创建一次 `formal-qualification/<content_hash>.json`。报告只含哈希、计数和尝试次数（benchmark ID 也只保留哈希），不含题面、测试、oracle、源码、原始 Judge 证据、诊断、反例、凭据、原始身份或 endpoint。
 6. Task 6 独立 `BenchmarkRunReport.formal_eligible=false` 和 `formal_evidence_verified=false` 语义保持不变，没有 fixture/test-mode 资格旁路。
 
 ## 2026-08-25 验证记录
@@ -34,10 +34,10 @@ Task 6、Task 7、Task 8 已汇总到 `codex/integrate-task6-8`，同进程、�
 
 ```text
 .venv/bin/pytest -q tests/test_formal_qualification.py
-9 passed
+18 passed
 
 .venv/bin/pytest -q -m "not docker_integration"
-474 passed, 9 deselected, 1 Starlette deprecation warning
+483 passed, 9 deselected, 1 Starlette deprecation warning
 
 .venv/bin/ruff check .
 All checks passed!
@@ -46,10 +46,10 @@ All checks passed!
 Success: no issues found in 33 source files
 
 .venv/bin/python -m hy3_algotrace.release_validation --root .
-release validation passed (117 files checked)
+release validation passed (119 files checked)
 ```
 
-新增负向覆盖包括：缺失文件、工件篡改、伪造 receipt、Judge case 缺失/重复、原始 JudgeEvidence 不匹配、不完整账本、超过 500 次尝试、observation 缺失、人工标签缺失/不匹配、selection strata 与自然运行身份不匹配、报告隐藏数据/凭据不泄漏，以及 CLI/readiness/release-gate 退出码传播。
+新增负向覆盖包括：缺失文件、工件篡改、伪造 receipt、Judge case 缺失/重复、原始 JudgeEvidence 不匹配、不完整账本、超过 500 次尝试、observation 缺失、人工标签缺失/不匹配、selection strata 与自然运行身份不匹配、同 strata problem ID 自重哈希调换、报告隐藏数据/凭据/原始 benchmark ID 不泄漏，以及 CLI/readiness/release-gate 退出码传播。CLI 与 shell 均显示“个人活动项目、非腾讯官方发布”声明；Compose 正式服务也具备可由干净环境显式构建的定义。
 
 本轮没有运行或宣称通过：真实 Docker 集成测试、Docker/Compose 构建、外部 CodeContests 数据获取、真实 30 题/165 样本审计、真实 Hy3 调用、正式发布、运行镜像证明或演示录制。
 

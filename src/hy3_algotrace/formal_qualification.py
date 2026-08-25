@@ -50,6 +50,9 @@ from .differential import (
 
 _MAX_JSON_BYTES = 256 * 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_NONOFFICIAL_DISCLOSURE = (
+    "Hy3 AlgoTrace Lab is a personal activity project and not an official Tencent release."
+)
 
 
 class FormalQualificationError(RuntimeError):
@@ -85,7 +88,7 @@ class FormalQualificationReport(BaseModel):
 
     schema_version: Literal["1.2"] = "1.2"
     kind: Literal["formal_qualification_report"] = "formal_qualification_report"
-    benchmark_id: str = Field(min_length=1)
+    benchmark_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     selection_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     bundle_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -127,7 +130,7 @@ class FormalQualificationReport(BaseModel):
         payload: dict[str, Any] = {
             "schema_version": "1.2",
             "kind": "formal_qualification_report",
-            "benchmark_id": benchmark_id,
+            "benchmark_hash": sha256_json(benchmark_id),
             "selection_hash": selection_hash,
             "bundle_manifest_hash": bundle_manifest_hash,
             "corpus_hash": corpus_hash,
@@ -389,6 +392,8 @@ def _load_observations(
         if sha256_json(observation.model_dump(mode="json")) != candidate.observation_hashes[index]:
             raise FormalQualificationError("observation hash does not match candidate")
         sample = corpus_by_id[spec.sample_id]
+        if sample.problem_id != spec.problem_id:
+            raise FormalQualificationError("benchmark problem identity does not match corpus")
         expected_kind = SampleKind(sample.kind.value)
         if (
             observation.sample_id,
@@ -554,7 +559,11 @@ def _read_json(path: Path) -> Any:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m hy3_algotrace.formal_qualification")
+    parser = argparse.ArgumentParser(
+        prog="python -m hy3_algotrace.formal_qualification",
+        description=_NONOFFICIAL_DISCLOSURE,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--acquisition", type=Path, required=True)
     parser.add_argument("--acquisition-validation", type=Path, required=True)

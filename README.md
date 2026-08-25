@@ -143,7 +143,7 @@ The shell interface requires these existing paths: `HY3_FORMAL_SELECTION`,
 
 Success creates exactly one safe report at
 `$HY3_FORMAL_QUALIFICATION_ROOT/formal-qualification/<content_hash>.json`. It contains only
-chain hashes, identities, counts, and the attempt total—never statements, tests, oracles, source,
+chain hashes, counts, and the attempt total—never identities, statements, tests, oracles, source,
 raw evidence, counterexamples, credentials, or endpoint details. Re-running the same chain does
 not overwrite it. This repository supplies no formal data, so the release gate remains blocking
 until maintainers externally acquire/review the 30-problem/165-sample data, preserve the 105-case
@@ -157,7 +157,7 @@ For Compose, arrange `HY3_FORMAL_INPUT_ROOT_HOST` as `selection.json`, `acquisit
 `benchmark/`; set `HY3_FORMAL_BENCHMARK_ID`, then run:
 
 ```sh
-docker compose --profile formal-readiness run --rm formal-readiness
+docker compose --profile formal-readiness run --build --rm formal-readiness
 ```
 
 Only original-English, standard-stdin/stdout Codeforces entries with source attribution may be

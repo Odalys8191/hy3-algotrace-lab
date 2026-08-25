@@ -154,6 +154,7 @@ def test_formal_readiness_stays_pending_without_complete_qualification_inputs() 
     )
 
     assert result.returncode == 3
+    assert "personal activity project and not an official Tencent release" in result.stderr
     assert "qualification inputs are absent" in result.stderr
 
 
@@ -183,8 +184,12 @@ def test_formal_readiness_compose_profile_is_separate_from_http_only_streamlit()
     )[0]
     assert "HY3_FORMAL_INPUT_ROOT_HOST" in formal_block
     assert "HY3_FORMAL_OUTPUT_ROOT_HOST" in formal_block
+    assert "build:" in formal_block
+    assert "dockerfile: docker/app/Dockerfile" in formal_block
     assert "HY3_FORMAL" not in streamlit_block
     assert "HY3_API_BASE_URL: http://api:8000" in streamlit_block
+    readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
+    assert "docker compose --profile formal-readiness run --build --rm formal-readiness" in readme
 
 
 def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates() -> None:
