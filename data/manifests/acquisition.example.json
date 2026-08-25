@@ -1,0 +1,28 @@
+{
+  "schema_version": "1.2",
+  "kind": "codecontests_raw_acquisition",
+  "dataset": "google-deepmind/code_contests",
+  "assets": [
+    {
+      "split": "validation",
+      "url": "https://storage.googleapis.com/dm-code_contests/code_contests_valid.riegeli",
+      "byte_length": "REPLACE_WITH_OBSERVED_INTEGER",
+      "sha256": "REPLACE_WITH_OBSERVED_SHA256",
+      "license": "CC-BY-4.0; third-party materials may have separate terms",
+      "attribution": "Google DeepMind CodeContests; Codeforces problem materials"
+    },
+    {
+      "split": "test",
+      "url": "https://storage.googleapis.com/dm-code_contests/code_contests_test.riegeli",
+      "byte_length": "REPLACE_WITH_OBSERVED_INTEGER",
+      "sha256": "REPLACE_WITH_OBSERVED_SHA256",
+      "license": "CC-BY-4.0; third-party materials may have separate terms",
+      "attribution": "Google DeepMind CodeContests; Codeforces problem materials"
+    }
+  ],
+  "converter": {
+    "name": "REPLACE_WITH_CONVERTER_NAME",
+    "version": "REPLACE_WITH_CONVERTER_VERSION"
+  },
+  "third_party_terms_acknowledged": true
+}
