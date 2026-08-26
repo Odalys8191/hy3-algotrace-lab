@@ -975,8 +975,14 @@ def _require_canonical_input_path(path: Path, *, root: Path, relative: Path) -> 
     ):
         raise FormalQualificationError("formal candidate path is not canonical")
     resolved_root = root.resolve(strict=True)
-    expected = (resolved_root / relative).resolve(strict=True)
-    if not expected.is_relative_to(resolved_root) or path.resolve(strict=True) != expected:
+    expected = resolved_root / relative
+    component = resolved_root
+    for part in relative.parts:
+        component /= part
+        if component.is_symlink():
+            raise FormalQualificationError("formal candidate path is not canonical")
+    resolved_expected = expected.resolve(strict=True)
+    if path != expected or not resolved_expected.is_relative_to(resolved_root):
         raise FormalQualificationError("formal candidate path is not canonical")
 
 

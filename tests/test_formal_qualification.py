@@ -969,6 +969,38 @@ def test_formal_bridge_rejects_unsafe_human_review_artifact_identifier_paths(
         module.qualify_formal_run(fixture.bridge_inputs())
 
 
+@pytest.mark.parametrize("symlink_shape", ("file", "parent-directory"))
+def test_formal_bridge_rejects_resolve_equivalent_human_review_symlink_alias(
+    tmp_path: Path,
+    symlink_shape: str,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    export_path = Path(fixture.inputs["human_review_export_path"])
+    batch_root = export_path.parent
+    if symlink_shape == "file":
+        target = batch_root / "export-target.json"
+        _write_json(target, json.loads(export_path.read_text(encoding="utf-8")))
+        export_path.unlink()
+        export_path.symlink_to(target.name)
+        fixture.inputs["human_review_export_path"] = target
+    else:
+        target_root = batch_root.with_name(f"{batch_root.name}-target")
+        batch_root.rename(target_root)
+        batch_root.symlink_to(target_root.name, target_is_directory=True)
+        for key in (
+            "human_review_export_path",
+            "human_review_mapping_path",
+            "human_decisions_path",
+            "human_review_replay_path",
+        ):
+            original = Path(fixture.inputs[key])
+            fixture.inputs[key] = target_root / original.relative_to(batch_root)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
 @pytest.mark.parametrize("substitute", (True, 1.0), ids=("bool-for-int", "float-for-int"))
 def test_formal_bridge_rejects_json_scalar_type_substitution_in_parameters(
     tmp_path: Path, substitute: bool | float
