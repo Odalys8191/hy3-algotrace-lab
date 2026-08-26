@@ -127,16 +127,22 @@ readiness invokes only `hy3_algotrace.formal_qualification`. In one Python proce
 the verified selection capability from raw validation/test bytes and pinned human reviews,
 validates all referenced bundle/corpus bytes, directly replays exactly 105 controlled source
 cases against the persisted Judge manifest and original raw `JudgeEvidence`, and—while those
-ephemeral results are live—validates the complete Task 6 benchmark chain. A selection receipt,
-corpus audit, persisted qualification report, or deserialized boolean is never authority.
+ephemeral results are live—requires every case's complete hidden-plus-generated per-test matrix,
+resolves the content-addressed 60-row natural materialization provenance, reconstructs the blind
+human-review batch and decision replay, and validates the complete Task 6 benchmark chain. A
+selection receipt, corpus audit, persisted qualification report, bare human-label set, or
+deserialized boolean is never authority.
 
 The shell interface requires these existing paths: `HY3_FORMAL_SELECTION`,
 `HY3_FORMAL_ACQUISITION`, `HY3_FORMAL_ACQUISITION_VALIDATION`,
 `HY3_FORMAL_VALIDATION_RAW`, `HY3_FORMAL_TEST_RAW`,
 `HY3_FORMAL_VALIDATION_REVIEWS`, `HY3_FORMAL_TEST_REVIEWS`,
 `HY3_FORMAL_REVIEW_MANIFEST`, `HY3_FORMAL_BUNDLES`, `HY3_FORMAL_CORPUS`,
+`HY3_FORMAL_NATURAL_MATERIALIZATION`,
 `HY3_FORMAL_DATA_ROOT`, `HY3_FORMAL_JUDGE_CASES`, `HY3_FORMAL_JUDGE_EVIDENCE`,
-`HY3_FORMAL_JUDGE_RAW_EVIDENCE`, `HY3_FORMAL_BENCHMARK_CANDIDATE`, and
+`HY3_FORMAL_JUDGE_RAW_EVIDENCE`, `HY3_FORMAL_BENCHMARK_CANDIDATE`,
+`HY3_FORMAL_HUMAN_REVIEW_EXPORT`, `HY3_FORMAL_HUMAN_REVIEW_MAPPING`,
+`HY3_FORMAL_HUMAN_DECISIONS`, `HY3_FORMAL_HUMAN_REVIEW_REPLAY`, and
 `HY3_FORMAL_BENCHMARK_ROOT`; it also requires `HY3_FORMAL_VALIDATION_FORMAT` and
 `HY3_FORMAL_TEST_FORMAT` (`json`, `jsonl`, `parquet`, or `riegeli`) and an existing
 `HY3_FORMAL_QUALIFICATION_ROOT` directory.
@@ -154,7 +160,12 @@ For Compose, arrange `HY3_FORMAL_INPUT_ROOT_HOST` as `selection.json`, `acquisit
 `acquisition-validation.json`, `validation.raw`, `test.raw`, `validation-reviews.json`,
 `test-reviews.json`, `review-manifest.json`, `bundles.json`, `corpus.json`,
 `judge-cases.json`, `judge-evidence.json`, `judge-raw-evidence.json`, plus `data/` and
-`benchmark/`; set `HY3_FORMAL_BENCHMARK_ID`, then run:
+`benchmark/`. Store the natural manifest at
+`data/natural-materialization/<content_hash>.json`; keep human artifacts at the canonical
+`benchmark/human-review/<batch>/...` create-only paths. Set
+`HY3_FORMAL_BENCHMARK_ID`, `HY3_FORMAL_NATURAL_MATERIALIZATION_HASH`,
+`HY3_FORMAL_HUMAN_REVIEW_BATCH_ID`, `HY3_FORMAL_HUMAN_DECISION_SET_ID`, and
+`HY3_FORMAL_HUMAN_REPLAY_ID`, then run:
 
 ```sh
 docker compose --profile formal-readiness run --build --rm formal-readiness
@@ -175,6 +186,13 @@ credential-free endpoint identity, prompts/parameters, code/Judge image versions
 version, bootstrap settings, random seed, and the call ledger. Reserve every remote attempt
 before transmission; the hard cap is 500 calls. Cache hits cost zero. A partial or exhausted
 run is immutable evidence but not a formal result.
+
+Each natural materialization row binds the exact corpus trace/source hashes and parsed trace,
+verified problem record and model-visible input, repository generator-prompt hash, frozen model,
+credential-free endpoint, type-preserving ordered parameters, recomputed cache key, and exact
+generation-attempt event hashes. This is an immutable provenance/replay chain; it is not
+cryptographic proof of what a remote service executed. The qualification report contains only
+the combined materialization hash, never the prompt, statement, response, endpoint, or code.
 
 Human review exports a blind package, keeps reviewer/mapping/replay artifacts separate, and
 requires a delayed blind re-review of a seeded 20% sample. A single reviewer is not independent

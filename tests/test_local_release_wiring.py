@@ -166,6 +166,14 @@ def test_formal_readiness_invokes_only_the_same_process_qualification_boundary()
     assert "dataset_cli" not in script
     assert "SELECTION_REPLAY_RECEIPT" not in script
     assert "CORPUS_AUDIT" not in script
+    for required in (
+        "HY3_FORMAL_NATURAL_MATERIALIZATION",
+        "HY3_FORMAL_HUMAN_REVIEW_EXPORT",
+        "HY3_FORMAL_HUMAN_REVIEW_MAPPING",
+        "HY3_FORMAL_HUMAN_DECISIONS",
+        "HY3_FORMAL_HUMAN_REVIEW_REPLAY",
+    ):
+        assert required in script
     data_lint = (REPOSITORY_ROOT / "scripts/data-lint.sh").read_text(encoding="utf-8")
     assert "validate-acquisition" in data_lint
     assert "--validation-id" not in data_lint
@@ -184,10 +192,23 @@ def test_formal_readiness_compose_profile_is_separate_from_http_only_streamlit()
     )[0]
     assert "HY3_FORMAL_INPUT_ROOT_HOST" in formal_block
     assert "HY3_FORMAL_OUTPUT_ROOT_HOST" in formal_block
+    assert "--natural-materialization" in formal_block
+    assert "--human-review-export" in formal_block
+    assert "--human-review-mapping" in formal_block
+    assert "--human-decisions" in formal_block
+    assert "--human-review-replay" in formal_block
     assert "build:" in formal_block
     assert "dockerfile: docker/app/Dockerfile" in formal_block
     assert "HY3_FORMAL" not in streamlit_block
     assert "HY3_API_BASE_URL: http://api:8000" in streamlit_block
+    env_example = (REPOSITORY_ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in (
+        "HY3_FORMAL_NATURAL_MATERIALIZATION_HASH",
+        "HY3_FORMAL_HUMAN_REVIEW_BATCH_ID",
+        "HY3_FORMAL_HUMAN_DECISION_SET_ID",
+        "HY3_FORMAL_HUMAN_REPLAY_ID",
+    ):
+        assert name in env_example
     readme = (REPOSITORY_ROOT / "README.md").read_text(encoding="utf-8")
     assert "docker compose --profile formal-readiness run --build --rm formal-readiness" in readme
 
@@ -199,7 +220,9 @@ def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates(
     assert 'python -m pytest -q -m "not docker_integration"' in workflow
     assert "python -m pytest -q -m docker_integration" in workflow
     assert "scripts/formal-release-gate.sh" in workflow
-    assert "expect not-ready without external inputs" in workflow
+    assert (
+        "expect not-ready without external data, natural, and human provenance inputs" in workflow
+    )
     assert "docker-release-not-ready" in workflow
     assert "--full-history --all --diff-filter=tuxdb" in workflow
 

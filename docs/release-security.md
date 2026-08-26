@@ -51,8 +51,10 @@ reviewer-only evidence.
 
 The formal qualification output is a create-only hash summary. It excludes statements, public
 and hidden tests, oracles, source, raw Judge evidence, diagnostics, counterexamples, credentials,
-and endpoint details. The `formal-readiness` Compose service alone receives the read-only formal
-input mount and dedicated output mount; the Streamlit service remains an HTTP-only API client.
+endpoint details, raw prompts/responses, and human reviewer identities. Natural-output and human
+review provenance enter only as safe combined hashes. The `formal-readiness` Compose service
+alone receives the read-only formal input mount and dedicated output mount; the Streamlit service
+remains an HTTP-only API client.
 
 ## Secret detection
 

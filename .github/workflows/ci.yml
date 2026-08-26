@@ -25,7 +25,7 @@ jobs:
       - run: python -m mypy src
       - run: python -m pytest -q -m "not docker_integration"
       - run: python -m hy3_algotrace.release_validation --root .
-      - name: expect not-ready without external inputs
+      - name: expect not-ready without external data, natural, and human provenance inputs
         run: |
           set +e
           scripts/formal-readiness.sh

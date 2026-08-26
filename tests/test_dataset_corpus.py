@@ -16,6 +16,7 @@ from hy3_algotrace.contracts import (
     ErrorTaxonomy,
     JudgeEvidence,
     JudgeStatus,
+    PerTestEvidence,
     ProblemOracle,
     ProblemRecord,
     RatingBand,
@@ -877,10 +878,25 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
         for sample in manifest.samples
     )
 
+    def complete_evidence(problem: ProblemRecord, *, mutant: bool) -> JudgeEvidence:
+        final_tests = (*problem.hidden_tests, *problem.generated_tests)
+        return JudgeEvidence(
+            compile_status=JudgeStatus.AC,
+            verdict=JudgeStatus.WA if mutant else JudgeStatus.AC,
+            tests=tuple(
+                PerTestEvidence(
+                    test_id=test.test_id,
+                    status=JudgeStatus.WA if mutant and index == 0 else JudgeStatus.AC,
+                    counterexample_input=test.input_data if mutant and index == 0 else None,
+                )
+                for index, test in enumerate(final_tests)
+            ),
+            first_counterexample_input=final_tests[0].input_data if mutant else None,
+        )
+
     class SemanticJudge:
-        def judge(self, _problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
-            verdict = JudgeStatus.WA if "mutant" in cpp_source else JudgeStatus.AC
-            return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=verdict)
+        def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+            return complete_evidence(problem, mutant="mutant" in cpp_source)
 
     result = validate_formal_corpus_judge_cases(
         corpus=manifest,
@@ -898,9 +914,9 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     with pytest.raises(TypeError):
         FormalCorpusJudgeValidationResult(evidence_manifest=report)
     raw_evidence = {
-        case.case_id: JudgeEvidence(
-            compile_status=JudgeStatus.AC,
-            verdict=JudgeStatus.WA if case.kind is JudgeCaseKind.MUTANT else JudgeStatus.AC,
+        case.case_id: complete_evidence(
+            case.problem,
+            mutant=case.kind is JudgeCaseKind.MUTANT,
         )
         for case in cases
     }

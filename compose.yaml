@@ -91,6 +91,8 @@ services:
       - /formal-inputs/bundles.json
       - --corpus
       - /formal-inputs/corpus.json
+      - --natural-materialization
+      - /formal-inputs/data/natural-materialization/${HY3_FORMAL_NATURAL_MATERIALIZATION_HASH:?Set the natural materialization content hash.}.json
       - --data-root
       - /formal-inputs/data
       - --judge-cases
@@ -101,6 +103,14 @@ services:
       - /formal-inputs/judge-raw-evidence.json
       - --candidate
       - /formal-inputs/benchmark/benchmarks/${HY3_FORMAL_BENCHMARK_ID:?Set the formal benchmark ID.}/formal-candidate.json
+      - --human-review-export
+      - /formal-inputs/benchmark/human-review/${HY3_FORMAL_HUMAN_REVIEW_BATCH_ID:?Set the formal human-review batch ID.}/export.json
+      - --human-review-mapping
+      - /formal-inputs/benchmark/human-review/${HY3_FORMAL_HUMAN_REVIEW_BATCH_ID}/mapping.json
+      - --human-decisions
+      - /formal-inputs/benchmark/human-review/${HY3_FORMAL_HUMAN_REVIEW_BATCH_ID}/decisions/${HY3_FORMAL_HUMAN_DECISION_SET_ID:?Set the formal human decision-set ID.}.json
+      - --human-review-replay
+      - /formal-inputs/benchmark/human-review/${HY3_FORMAL_HUMAN_REVIEW_BATCH_ID}/replays/${HY3_FORMAL_HUMAN_REPLAY_ID:?Set the formal human replay ID.}.json
       - --benchmark-root
       - /formal-inputs/benchmark
       - --output-root

@@ -11,7 +11,7 @@ if [ "$status" -eq 0 ]; then
     exit 0
 fi
 if [ "$status" -eq 3 ]; then
-    printf '%s\n' 'formal release gate blocked: persisted/replayed Task 7 Judge evidence is not ready' >&2
+    printf '%s\n' 'formal release gate blocked: complete replayed formal provenance is not ready' >&2
     exit 1
 fi
 exit "$status"

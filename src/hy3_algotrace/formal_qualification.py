@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -11,23 +12,40 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self, cast
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .artifacts import ArtifactExistsError, ArtifactStore, ArtifactStoreError, sha256_json
 from .benchmark import formal_attempt_profile_is_valid
 from .benchmark_models import (
     BenchmarkConfig,
+    BlindPublicExample,
     FormalIntegrationCandidate,
+    HumanConfirmedLabel,
     HumanConfirmedLabelSet,
+    HumanDecisionChange,
+    HumanDecisionSet,
+    HumanRereviewAgreement,
+    HumanReviewCandidate,
+    HumanReviewExport,
+    HumanReviewMapping,
+    HumanReviewReplay,
     LedgerEvent,
     LedgerIndex,
     MetricObservation,
     SampleKind,
 )
-from .contracts import JudgeEvidence, SolutionTrace
+from .contracts import JudgeEvidence, ProblemRecord, SolutionTrace
 from .corpus import (
     CorpusManifest,
     CorpusSample,
+    CorpusSampleKind,
     CorpusStatus,
     ProjectBundleManifest,
     lint_corpus_manifest,
@@ -47,6 +65,9 @@ from .differential import (
     JudgeSourceCase,
     validate_persisted_formal_judge_evidence,
 )
+from .human_review import build_blind_batch
+from .hy3_client import build_cache_key, generation_input
+from .prompts import GENERATOR_SYSTEM_PROMPT
 
 _MAX_JSON_BYTES = 256 * 1024 * 1024
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -72,13 +93,124 @@ class FormalQualificationInputs:
     review_manifest_path: Path
     bundle_manifest_path: Path
     corpus_manifest_path: Path
+    natural_materialization_path: Path
     data_root: Path
     judge_cases_path: Path
     judge_report_path: Path
     raw_judge_evidence_path: Path
     candidate_path: Path
+    human_review_export_path: Path
+    human_review_mapping_path: Path
+    human_decisions_path: Path
+    human_review_replay_path: Path
     benchmark_artifact_root: Path
     output_root: Path
+
+
+type JsonScalar = str | int | float | bool | None
+type JsonScalarType = Literal["string", "integer", "number", "boolean", "null"]
+
+
+class NaturalMaterializationParameter(BaseModel):
+    """One type-preserving JSON scalar used by a natural generation request."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    name: str = Field(pattern=r"^[a-z][a-z0-9_]{0,63}$")
+    json_type: JsonScalarType
+    value: JsonScalar
+
+    @model_validator(mode="after")
+    def validate_json_type(self) -> Self:
+        if self.json_type != _json_scalar_type(self.value):
+            raise ValueError("natural materialization parameter JSON type does not match")
+        return self
+
+
+class NaturalMaterializationEntry(BaseModel):
+    """Content and request provenance for one immutable natural output."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    sample_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,255}$")
+    problem_id: str = Field(pattern=r"^cf-[1-9][0-9]*-[a-z0-9]+$")
+    trace_path: str = Field(min_length=1, max_length=1_024)
+    trace_byte_length: int = Field(gt=0, strict=True)
+    trace_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    parsed_trace_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_path: str = Field(min_length=1, max_length=1_024)
+    source_byte_length: int = Field(gt=0, strict=True)
+    source_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    problem_record_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_name: str = Field(min_length=1, max_length=256)
+    endpoint_identity: str = Field(min_length=1, max_length=2_048)
+    generator_prompt_version: str = Field(min_length=1, max_length=128)
+    generator_prompt_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    model_parameters: tuple[NaturalMaterializationParameter, ...]
+    model_visible_input_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    request_cache_key: str = Field(pattern=r"^[0-9a-f]{64}$")
+    generation_event_hashes: tuple[str, ...] = Field(min_length=1)
+
+    @field_validator("trace_path", "source_path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError("natural materialization paths must be safe and relative")
+        return value
+
+    @field_validator("generation_event_hashes")
+    @classmethod
+    def validate_event_hashes(cls, values: tuple[str, ...]) -> tuple[str, ...]:
+        if len(set(values)) != len(values) or any(
+            _SHA256.fullmatch(value) is None for value in values
+        ):
+            raise ValueError("natural generation event hashes must be unique SHA-256 values")
+        return values
+
+
+class NaturalMaterializationManifest(BaseModel):
+    """Content-addressed immutable provenance for all sixty natural outputs."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    schema_version: Literal["1.2"] = "1.2"
+    kind: Literal["natural_hy3_materialization_manifest"] = "natural_hy3_materialization_manifest"
+    selection_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    entries: tuple[NaturalMaterializationEntry, ...] = Field(min_length=60, max_length=60)
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_manifest(self) -> Self:
+        ids = tuple(entry.sample_id for entry in self.entries)
+        if len(set(ids)) != 60:
+            raise ValueError("natural materialization requires 60 unique sample IDs")
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        if self.content_hash != sha256_json(payload):
+            raise ValueError("natural materialization content_hash does not match")
+        return self
+
+
+def _json_scalar_type(value: JsonScalar) -> JsonScalarType:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    return "string"
+
+
+def _typed_parameter_identity(
+    parameters: Sequence[Any],
+) -> tuple[tuple[str, JsonScalarType, JsonScalar], ...]:
+    return tuple(
+        (parameter.name, _json_scalar_type(parameter.value), parameter.value)
+        for parameter in parameters
+    )
 
 
 class FormalQualificationReport(BaseModel):
@@ -92,11 +224,13 @@ class FormalQualificationReport(BaseModel):
     selection_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     bundle_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     corpus_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    natural_materialization_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     judge_evidence_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     observations_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     human_labels_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    human_review_provenance_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     ledger_index_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     sample_count: Literal[165] = 165
     controlled_judge_case_count: Literal[105] = 105
@@ -119,11 +253,13 @@ class FormalQualificationReport(BaseModel):
         selection_hash: str,
         bundle_manifest_hash: str,
         corpus_hash: str,
+        natural_materialization_hash: str,
         judge_evidence_hash: str,
         candidate_hash: str,
         config_hash: str,
         observation_hashes: tuple[str, ...],
         human_label_hashes: tuple[str, ...],
+        human_review_provenance_hash: str,
         ledger_index_hash: str,
         remote_attempts_used: int,
     ) -> FormalQualificationReport:
@@ -134,11 +270,13 @@ class FormalQualificationReport(BaseModel):
             "selection_hash": selection_hash,
             "bundle_manifest_hash": bundle_manifest_hash,
             "corpus_hash": corpus_hash,
+            "natural_materialization_hash": natural_materialization_hash,
             "judge_evidence_hash": judge_evidence_hash,
             "candidate_hash": candidate_hash,
             "config_hash": config_hash,
             "observations_hash": sha256_json(list(observation_hashes)),
             "human_labels_hash": sha256_json(list(human_label_hashes)),
+            "human_review_provenance_hash": human_review_provenance_hash,
             "ledger_index_hash": ledger_index_hash,
             "sample_count": 165,
             "controlled_judge_case_count": 105,
@@ -200,6 +338,14 @@ def _qualify_formal_run(inputs: FormalQualificationInputs) -> FormalQualificatio
         raise FormalQualificationError("formal corpus must contain all 165 samples")
     if audit.materialized_counts != audit.expected_counts:
         raise FormalQualificationError("formal corpus counts are incomplete")
+    materialization = _read_model(
+        NaturalMaterializationManifest, inputs.natural_materialization_path
+    )
+    _require_canonical_input_path(
+        inputs.natural_materialization_path,
+        root=inputs.data_root,
+        relative=Path("natural-materialization") / f"{materialization.content_hash}.json",
+    )
 
     raw_cases = _read_list(inputs.judge_cases_path)
     if len(raw_cases) != 105:
@@ -229,6 +375,8 @@ def _qualify_formal_run(inputs: FormalQualificationInputs) -> FormalQualificatio
         bundle_manifest=bundle_manifest,
         judge_payload=judge_payload,
         judge_result=judge_result,
+        materialization=materialization,
+        selected_records=_selected_problem_records(selection, cases),
     )
 
 
@@ -240,6 +388,8 @@ def _qualify_benchmark_chain(
     bundle_manifest: ProjectBundleManifest,
     judge_payload: Mapping[str, Any],
     judge_result: FormalCorpusJudgeValidationResult,
+    materialization: NaturalMaterializationManifest,
+    selected_records: Mapping[str, ProblemRecord],
 ) -> FormalQualificationReport:
     if (
         not isinstance(judge_result, FormalCorpusJudgeValidationResult)
@@ -254,6 +404,31 @@ def _qualify_benchmark_chain(
         inputs.candidate_path,
         root=inputs.benchmark_artifact_root,
         relative=base / "formal-candidate.json",
+    )
+    review_export = _read_model(HumanReviewExport, inputs.human_review_export_path)
+    review_mapping = _read_model(HumanReviewMapping, inputs.human_review_mapping_path)
+    decisions = _read_model(HumanDecisionSet, inputs.human_decisions_path)
+    review_replay = _read_model(HumanReviewReplay, inputs.human_review_replay_path)
+    review_root = Path("human-review") / review_export.batch_id
+    _require_canonical_input_path(
+        inputs.human_review_export_path,
+        root=inputs.benchmark_artifact_root,
+        relative=review_root / "export.json",
+    )
+    _require_canonical_input_path(
+        inputs.human_review_mapping_path,
+        root=inputs.benchmark_artifact_root,
+        relative=review_root / "mapping.json",
+    )
+    _require_canonical_input_path(
+        inputs.human_decisions_path,
+        root=inputs.benchmark_artifact_root,
+        relative=review_root / "decisions" / f"{decisions.decision_set_id}.json",
+    )
+    _require_canonical_input_path(
+        inputs.human_review_replay_path,
+        root=inputs.benchmark_artifact_root,
+        relative=review_root / "replays" / f"{review_replay.replay_id}.json",
     )
     config_payload = store.read_json(base / "config.json")
     config = _validate_model(BenchmarkConfig, config_payload)
@@ -276,17 +451,12 @@ def _qualify_benchmark_chain(
     ):
         raise FormalQualificationError("benchmark verified-data identity mismatch")
     natural_config = corpus.natural_run_config
-    benchmark_parameters = {
-        parameter.name: parameter.value for parameter in config.model_parameters
-    }
-    natural_parameters = {
-        parameter.name: parameter.value for parameter in natural_config.model_parameters
-    }
     if (
         config.model != natural_config.model_name
         or config.endpoint_identity != natural_config.endpoint_url
         or config.generator_prompt_version != natural_config.prompt_version
-        or benchmark_parameters != natural_parameters
+        or _typed_parameter_identity(config.model_parameters)
+        != _typed_parameter_identity(natural_config.model_parameters)
     ):
         raise FormalQualificationError("benchmark generation identity does not match corpus")
     if (
@@ -340,6 +510,17 @@ def _qualify_benchmark_chain(
             observation.gold_taxonomy,
         ):
             raise FormalQualificationError("human labels do not match frozen gold fields")
+    human_review_provenance_hash = _validate_human_review_chain(
+        export=review_export,
+        mapping=review_mapping,
+        decisions=decisions,
+        replay=review_replay,
+        corpus=corpus,
+        selected_records=selected_records,
+        observations=observations,
+        labels=labels,
+        data_root=inputs.data_root,
+    )
 
     ledger_payload = store.read_json(base / "ledger-index.json")
     ledger = _validate_model(LedgerIndex, ledger_payload)
@@ -361,16 +542,27 @@ def _qualify_benchmark_chain(
     ):
         raise FormalQualificationError("formal attempt total exceeds its frozen limit")
     _validate_formal_attempt_profile(config, observations, events)
+    _validate_natural_materialization(
+        manifest=materialization,
+        corpus=corpus,
+        selected_records=selected_records,
+        config=config,
+        events=events,
+        event_hashes=ledger.event_hashes,
+        data_root=inputs.data_root,
+    )
     return FormalQualificationReport.create(
         benchmark_id=config.benchmark_id,
         selection_hash=config.selection_hash,
         bundle_manifest_hash=bundle_manifest.content_hash,
         corpus_hash=config.corpus_hash,
+        natural_materialization_hash=materialization.content_hash,
         judge_evidence_hash=judge_artifact_hash,
         candidate_hash=sha256_json(candidate.model_dump(mode="json")),
         config_hash=candidate.config_hash,
         observation_hashes=candidate.observation_hashes,
         human_label_hashes=candidate.human_label_hashes,
+        human_review_provenance_hash=human_review_provenance_hash,
         ledger_index_hash=candidate.ledger_index_hash,
         remote_attempts_used=candidate.remote_attempts_used,
     )
@@ -436,6 +628,283 @@ def _load_observations(
             raise FormalQualificationError("formal reviewer/arbitration relationship is invalid")
         observations.append(observation)
     return tuple(observations)
+
+
+def _selected_problem_records(
+    selection: FrozenSelectionManifest,
+    cases: tuple[JudgeSourceCase, ...],
+) -> Mapping[str, ProblemRecord]:
+    records: dict[str, ProblemRecord] = {}
+    for case in cases:
+        existing = records.setdefault(case.problem.problem_id, case.problem)
+        if existing != case.problem:
+            raise FormalQualificationError("Judge cases disagree on selected problem records")
+    expected_ids = tuple(entry.problem_id for entry in selection.entries)
+    if set(records) != set(expected_ids):
+        raise FormalQualificationError("Judge cases do not cover every selected problem record")
+    return {problem_id: records[problem_id] for problem_id in expected_ids}
+
+
+def _validate_natural_materialization(
+    *,
+    manifest: NaturalMaterializationManifest,
+    corpus: CorpusManifest,
+    selected_records: Mapping[str, ProblemRecord],
+    config: BenchmarkConfig,
+    events: tuple[LedgerEvent, ...],
+    event_hashes: tuple[str, ...],
+    data_root: Path,
+) -> None:
+    natural_config = corpus.natural_run_config
+    if (
+        natural_config.materialization_manifest_hash != manifest.content_hash
+        or manifest.selection_manifest_hash != corpus.selection_manifest_hash
+    ):
+        raise FormalQualificationError("natural materialization identity does not match corpus")
+    actual_prompt_hash = hashlib.sha256(GENERATOR_SYSTEM_PROMPT.encode("utf-8")).hexdigest()
+    if natural_config.prompt_hash != actual_prompt_hash:
+        raise FormalQualificationError("natural generator prompt hash is not repository-authentic")
+    natural_samples = tuple(
+        sample for sample in corpus.samples if sample.kind is CorpusSampleKind.NATURAL
+    )
+    if tuple(entry.sample_id for entry in manifest.entries) != tuple(
+        sample.sample_id for sample in natural_samples
+    ):
+        raise FormalQualificationError("natural materialization must follow canonical corpus order")
+    if len(events) != len(event_hashes):
+        raise FormalQualificationError("natural materialization ledger hashes are incomplete")
+    parameters = {parameter.name: parameter.value for parameter in natural_config.model_parameters}
+    parameter_identity = _typed_parameter_identity(natural_config.model_parameters)
+    hashed_events = tuple(zip(events, event_hashes, strict=True))
+    for entry, sample in zip(manifest.entries, natural_samples, strict=True):
+        record = selected_records.get(sample.problem_id)
+        if record is None:
+            raise FormalQualificationError("natural sample problem is outside verified selection")
+        trace_snapshot = read_trusted_file(
+            data_root / sample.trace.path,
+            logical_id=f"natural-trace-{sample.sample_id}",
+            max_bytes=sample.trace.byte_length,
+        )
+        source_snapshot = read_trusted_file(
+            data_root / sample.cpp_source.path,
+            logical_id=f"natural-source-{sample.sample_id}",
+            max_bytes=sample.cpp_source.byte_length,
+        )
+        if (trace_snapshot.byte_length, trace_snapshot.sha256) != (
+            sample.trace.byte_length,
+            sample.trace.sha256,
+        ) or (source_snapshot.byte_length, source_snapshot.sha256) != (
+            sample.cpp_source.byte_length,
+            sample.cpp_source.sha256,
+        ):
+            raise FormalQualificationError("natural corpus bytes changed after lint")
+        trace = SolutionTrace.model_validate_json(trace_snapshot.contents)
+        source = source_snapshot.contents.decode("utf-8")
+        visible_input = generation_input(record)
+        expected_event_hashes = tuple(
+            event_hash
+            for event, event_hash in hashed_events
+            if event.sample_id == sample.sample_id
+            and event.operation == natural_config.prompt_version
+        )
+        expected_entry_identity = (
+            sample.sample_id,
+            sample.problem_id,
+            sample.trace.path,
+            sample.trace.byte_length,
+            sample.trace.sha256,
+            sha256_json(trace.model_dump(mode="json")),
+            sample.cpp_source.path,
+            sample.cpp_source.byte_length,
+            sample.cpp_source.sha256,
+            sha256_json(record.model_dump(mode="json")),
+            natural_config.model_name,
+            natural_config.endpoint_url,
+            natural_config.prompt_version,
+            actual_prompt_hash,
+            parameter_identity,
+            sha256_json(visible_input),
+            build_cache_key(
+                model=natural_config.model_name,
+                endpoint=natural_config.endpoint_url,
+                prompt_version=natural_config.prompt_version,
+                parameters=parameters,
+                canonical_input=visible_input,
+            ),
+            expected_event_hashes,
+        )
+        observed_entry_identity = (
+            entry.sample_id,
+            entry.problem_id,
+            entry.trace_path,
+            entry.trace_byte_length,
+            entry.trace_sha256,
+            entry.parsed_trace_hash,
+            entry.source_path,
+            entry.source_byte_length,
+            entry.source_sha256,
+            entry.problem_record_hash,
+            entry.model_name,
+            entry.endpoint_identity,
+            entry.generator_prompt_version,
+            entry.generator_prompt_hash,
+            _typed_parameter_identity(entry.model_parameters),
+            entry.model_visible_input_hash,
+            entry.request_cache_key,
+            entry.generation_event_hashes,
+        )
+        if (
+            trace.trace_id != sample.sample_id
+            or trace.problem_id != sample.problem_id
+            or trace.code != source
+            or observed_entry_identity != expected_entry_identity
+        ):
+            raise FormalQualificationError("natural materialization row is inconsistent")
+    if tuple(sample.sample_id for sample in natural_samples) != config.generation_sample_ids:
+        raise FormalQualificationError(
+            "natural materialization does not match benchmark generation"
+        )
+
+
+def _validate_human_review_chain(
+    *,
+    export: HumanReviewExport,
+    mapping: HumanReviewMapping,
+    decisions: HumanDecisionSet,
+    replay: HumanReviewReplay,
+    corpus: CorpusManifest,
+    selected_records: Mapping[str, ProblemRecord],
+    observations: tuple[MetricObservation, ...],
+    labels: HumanConfirmedLabelSet,
+    data_root: Path,
+) -> str:
+    if (
+        len(export.items) != 165
+        or len(mapping.entries) != 165
+        or export.batch_id != mapping.batch_id
+        or decisions.batch_id != export.batch_id
+        or replay.batch_id != export.batch_id
+        or replay.source_decision_set_id != decisions.decision_set_id
+    ):
+        raise FormalQualificationError("human-review batch identities are incomplete")
+    candidates: list[HumanReviewCandidate] = []
+    for sample in corpus.samples:
+        record = selected_records.get(sample.problem_id)
+        if record is None:
+            raise FormalQualificationError("human-review problem is outside verified selection")
+        snapshot = read_trusted_file(
+            data_root / sample.trace.path,
+            logical_id=f"human-review-trace-{sample.sample_id}",
+            max_bytes=sample.trace.byte_length,
+        )
+        if (snapshot.byte_length, snapshot.sha256) != (
+            sample.trace.byte_length,
+            sample.trace.sha256,
+        ):
+            raise FormalQualificationError("human-review trace changed after corpus lint")
+        trace = SolutionTrace.model_validate_json(snapshot.contents)
+        candidates.append(
+            HumanReviewCandidate(
+                sample_id=sample.sample_id,
+                problem_id=sample.problem_id,
+                trace_id=trace.trace_id,
+                statement=record.statement_en,
+                public_examples=tuple(
+                    BlindPublicExample(
+                        input_data=test.input_data,
+                        output_data=test.expected_output,
+                    )
+                    for test in record.public_tests
+                ),
+                trace=trace,
+            )
+        )
+    expected_export, expected_mapping = build_blind_batch(
+        batch_id=export.batch_id,
+        candidates=tuple(candidates),
+        blind_ids=tuple(item.blind_id for item in export.items),
+    )
+    if export != expected_export or mapping != expected_mapping:
+        raise FormalQualificationError("human-review blind export or mapping is inconsistent")
+    mapping_ids = tuple(entry.blind_id for entry in mapping.entries)
+    initial_ids = tuple(decision.blind_id for decision in decisions.initial_decisions)
+    if initial_ids != mapping_ids or len(initial_ids) != 165:
+        raise FormalQualificationError(
+            "human-review initial decisions must be complete and ordered"
+        )
+    initial_by_blind = {decision.blind_id: decision for decision in decisions.initial_decisions}
+    delayed_by_blind = {decision.blind_id: decision for decision in decisions.delayed_decisions}
+    if any(
+        delayed.reviewer_id != initial_by_blind[delayed.blind_id].reviewer_id
+        for delayed in decisions.delayed_decisions
+    ):
+        raise FormalQualificationError("delayed rereview reviewer identity changed")
+    final_by_blind = {
+        blind_id: delayed_by_blind.get(blind_id, initial)
+        for blind_id, initial in initial_by_blind.items()
+    }
+    expected_labels = tuple(
+        HumanConfirmedLabel(
+            sample_id=entry.sample_id,
+            final_correct=final_by_blind[entry.blind_id].final_correct,
+            process_valid=final_by_blind[entry.blind_id].process_valid,
+            first_error_step=final_by_blind[entry.blind_id].first_error_step,
+            taxonomy=final_by_blind[entry.blind_id].taxonomy,
+        )
+        for entry in mapping.entries
+    )
+    changes = tuple(
+        HumanDecisionChange(
+            blind_id=delayed.blind_id,
+            initial_decision_id=initial_by_blind[delayed.blind_id].decision_id,
+            delayed_decision_id=delayed.decision_id,
+            changed_fields=tuple(
+                field
+                for field in (
+                    "final_correct",
+                    "process_valid",
+                    "first_error_step",
+                    "taxonomy",
+                )
+                if getattr(initial_by_blind[delayed.blind_id], field) != getattr(delayed, field)
+            ),
+        )
+        for delayed in decisions.delayed_decisions
+        if any(
+            getattr(initial_by_blind[delayed.blind_id], field) != getattr(delayed, field)
+            for field in (
+                "final_correct",
+                "process_valid",
+                "first_error_step",
+                "taxonomy",
+            )
+        )
+    )
+    rereviewed_count = len(decisions.delayed_decisions)
+    agreement = HumanRereviewAgreement(
+        rereviewed_count=rereviewed_count,
+        unchanged_count=rereviewed_count - len(changes),
+        agreement=(rereviewed_count - len(changes)) / rereviewed_count,
+        changes=changes,
+    )
+    expected_replay = HumanReviewReplay(
+        replay_id=replay.replay_id,
+        batch_id=export.batch_id,
+        source_decision_set_id=decisions.decision_set_id,
+        observations=observations,
+        human_labels=expected_labels,
+        rereview_agreement=agreement,
+    )
+    if replay != expected_replay or expected_labels != labels.labels:
+        raise FormalQualificationError("human-review replay does not match benchmark artifacts")
+    return sha256_json(
+        {
+            "export_hash": sha256_json(export.model_dump(mode="json")),
+            "mapping_hash": sha256_json(mapping.model_dump(mode="json")),
+            "decisions_hash": sha256_json(decisions.model_dump(mode="json")),
+            "replay_hash": sha256_json(replay.model_dump(mode="json")),
+        }
+    )
 
 
 def _corpus_first_error_step(sample: CorpusSample, *, data_root: Path) -> int | None:
@@ -548,11 +1017,16 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-manifest", type=Path, required=True)
     parser.add_argument("--bundles", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
+    parser.add_argument("--natural-materialization", type=Path, required=True)
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--judge-cases", type=Path, required=True)
     parser.add_argument("--judge-report", type=Path, required=True)
     parser.add_argument("--judge-raw-evidence", type=Path, required=True)
     parser.add_argument("--candidate", type=Path, required=True)
+    parser.add_argument("--human-review-export", type=Path, required=True)
+    parser.add_argument("--human-review-mapping", type=Path, required=True)
+    parser.add_argument("--human-decisions", type=Path, required=True)
+    parser.add_argument("--human-review-replay", type=Path, required=True)
     parser.add_argument("--benchmark-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     return parser
@@ -581,11 +1055,16 @@ def main(argv: Sequence[str] | None = None) -> int:
                 review_manifest_path=arguments.review_manifest,
                 bundle_manifest_path=arguments.bundles,
                 corpus_manifest_path=arguments.corpus,
+                natural_materialization_path=arguments.natural_materialization,
                 data_root=arguments.data_root,
                 judge_cases_path=arguments.judge_cases,
                 judge_report_path=arguments.judge_report,
                 raw_judge_evidence_path=arguments.judge_raw_evidence,
                 candidate_path=arguments.candidate,
+                human_review_export_path=arguments.human_review_export,
+                human_review_mapping_path=arguments.human_review_mapping,
+                human_decisions_path=arguments.human_decisions,
+                human_review_replay_path=arguments.human_review_replay,
                 benchmark_artifact_root=arguments.benchmark_root,
                 output_root=arguments.output_root,
             )

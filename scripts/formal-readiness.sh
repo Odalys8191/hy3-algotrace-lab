@@ -15,10 +15,15 @@ for required_file in \
     "${HY3_FORMAL_REVIEW_MANIFEST:-}" \
     "${HY3_FORMAL_BUNDLES:-}" \
     "${HY3_FORMAL_CORPUS:-}" \
+    "${HY3_FORMAL_NATURAL_MATERIALIZATION:-}" \
     "${HY3_FORMAL_JUDGE_CASES:-}" \
     "${HY3_FORMAL_JUDGE_EVIDENCE:-}" \
     "${HY3_FORMAL_JUDGE_RAW_EVIDENCE:-}" \
-    "${HY3_FORMAL_BENCHMARK_CANDIDATE:-}"; do
+    "${HY3_FORMAL_BENCHMARK_CANDIDATE:-}" \
+    "${HY3_FORMAL_HUMAN_REVIEW_EXPORT:-}" \
+    "${HY3_FORMAL_HUMAN_REVIEW_MAPPING:-}" \
+    "${HY3_FORMAL_HUMAN_DECISIONS:-}" \
+    "${HY3_FORMAL_HUMAN_REVIEW_REPLAY:-}"; do
     if [ -z "$required_file" ] || [ ! -f "$required_file" ]; then
         printf '%s\n' 'formal qualification inputs are absent; formal readiness is not ready' >&2
         exit 3
@@ -57,10 +62,15 @@ python -m hy3_algotrace.formal_qualification \
     --review-manifest "$HY3_FORMAL_REVIEW_MANIFEST" \
     --bundles "$HY3_FORMAL_BUNDLES" \
     --corpus "$HY3_FORMAL_CORPUS" \
+    --natural-materialization "$HY3_FORMAL_NATURAL_MATERIALIZATION" \
     --data-root "$HY3_FORMAL_DATA_ROOT" \
     --judge-cases "$HY3_FORMAL_JUDGE_CASES" \
     --judge-report "$HY3_FORMAL_JUDGE_EVIDENCE" \
     --judge-raw-evidence "$HY3_FORMAL_JUDGE_RAW_EVIDENCE" \
     --candidate "$HY3_FORMAL_BENCHMARK_CANDIDATE" \
+    --human-review-export "$HY3_FORMAL_HUMAN_REVIEW_EXPORT" \
+    --human-review-mapping "$HY3_FORMAL_HUMAN_REVIEW_MAPPING" \
+    --human-decisions "$HY3_FORMAL_HUMAN_DECISIONS" \
+    --human-review-replay "$HY3_FORMAL_HUMAN_REVIEW_REPLAY" \
     --benchmark-root "$HY3_FORMAL_BENCHMARK_ROOT" \
     --output-root "$HY3_FORMAL_QUALIFICATION_ROOT"

@@ -456,12 +456,60 @@ def _validate_replayed_evidence(
         evidence = raw_evidence[case.case_id]
         if not isinstance(evidence, JudgeEvidence):
             raise DifferentialDataError(f"raw JudgeEvidence is invalid for {case.case_id}")
+        _validate_formal_test_evidence(case, evidence)
         results.append(_validate_case_evidence(case, evidence))
     counts = Counter(result.kind.value for result in results)
     return JudgeValidationReport(
         results=tuple(results),
         counts={kind.value: counts[kind.value] for kind in JudgeCaseKind},
     )
+
+
+def _validate_formal_test_evidence(
+    case: JudgeSourceCase,
+    evidence: JudgeEvidence,
+) -> None:
+    """Require the exact final-test matrix executed by DockerJudge."""
+
+    final_tests = (*case.problem.hidden_tests, *case.problem.generated_tests)
+    expected_ids = tuple(test.test_id for test in final_tests)
+    observed_ids = tuple(test.test_id for test in evidence.tests)
+    if not expected_ids or observed_ids != expected_ids:
+        raise DifferentialDataError(
+            f"formal Judge tests must match the canonical final matrix: {case.case_id}"
+        )
+    unavailable = {JudgeStatus.NOT_RUN, JudgeStatus.INFRASTRUCTURE_ERROR}
+    if any(test.status in unavailable for test in evidence.tests):
+        raise DifferentialDataError(
+            f"formal Judge per-test infrastructure evidence is unavailable: {case.case_id}"
+        )
+    first_failure_index = next(
+        (index for index, test in enumerate(evidence.tests) if test.status is not JudgeStatus.AC),
+        None,
+    )
+    first_failure = evidence.tests[first_failure_index] if first_failure_index is not None else None
+    expected_verdict = first_failure.status if first_failure is not None else JudgeStatus.AC
+    if evidence.verdict is not expected_verdict:
+        raise DifferentialDataError(
+            f"formal Judge aggregate verdict does not match per-test evidence: {case.case_id}"
+        )
+    expected_counterexample = (
+        final_tests[first_failure_index].input_data if first_failure_index is not None else None
+    )
+    if (
+        (
+            first_failure is not None
+            and first_failure.counterexample_input != expected_counterexample
+        )
+        or evidence.first_counterexample_input != expected_counterexample
+        or any(
+            test.counterexample_input is not None and test is not first_failure
+            for test in evidence.tests
+        )
+    ):
+        raise DifferentialDataError(
+            f"formal Judge counterexample exposure is inconsistent: {case.case_id}"
+        )
 
 
 def _validate_case_evidence(
