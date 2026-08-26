@@ -84,6 +84,7 @@ def _problem_record(
     source_split: Literal["validation", "test"],
     topic: Topic,
     rating: int,
+    hidden_input_data: str = "2\n",
 ) -> ProblemRecord:
     contest_id = int(problem_id.split("-")[1])
     topic_tag = {
@@ -114,7 +115,11 @@ def _problem_record(
             ContractTestCase(test_id="public-1", input_data="1\n", expected_output="1\n"),
         ),
         hidden_tests=(
-            ContractTestCase(test_id="hidden-1", input_data="2\n", expected_output="2\n"),
+            ContractTestCase(
+                test_id="hidden-1",
+                input_data=hidden_input_data,
+                expected_output="2\n",
+            ),
         ),
         generated_tests=(
             ContractTestCase(test_id="generated-1", input_data="3\n", expected_output="3\n"),
@@ -124,7 +129,7 @@ def _problem_record(
     return provisional.model_copy(update={"content_hash": problem_content_hash(provisional)})
 
 
-def _selection() -> FrozenSelectionManifest:
+def _selection(*, hidden_input_data: str = "2\n") -> FrozenSelectionManifest:
     entries: list[FrozenSelectionEntry] = []
     number = 5000
     for topic in Topic:
@@ -141,6 +146,7 @@ def _selection() -> FrozenSelectionManifest:
                     source_split=source_split,
                     topic=topic,
                     rating=rating,
+                    hidden_input_data=hidden_input_data,
                 )
                 entries.append(
                     FrozenSelectionEntry(
@@ -174,8 +180,10 @@ def _selection() -> FrozenSelectionManifest:
 
 def _verified_selection_chain(
     root: Path,
+    *,
+    hidden_input_data: str = "2\n",
 ) -> tuple[VerifiedSelectionChain, dict[str, ProblemRecord]]:
-    template = _selection()
+    template = _selection(hidden_input_data=hidden_input_data)
     rows: dict[str, list[dict[str, object]]] = {"validation": [], "test": []}
     reviews: dict[str, list[CandidateReview]] = {"validation": [], "test": []}
     records: dict[str, ProblemRecord] = {}
@@ -193,6 +201,7 @@ def _verified_selection_chain(
             source_split=entry.source_split,
             topic=entry.topic,
             rating=entry.rating,
+            hidden_input_data=hidden_input_data,
         )
         rows[entry.source_split].append(
             {
@@ -210,7 +219,7 @@ def _verified_selection_chain(
                 "input_file": "",
                 "output_file": "",
                 "public_tests": [{"input": "1\n", "output": "1\n"}],
-                "private_tests": [{"input": "2\n", "output": "2\n"}],
+                "private_tests": [{"input": hidden_input_data, "output": "2\n"}],
                 "generated_tests": [{"input": "3\n", "output": "3\n"}],
             }
         )

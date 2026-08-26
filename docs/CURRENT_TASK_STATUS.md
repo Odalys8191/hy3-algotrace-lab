@@ -34,14 +34,14 @@ Task 6、Task 7、Task 8 已汇总到 `codex/integrate-task6-8`，同进程、�
 使用集成树现有 Python 3.12.14 `.venv` 执行：
 
 ```text
-.venv/bin/pytest -q tests/test_formal_qualification.py tests/test_benchmark.py tests/test_dataset_corpus.py tests/test_dataset_differential.py tests/test_local_release_wiring.py tests/test_release_validation.py
-171 passed，1 Starlette deprecation warning
+.venv/bin/pytest -q tests/test_formal_qualification.py tests/test_judge.py tests/test_benchmark.py tests/test_dataset_corpus.py tests/test_dataset_differential.py tests/test_local_release_wiring.py tests/test_release_validation.py
+196 passed，1 Starlette deprecation warning
 
 .venv/bin/pytest -q tests/test_formal_qualification.py
-62 passed
+69 passed
 
 .venv/bin/pytest -q -m "not docker_integration"
-529 passed, 9 deselected, 1 Starlette deprecation warning
+536 passed, 9 deselected, 1 Starlette deprecation warning
 
 .venv/bin/ruff check .
 All checks passed!
@@ -62,7 +62,7 @@ scripts/formal-release-gate.sh
 将 not-ready 转换为退出 1
 ```
 
-新增负向覆盖包括：缺失文件/工件篡改、伪造 receipt、Judge case 缺失/重复/换序、持久化 evidence 换序、逐测试 Judge evidence 缺失/重复/换序/未知/NOT_RUN/基础设施失败/汇总不一致/反例暴露不一致、原始 JudgeEvidence 不匹配、corpus manifest 与 trace 的确定性读边界替换、natural materialization 未解析或逐行 trace/source/request/input/prompt/参数/event hash 伪造、人工 export/mapping/decision/reviewer/timestamp/replay/path 伪造、bool/int/float 参数类型替换、Judge 能力 pickle/浅拷贝/深拷贝/伪造、不完整账本、超过 500 次尝试、retry 999、重试号倒序、repair 先于 request、重复 repair、sample/operation block 换序、observation 或人工标签缺失/不匹配、selection strata/自然运行身份/problem ID 不匹配、报告隐藏数据/凭据/原始 benchmark ID 不泄漏，以及缺失嵌套 benchmark 输入时 direct CLI/readiness/release-gate 一致安全返回 2。CLI 与 shell 均显示“个人活动项目、非腾讯官方发布”声明；Compose 正式服务也具备可由干净环境显式构建的定义。
+新增负向覆盖包括：缺失文件/工件篡改、伪造 receipt、Judge case 缺失/重复/换序、持久化 evidence 换序、逐测试 Judge evidence 缺失/重复/换序/未知/NOT_RUN/基础设施失败/汇总不一致/反例暴露不一致、DockerJudge 控制字符替换与 2,048 字符截断后的真实反例回放、原始 JudgeEvidence 不匹配、corpus manifest 与 trace 的确定性读边界替换、natural materialization 未解析或逐行 trace/source/request/input/prompt/参数/event hash 伪造、人工 export/mapping/decision/reviewer/timestamp/replay/path 伪造、人工 batch/decision/replay ID 的绝对路径与 `..` 路径逃逸、bool/int/float 参数类型替换、Judge 能力 pickle/浅拷贝/深拷贝/伪造、不完整账本、超过 500 次尝试、retry 999、重试号倒序、repair 先于 request、重复 repair、sample/operation block 换序、observation 或人工标签缺失/不匹配、selection strata/自然运行身份/problem ID 不匹配、报告隐藏数据/凭据/原始 benchmark ID 不泄漏，以及缺失嵌套 benchmark 输入时 direct CLI/readiness/release-gate 一致安全返回 2。CLI 与 shell 均显示“个人活动项目、非腾讯官方发布”声明；Compose 正式服务也具备可由干净环境显式构建的定义。
 
 本轮没有运行或宣称通过：真实 Docker 集成测试、Docker/Compose 构建、外部 CodeContests 数据获取、真实 30 题/165 样本审计、真实 Hy3 调用、正式发布、运行镜像证明或演示录制。`scripts/security-scan.sh` 因本机未安装 Gitleaks 按设计退出 69，因此全历史 Gitleaks 扫描也没有被描述为通过；上面的 Python 发布/安全单测与 118 文件发布校验均已实际执行。
 

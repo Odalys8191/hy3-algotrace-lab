@@ -71,6 +71,7 @@ from hy3_algotrace.human_review import (
     select_delayed_rereview,
 )
 from hy3_algotrace.hy3_client import build_cache_key, generation_input
+from hy3_algotrace.judge import sanitize_counterexample_input
 from hy3_algotrace.prompts import GENERATOR_PROMPT_VERSION, GENERATOR_SYSTEM_PROMPT
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -160,11 +161,19 @@ def _formal_cli_command(environment: dict[str, str]) -> list[str]:
     ]
 
 
-def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> FormalFixture:
+def _build_fixture(
+    root: Path,
+    *,
+    benchmark_id: str = "formal-integration",
+    final_test_input: str = "2\n",
+) -> FormalFixture:
     support = _corpus_support()
     data_root = root / "formal-data"
     data_root.mkdir(parents=True)
-    selection_chain, records = support._verified_selection_chain(data_root)
+    selection_chain, records = support._verified_selection_chain(
+        data_root,
+        hidden_input_data=final_test_input,
+    )
     selection = selection_chain.selection
 
     raw_paths = {
@@ -379,7 +388,7 @@ def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> F
                     ),
                     diagnostics="credential=sk-private-formal-value",
                     counterexample_input=(
-                        test.input_data
+                        sanitize_counterexample_input(test.input_data)
                         if case.kind is JudgeCaseKind.MUTANT and index == 0
                         else None
                     ),
@@ -390,7 +399,7 @@ def _build_fixture(root: Path, *, benchmark_id: str = "formal-integration") -> F
             ),
             diagnostics="private endpoint https://secret.example.invalid/v1",
             first_counterexample_input=(
-                case.problem.hidden_tests[0].input_data
+                sanitize_counterexample_input(case.problem.hidden_tests[0].input_data)
                 if case.kind is JudgeCaseKind.MUTANT
                 else None
             ),
@@ -795,6 +804,54 @@ def _rewrite_natural_materialization(fixture: FormalFixture, mutation: str) -> N
     _replace_materialization_hash(fixture, manifest["content_hash"])
 
 
+def _relocate_human_review_chain_with_unsafe_id(
+    fixture: FormalFixture,
+    *,
+    identifier: str,
+    unsafe_id: str,
+) -> None:
+    export = json.loads(
+        Path(fixture.inputs["human_review_export_path"]).read_text(encoding="utf-8")
+    )
+    mapping = json.loads(
+        Path(fixture.inputs["human_review_mapping_path"]).read_text(encoding="utf-8")
+    )
+    decisions = json.loads(Path(fixture.inputs["human_decisions_path"]).read_text(encoding="utf-8"))
+    replay = json.loads(
+        Path(fixture.inputs["human_review_replay_path"]).read_text(encoding="utf-8")
+    )
+    if identifier == "batch":
+        export["batch_id"] = unsafe_id
+        mapping["batch_id"] = unsafe_id
+        decisions["batch_id"] = unsafe_id
+        replay["batch_id"] = unsafe_id
+    elif identifier == "decision":
+        decisions["decision_set_id"] = unsafe_id
+        replay["source_decision_set_id"] = unsafe_id
+    else:
+        replay["replay_id"] = unsafe_id
+    review_root = Path("human-review") / export["batch_id"]
+    relocated = {
+        "human_review_export_path": fixture.benchmark_root / review_root / "export.json",
+        "human_review_mapping_path": fixture.benchmark_root / review_root / "mapping.json",
+        "human_decisions_path": fixture.benchmark_root
+        / review_root
+        / "decisions"
+        / f"{decisions['decision_set_id']}.json",
+        "human_review_replay_path": fixture.benchmark_root
+        / review_root
+        / "replays"
+        / f"{replay['replay_id']}.json",
+    }
+    for key, payload in zip(
+        relocated,
+        (export, mapping, decisions, replay),
+        strict=True,
+    ):
+        _write_json(relocated[key], payload)
+        fixture.inputs[key] = relocated[key]
+
+
 def test_formal_bridge_rejects_unresolved_natural_materialization_digest(
     tmp_path: Path,
 ) -> None:
@@ -888,6 +945,30 @@ def test_formal_bridge_rejects_human_review_provenance_forgery(
         module.qualify_formal_run(fixture.bridge_inputs())
 
 
+@pytest.mark.parametrize("identifier", ("batch", "decision", "replay"))
+@pytest.mark.parametrize("path_shape", ("absolute", "traversal"))
+def test_formal_bridge_rejects_unsafe_human_review_artifact_identifier_paths(
+    tmp_path: Path,
+    identifier: str,
+    path_shape: str,
+) -> None:
+    fixture = _build_fixture(tmp_path)
+    unsafe_id = (
+        str(fixture.root / f"outside-{identifier}")
+        if path_shape == "absolute"
+        else f"../outside-{identifier}"
+    )
+    _relocate_human_review_chain_with_unsafe_id(
+        fixture,
+        identifier=identifier,
+        unsafe_id=unsafe_id,
+    )
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
 @pytest.mark.parametrize("substitute", (True, 1.0), ids=("bool-for-int", "float-for-int"))
 def test_formal_bridge_rejects_json_scalar_type_substitution_in_parameters(
     tmp_path: Path, substitute: bool | float
@@ -922,6 +1003,62 @@ def test_formal_bridge_rejects_aggregate_only_judge_evidence_with_rehashed_chain
 
     with pytest.raises(module.FormalQualificationError):
         module.qualify_formal_run(fixture.bridge_inputs())
+
+
+def test_formal_bridge_accepts_genuine_docker_sanitized_truncated_counterexample(
+    tmp_path: Path,
+) -> None:
+    raw_input = "7\x00" + "x" * 2050 + "\n"
+    fixture = _build_fixture(tmp_path, final_test_input=raw_input)
+    cases = tuple(
+        JudgeSourceCase.model_validate_json(json.dumps(value))
+        for value in json.loads(
+            Path(fixture.inputs["judge_cases_path"]).read_text(encoding="utf-8")
+        )
+    )
+    case = next(case for case in cases if case.kind is JudgeCaseKind.MUTANT)
+    docker_judge = importlib.import_module("hy3_algotrace.docker_judge")
+
+    class WrongAnswerBackend:
+        def compile(self, *, workspace: Path, memory_limit_mb: int) -> object:
+            assert workspace.is_dir()
+            assert memory_limit_mb == case.problem.memory_limit_mb
+            return docker_judge.CompileOutcome(status=JudgeStatus.AC)
+
+        def execute(
+            self,
+            *,
+            workspace: Path,
+            input_dir: Path,
+            result_dir: Path,
+            memory_limit_mb: int,
+            time_limit_ms: int,
+            output_limit_bytes: int,
+        ) -> object:
+            assert workspace.is_dir()
+            assert input_dir.is_dir()
+            assert result_dir.is_dir()
+            assert memory_limit_mb == case.problem.memory_limit_mb
+            assert time_limit_ms == case.problem.time_limit_ms
+            assert output_limit_bytes > 0
+            return docker_judge.ExecutionOutcome(status=JudgeStatus.AC, stdout="wrong\n")
+
+    evidence = docker_judge.DockerJudge(
+        backend=WrongAnswerBackend(),
+        temp_root=tmp_path,
+    ).judge(case.problem, case.cpp_source)
+    expected_counterexample = "7\ufffd" + "x" * 2046 + "\n<truncated>"
+    assert evidence.first_counterexample_input == expected_counterexample
+    assert evidence.tests[0].counterexample_input == expected_counterexample
+    raw_evidence_path = Path(fixture.inputs["raw_judge_evidence_path"])
+    raw_evidence = json.loads(raw_evidence_path.read_text(encoding="utf-8"))
+    raw_evidence[case.case_id] = evidence.model_dump(mode="json")
+    _rehash_judge_chain(fixture, raw_evidence)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+
+    output = module.qualify_formal_run(fixture.bridge_inputs())
+
+    assert output.parent == fixture.output_root / "formal-qualification"
 
 
 @pytest.mark.parametrize(

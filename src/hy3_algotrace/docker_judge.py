@@ -20,14 +20,13 @@ from typing import Protocol
 from pydantic import ValidationError
 
 from .contracts import JudgeEvidence, JudgeStatus, PerTestEvidence, ProblemRecord, TestCase
-from .judge import Judge
+from .judge import Judge, sanitize_counterexample_input
 
 JUDGE_BUILD_TAG = "hy3-algotrace-cpp17-judge:1.0"
 JUDGE_IMAGE_ENV = "HY3_JUDGE_IMAGE"
 
 DEFAULT_OUTPUT_LIMIT_BYTES = 64 * 1024
 MAX_DIAGNOSTIC_CHARACTERS = 4096
-MAX_COUNTEREXAMPLE_CHARACTERS = 2048
 MAX_TRUSTED_INTEGER = (1 << 63) - 1
 MAX_DOCKER_STDERR_BYTES = 16 * 1024
 MAX_COMPILER_STREAM_BYTES = 16 * 1024
@@ -455,7 +454,7 @@ class DockerJudge(Judge):
             diagnostics = _public_runtime_diagnostics(status)
 
         counterexample = (
-            _sanitize_counterexample(test.input_data)
+            sanitize_counterexample_input(test.input_data)
             if status not in {JudgeStatus.AC, JudgeStatus.INFRASTRUCTURE_ERROR}
             else None
         )
@@ -791,18 +790,6 @@ def _sanitize_diagnostics(
     if len(sanitized) > MAX_DIAGNOSTIC_CHARACTERS:
         sanitized = sanitized[:MAX_DIAGNOSTIC_CHARACTERS] + "\n<truncated>"
     return sanitized.strip()
-
-
-def _sanitize_counterexample(input_data: str) -> str:
-    sanitized = "".join(
-        character
-        if character in {"\n", "\t"} or ord(character) >= 32
-        else "\ufffd"
-        for character in input_data
-    )
-    if len(sanitized) > MAX_COUNTEREXAMPLE_CHARACTERS:
-        return sanitized[:MAX_COUNTEREXAMPLE_CHARACTERS] + "\n<truncated>"
-    return sanitized
 
 
 def _random_container_name() -> str:

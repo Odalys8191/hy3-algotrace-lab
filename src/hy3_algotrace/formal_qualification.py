@@ -968,7 +968,15 @@ def _validate_formal_attempt_profile(
 
 
 def _require_canonical_input_path(path: Path, *, root: Path, relative: Path) -> None:
-    if path.resolve(strict=True) != (root.resolve(strict=True) / relative):
+    if (
+        relative.is_absolute()
+        or not relative.parts
+        or any(part in {"", ".", ".."} for part in relative.parts)
+    ):
+        raise FormalQualificationError("formal candidate path is not canonical")
+    resolved_root = root.resolve(strict=True)
+    expected = (resolved_root / relative).resolve(strict=True)
+    if not expected.is_relative_to(resolved_root) or path.resolve(strict=True) != expected:
         raise FormalQualificationError("formal candidate path is not canonical")
 
 

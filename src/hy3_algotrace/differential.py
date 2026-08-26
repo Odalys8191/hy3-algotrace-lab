@@ -25,7 +25,7 @@ from hy3_algotrace.dataset_models import (
     DatasetModel,
     VerifiedSelectionChain,
 )
-from hy3_algotrace.judge import Judge
+from hy3_algotrace.judge import Judge, sanitize_counterexample_input
 
 
 class DifferentialDataError(ValueError):
@@ -494,7 +494,9 @@ def _validate_formal_test_evidence(
             f"formal Judge aggregate verdict does not match per-test evidence: {case.case_id}"
         )
     expected_counterexample = (
-        final_tests[first_failure_index].input_data if first_failure_index is not None else None
+        sanitize_counterexample_input(final_tests[first_failure_index].input_data)
+        if first_failure_index is not None
+        else None
     )
     if (
         (
