@@ -64,6 +64,9 @@ HY3_MAX_PRICE_COMPLETION=4   # 元/百万输出
 
 ## 四、当前项目位置（供接手 Agent 快速定位）
 
-- 集成代码树：`.worktrees/integrate-task6-8`（分支 `codex/integrate-task6-8`），非 Docker 质量门全过；该分支尚有未提交改动（benchmark_cli.py / codecontests.py / docs / data/README.md），接手后先复核提交。
+- 集成代码树：`.worktrees/integrate-task6-8`（分支 `codex/integrate-task6-8`）；原集成改动已提交于 `95827ed`，端点决策提交于 `6adbd0e`。2026-09-09 续作没有修改源码，focused 58 passed，完整 suite 579 passed / 9 Docker skipped，Ruff、mypy 通过。
 - 数据就绪：`/Users/odalys/Documents/hy4oi-data/codecontests-v1/raw/`（validation + test parquet，282 题，无需再下载）。
-- 下一步顺序：复核提交集成分支改动 → 领取 TokenHub 免费包 + 重生成 smoke 配置 → 执行 smoke（首次真实 Hy3 请求）→ 正式语料生命周期设计（执行意图冻结 vs 运行结果冻结）→ 30 题人工审核冻结 → 正式数据/基准（GA hy3）/报告/演示。
+- **当前阻塞覆盖上文的可执行性判断**：TokenHub `hy3-preview` 已于 2026-08-31 下线（[官方公告](https://cloud.tencent.com/announce/detail/2391)）。当天已有 v1/v2 两份 TokenHub smoke，各在生成阶段退出 2；v2 明确返回 HTTP 400 / 400004（模型或服务 ID 不存在）。续作带凭据 GET 模型列表返回 200，124 个模型中无 preview、有 `hy3`。免费包不能恢复下线模型，不要继续重试 preview 或自动切换付费 GA。
+- 配置与失败账本位于外部数据根 `smoke-20260909-tokenhub-v1/v2`、`smoke-runs-20260909-tokenhub-v1/v2`；两份 benchmark ID 均已占用，无 report，`complete` 不存在。续作审计位于 `smoke-audit-20260909-v1`。条件、原始命令、哈希索引和恢复步骤见 [2026-09-09 smoke 记录](LIVE_SMOKE_2026-09-09.md)。
+- 费用说明修正：上文“客户端价格守卫会拦截”的表述不符合当前源码，三个费用变量均未被客户端读取；价格上限 0 不是已实现的防超支保护。1.2/4 仅保留为用户指定的历史 preview 价格依据，当前价格页已无 preview 独立项。
+- 下一步顺序：用户确认可用模型与计费条件 → 使用全新配置、benchmark ID 和目录恢复非正式 smoke → 正式语料生命周期设计（执行意图冻结 vs 运行结果冻结）→ 30 题人工审核冻结 → 正式数据/基准（GA hy3）/报告/演示。已有失败请求不能写成成功端到端结果，也不能将 preview 或单题 smoke 外推为正式性能或资格。
