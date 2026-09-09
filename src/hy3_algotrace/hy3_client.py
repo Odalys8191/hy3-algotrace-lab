@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import tempfile
@@ -92,13 +93,23 @@ class Hy3Config:
             raise Hy3ConfigurationError("HY3_API_KEY must be set")
         if self.max_attempts < 1:
             raise Hy3ConfigurationError("max_attempts must be positive")
+        if not math.isfinite(self.timeout_seconds) or self.timeout_seconds <= 0:
+            raise Hy3ConfigurationError("timeout_seconds must be finite and positive")
 
     @classmethod
     def from_env(cls) -> Hy3Config:
+        try:
+            timeout_seconds = float(os.environ.get("HY3_TIMEOUT_SECONDS", "60"))
+        except ValueError:
+            timeout_seconds = float("nan")
+        if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+            raise Hy3ConfigurationError("timeout_seconds must be finite and positive")
         base_url = os.environ.get("HY3_BASE_URL", "")
         api_key = os.environ.get("HY3_API_KEY", "")
         model = os.environ.get("HY3_MODEL", "hy3")
-        return cls(base_url=base_url, api_key=api_key, model=model)
+        return cls(
+            base_url=base_url, api_key=api_key, model=model, timeout_seconds=timeout_seconds
+        )
 
 
 def endpoint_identity(endpoint: str) -> str:

@@ -201,8 +201,12 @@ results, and audit templates in `docs/`; they intentionally contain no claimed o
 
 ## Security and attribution
 
-- Runtime model settings use only `HY3_BASE_URL`, `HY3_API_KEY`, and `HY3_MODEL`; credentials
+- Runtime connection settings use `HY3_BASE_URL`, `HY3_API_KEY`, and `HY3_MODEL`; credentials
   never pass through Docker build args, artifacts, prompts, reports, screenshots, or logs.
+  Optional `HY3_TIMEOUT_SECONDS` accepts finite positive seconds (default 60). For long
+  non-streaming responses, export a larger value such as 300 into the CLI/API process.
+  This changes HTTP waiting time, not model parameters or request budgets; the client does
+  not automatically load `.env`.
 - The release validator rejects public Compose ports, hard-coded secret-like assignments, and
   missing disclosures. CI performs a full-history Gitleaks scan with a deliberately tiny
   placeholder-only allowlist.

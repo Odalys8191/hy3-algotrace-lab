@@ -14,6 +14,7 @@ from hy3_algotrace.hy3_client import (
     Hy3AttemptContext,
     Hy3Client,
     Hy3Config,
+    Hy3ConfigurationError,
     Hy3ResponseError,
     JsonResponseCache,
     build_cache_key,
@@ -185,12 +186,46 @@ def test_environment_interface_defaults_model_and_does_not_repr_credentials(
     monkeypatch.setenv("HY3_BASE_URL", "https://hy3.example/v1")
     monkeypatch.setenv("HY3_API_KEY", "sk-environment-secret")
     monkeypatch.delenv("HY3_MODEL", raising=False)
+    monkeypatch.delenv("HY3_TIMEOUT_SECONDS", raising=False)
 
     config = Hy3Config.from_env()
 
     assert config.base_url == "https://hy3.example/v1"
     assert config.model == "hy3"
+    assert config.timeout_seconds == 60.0
     assert "sk-environment-secret" not in repr(config)
+
+
+def test_environment_timeout_reaches_outbound_generation_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HY3_BASE_URL", "https://hy3.example/v1")
+    monkeypatch.setenv("HY3_API_KEY", "test-key")
+    monkeypatch.setenv("HY3_TIMEOUT_SECONDS", "300")
+    observed_timeouts: list[object] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_timeouts.append(request.extensions["timeout"]["read"])
+        return completion(json.dumps(valid_trace_payload()))
+
+    hy3 = Hy3Client(Hy3Config.from_env(), transport=httpx.MockTransport(handler))
+    try:
+        assert hy3.generate(problem()).trace_id == "trace-1"
+    finally:
+        hy3.close()
+    assert observed_timeouts == [300.0]
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "-inf", "", "bad-timeout"])
+def test_invalid_environment_timeout_fails_before_http(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv("HY3_BASE_URL", "https://hy3.example/v1")
+    monkeypatch.setenv("HY3_API_KEY", "test-key")
+    monkeypatch.setenv("HY3_TIMEOUT_SECONDS", value)
+
+    with pytest.raises(Hy3ConfigurationError, match="timeout"):
+        Hy3Config.from_env()
 
 
 def test_generate_uses_high_reasoning_and_cache_without_hidden_inputs(tmp_path: Path) -> None:
