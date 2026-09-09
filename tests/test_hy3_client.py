@@ -20,6 +20,7 @@ from hy3_algotrace.hy3_client import (
     build_cache_key,
     endpoint_identity,
     generation_input,
+    sanitize_json_schema,
 )
 
 
@@ -261,6 +262,64 @@ def test_generate_uses_high_reasoning_and_cache_without_hidden_inputs(tmp_path: 
     assert "classified output" not in serialized_request
     assert "hidden-secret" not in serialized_request
     assert generation_input(record)["public_tests"] == []
+
+
+def test_generate_sends_structure_only_json_schema(tmp_path: Path) -> None:
+    observed_schemas: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        observed_schemas.append(body["response_format"]["json_schema"]["schema"])
+        return completion(json.dumps(valid_trace_payload()))
+
+    client(tmp_path, handler).generate(problem())
+
+    assert len(observed_schemas) == 1
+    serialized = json.dumps(observed_schemas[0])
+    for keyword in ("minLength", "maxLength", "pattern", "exclusiveMinimum", "minimum"):
+        assert keyword not in serialized, keyword
+    schema = observed_schemas[0]
+    assert schema["type"] == "object"
+    assert "code" in schema["properties"]
+    assert "steps" in schema["properties"]
+
+
+def test_sanitize_json_schema_keeps_structure_and_drops_bounds() -> None:
+    raw = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "minLength": 1, "maxLength": 64},
+            "count": {"type": "integer", "exclusiveMinimum": 0, "minimum": 1},
+            "stage": {"enum": ["a", "b"]},
+            "flag": {"const": True},
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+        "$defs": {
+            "Step": {
+                "type": "object",
+                "properties": {"claim": {"type": "string", "minLength": 1}},
+            }
+        },
+        "$ref_placeholder": {"type": "string"},
+    }
+
+    sanitized = sanitize_json_schema(raw)
+
+    assert sanitized == {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string"},
+            "count": {"type": "integer"},
+            "stage": {"enum": ["a", "b"]},
+            "flag": {"const": True},
+        },
+        "required": ["code"],
+        "additionalProperties": False,
+        "$defs": {"Step": {"type": "object", "properties": {"claim": {"type": "string"}}}},
+    }
+    # The caller's schema object is not mutated.
+    assert raw["properties"]["code"] == {"type": "string", "minLength": 1, "maxLength": 64}
 
 
 def test_generate_rejects_wrong_problem_identity_before_cache(tmp_path: Path) -> None:

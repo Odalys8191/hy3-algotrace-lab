@@ -39,6 +39,62 @@ from .prompts import (
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
 TRANSIENT_STATUS_CODES = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
+# Structural JSON-schema keywords the endpoint grammar compiler handles
+# correctly. Validation keywords such as minLength are dropped before the
+# schema is sent: TokenHub hy3's constrained decoding mangles newline
+# escapes inside string values whenever the schema contains them
+# (observed 2026-09-09, reproduced with minimal probes). All semantic
+# constraints stay enforced client-side by pydantic validation instead.
+_STRUCTURE_ONLY_SCHEMA_KEYS = frozenset(
+    {
+        "$defs",
+        "$ref",
+        "additionalProperties",
+        "allOf",
+        "anyOf",
+        "const",
+        "description",
+        "enum",
+        "items",
+        "oneOf",
+        "prefixItems",
+        "properties",
+        "required",
+        "title",
+        "type",
+    }
+)
+
+
+def sanitize_json_schema(schema: object) -> object:
+    """Return a copy of ``schema`` without non-structural validation keywords.
+
+    Keeps the document a valid structural JSON schema so the endpoint can
+    constrain output shape, while length, pattern, and numeric bounds are
+    left to the client-side pydantic validation that already owns them.
+    Keys of ``properties`` and ``$defs`` mappings are field identifiers, not
+    schema keywords, so their entries are preserved and recursed into.
+    """
+
+    if isinstance(schema, list):
+        return [sanitize_json_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    sanitized = {
+        key: value for key, value in schema.items() if key in _STRUCTURE_ONLY_SCHEMA_KEYS
+    }
+    for mapping_key in ("properties", "$defs"):
+        mapping = sanitized.get(mapping_key)
+        if isinstance(mapping, dict):
+            sanitized[mapping_key] = {
+                name: sanitize_json_schema(sub) for name, sub in mapping.items()
+            }
+    schema_containers = ("items", "prefixItems", "additionalProperties", "anyOf", "oneOf", "allOf")
+    for container_key in schema_containers:
+        if container_key in sanitized:
+            sanitized[container_key] = sanitize_json_schema(sanitized[container_key])
+    return sanitized
+
 
 class Hy3Error(RuntimeError):
     """Base error for failures at the external model boundary."""
@@ -489,7 +545,7 @@ class Hy3Client:
                 "json_schema": {
                     "name": output_model.__name__,
                     "strict": True,
-                    "schema": output_model.model_json_schema(),
+                    "schema": sanitize_json_schema(output_model.model_json_schema()),
                 },
             },
         }
