@@ -10,8 +10,27 @@ include problem understanding, algorithm, proof, complexity, edge cases, and cod
 """
 
 SCHEMA_REPAIR_PROMPT = """\
-Your previous response did not validate against the required JSON schema. Repair only its
-format or schema violations. Return one complete JSON object and no surrounding prose.
+Your previous response did not validate against the required JSON schema. Repair the
+reported violation, then re-check the complete object for other violations — including
+the cross-field consistency rules below that the JSON schema cannot express — before
+returning it. Return one complete JSON object and no surrounding prose. Preserve string
+content exactly, including newline characters (a C++17 program is never one line).
+
+Cross-field consistency rules for review verdicts:
+- A step review that is material with status "unsupported" or "incorrect" must set a
+  taxonomy; a step review with status "correct" or "acceptable_omission" must not.
+- If material_error is true, error_taxonomy and first_error_step_id must be set, and
+  first_error_step_id must reference the FIRST step review that is both material and
+  erroneous, and its taxonomy must equal error_taxonomy.
+- If material_error is false, error_taxonomy and first_error_step_id must be null and
+  no step review may be both material and erroneous.
+- reviewer_id and trace_id must match the request, and every reviewed step_id must
+  exist in the supplied trace.
+
+Cross-field consistency rules for solution traces:
+- step_id and step_number values must be unique, and step dependencies must reference
+  known step IDs without cycles.
+- code must be complete C++17 source with real newline characters between lines.
 """
 
 LOGIC_REVIEW_PROMPT_VERSION = "logic-dependency-review-v1"
