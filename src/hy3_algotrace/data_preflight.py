@@ -153,9 +153,9 @@ def assess_rows(rows_by_split: Mapping[str, Sequence[Any]]) -> dict[str, Any]:
                 }
             )
     candidates = [row for row in summaries if row["candidate"]]
-    assignments, cells = _assign_candidates(candidates)
+    assignments, cells = assign_candidates(candidates)
     screened = [row for row in candidates if not row["checker_warnings"]]
-    screened_assignments, screened_cells = _assign_candidates(screened)
+    screened_assignments, screened_cells = assign_candidates(screened)
     if len(screened_assignments) == 30:
         assignments = screened_assignments
     return {
@@ -188,9 +188,16 @@ def assess_rows(rows_by_split: Mapping[str, Sequence[Any]]) -> dict[str, Any]:
     }
 
 
-def _assign_candidates(
+def assign_candidates(
     candidates: Sequence[Mapping[str, Any]],
 ) -> tuple[list[dict[str, str]], list[dict[str, Any]]]:
+    """Fill the 15 quota cells with two distinct problems each, deterministically.
+
+    Public because the formal checklist generator binds the same rule by content
+    hash; the tie-break order (fewest supported topics, then lowest rating, then
+    problem ID) and the slot order are part of the frozen selection rule and must
+    not drift between the preflight draft and the formal checklist.
+    """
     # Bipartite maximum matching: two slots per cell, one slot per unique problem.
     cells = [(topic.value, band.value) for topic in Topic for band in RatingBand]
     choices = {
