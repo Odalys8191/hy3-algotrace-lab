@@ -1,6 +1,50 @@
 # Hy3 AlgoTrace Lab 当前任务完成情况
 
-更新时间：2026-08-26（Asia/Shanghai）
+更新时间：2026-09-08（Asia/Shanghai）
+
+## 2026-09-08 真实试运行入口
+
+- 已完成非正式 live CLI 装配、无缓存生成、Docker 判题、审查融合与请求账本。
+- 已创建真实 CF 1613C 外部题包和试运行配置模板，原始数据未修改。
+- 参考解和六步轨迹已通过契约与编译期检查；未声称 Docker AC 或人工批准。
+- 自动试运行与静态校验均屏蔽私有异常内容；预算耗尽保留 partial report。
+- 运行条件和可复制命令见 `docs/LIVE_SMOKE_2026-09-08.md`。
+- 本轮续作已启动 Docker daemon 29.2.1，并从实际固定基底构建原有 Judge，
+  推送至仅绑定本机的 registry；已创建 `config.runtime-v1.json`，
+  `validate-live-inputs` 返回 inputs_valid=true。真实参考解 Judge 已运行全部
+  204 项测试，编译 AC、verdict AC、204/204 AC（41.297 秒）。
+- 两处 live CLI 失败边界缺陷均先复现后修复，独立复审无遗留问题；focused
+  tests 186 passed、完整非 Docker pytest 579 passed，Ruff/mypy/发布校验通过。
+- 尚未发出真实 Hy3 HTTP 请求；模型、端点、12 次请求上限及官方当前零价格
+  已记入外部 request-intent，实际请求仍须用户确认。正式自然语料冻结存在
+  生命周期依赖，需下一阶段单独设计，当前适配器拒绝 formal=true。
+
+## 2026-09-07 真实数据推进
+
+- 已找到用户下载的 validation/test Parquet：117/165 题，共 282 题。两份
+  原始文件保持在仓库外，未修改，也未提交。
+- 发现并修复导入器要求内存字节必须整除 MiB 的真实兼容性缺陷。现在按
+  原始字节向下取整 MiB，保持 Judge 分配不超过原始上限；原始行哈希不变。
+  共享 1.2 契约未改变，历史已接受的整 MiB 输入结果不变。
+- 新增 `python -m hy3_algotrace.data_preflight`，实际生成了 acquisition、
+  acquisition-validation、data-preflight、human-review-draft 和 index 工件。
+- 282 题中有 84 个结构候选、198 个自动排除；25 个候选触发判题提示，
+  59 个未触发。即使只使用未触发提示的候选，仍可匹配出不重复的 30 题，
+  满足五主题 × 三难度段 × 每格两题。此结果仅是人工审核前的可行性上界。
+- 基础二分、基础图论、中档图论的未触发提示候选各只有两题，优先人工核查。
+- 真实审核者身份、审核时间和批准内容保持空缺，没有伪造人工确认，也没有
+  创建正式 selection、题包、165 样本或资格报告。
+- 最终机器工件位于用户外部数据目录的 `preflight-20260907-v3`，早期 v1/v2
+  探索工件保留但不作为最终审核版本。可读材料见
+  `docs/DATA_PREFLIGHT_REVIEW_2026-09-07.md`；命令说明见 `data/README.md`。
+- 本轮网络无法解析 Hugging Face，未独立取得上游哈希或认证 revision；
+  已生成报告明确标记 `publisher_verified=false`，本地校验不冒充来源认证。
+- 09-07 时 live 适配器尚未实现；该项已于 09-08 完成，见上方更新。
+- Docker Compose CLI 可用，但 daemon 检查没有成功；本轮没有调用 Hy3，
+  没有进行 Docker Judge 或付费基准。正式门继续保持 not-ready。
+
+本轮代码与验证证据见 `docs/task-data-preflight.md`。以下为此前集成工作的记录，
+其中外部数据获取一项已由上面的实际预检推进，正式数据制作与运行仍未完成。
 
 ## 总体结论
 

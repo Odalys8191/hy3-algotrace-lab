@@ -4,6 +4,60 @@ This repository does not contain the CodeContests validation/test records, a
 formal 30-problem selection, third-party submitted solutions, or fabricated
 problem bundles.
 
+## Start with downloaded Parquet files
+
+The data preflight command hashes user-supplied raw files, runs the existing import
+checks without human annotations, and creates acquisition/validation reports plus
+a safe candidate report and unsigned review drafts. It never creates formal
+eligibility. Use Python 3.12 and install `pyarrow` if it is not already available.
+
+```sh
+# Set HY3_DATA_HOME to the external directory containing raw/validation.parquet
+# and raw/test.parquet. Choose a NEW output directory for each preflight version.
+python -m hy3_algotrace.data_preflight \
+  --validation "$HY3_DATA_HOME/raw/validation.parquet" \
+  --test "$HY3_DATA_HOME/raw/test.parquet" \
+  --validation-url 'https://huggingface.co/datasets/deepmind/code_contests/resolve/main/data/valid-00000-of-00001-5e672c5751f060d3.parquet' \
+  --test-url 'https://huggingface.co/datasets/deepmind/code_contests/resolve/main/data/test-00000-of-00001-9c49eeff30aacaa8.parquet' \
+  --format parquet \
+  --output-root "$HY3_DATA_HOME/preflight-new-run" \
+  --acknowledge-third-party-terms
+```
+
+URLs are declared provenance: this offline command does **not** authenticate a
+publisher, verify an upstream revision, or claim that a recorded local hash was
+published upstream. Replace the example URLs with the actual source URLs when
+different. Retain independent upstream verification separately when available.
+The acquisition manifest's converter name/version must also be supplied unchanged
+to subsequent `convert-preliminary` / `convert-formal` commands.
+
+All JSON outputs are content-addressed and create-only. The command prints a JSON
+map of relative artifact paths, including an `index` file. Repeating a command
+against the same artifacts fails without overwriting them. The report excludes
+statements, test content, and submitted code; it retains raw-row hashes for review
+binding. No raw-row export is performed. Load the exact row from its original
+split and one-based row number when creating a reviewed artifact.
+
+The maximum matching prevents one multi-topic problem from occupying two quota
+slots. It is only an optimistic feasibility bound before checker/topic review.
+Advisory statement patterns flag possible multiple answers, interaction, or
+tolerance checking. If a complete unflagged assignment exists, it is preferred;
+absence of a warning is never proof of standard checking. The review-draft JSON
+has a separate kind and null human identity/timestamp: it is not a valid signed
+`CandidateReview` or frozen selection input.
+
+Memory import policy: acquired positive byte limits are floored to integral MiB
+because the existing Judge contract accepts whole MiB. For example, 256000000
+bytes maps to 244 MiB, never above the source limit; limits below 1 MiB are rejected.
+The raw bytes/row hash remain unchanged. Existing exact-MiB inputs retain the same
+record, and the converter identity records the new policy. This conservative
+rounding can make an execution limit slightly stricter than the acquired limit.
+
+The actual 2026-09-07 preflight and human worksheet are documented in
+`docs/DATA_PREFLIGHT_REVIEW_2026-09-07.md` (relative to the project root).
+
+## Formal acquisition and review chain
+
 Formal inputs are limited to the Google DeepMind CodeContests `validation` and
 `test` splits. Keep both raw files outside the repository. Before conversion,
 create an acquisition manifest that records, for each split, its HTTPS source,
@@ -63,7 +117,7 @@ The supported workflow is:
    `formal_eligibility=false` and `capability_persisted=false`; loading it never
    recreates the capability.
 9. Author reference C++17, traces, oracles, mutants, and paradox samples in the
-   project. `lint-bundles` and `lint-corpus` verify relative paths, hashes,
+project. `lint-bundles` and `lint-corpus` verify relative paths, hashes,
    authorship declarations, selection links, labels, and counts. Corpus lint
    deliberately reports `formal_eligibility=false`. The persisted Judge artifact
    contains only per-case canonical source/problem/evidence hashes and the

@@ -9,7 +9,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, TextIO
 
-from .artifacts import ArtifactStore
+from .artifacts import ArtifactStore, ArtifactStoreError
 from .benchmark import (
     ArtifactAttemptLedger,
     BenchmarkRunner,
@@ -35,6 +35,12 @@ def _parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run")
     run.add_argument("--config", type=Path, required=True)
     run.add_argument("--artifact-root", type=Path, required=True)
+    run.add_argument("--catalog-root", type=Path)
+    run.add_argument("--live-inputs", type=Path)
+    live_validate = commands.add_parser("validate-live-inputs")
+    live_validate.add_argument("--config", type=Path, required=True)
+    live_validate.add_argument("--catalog-root", type=Path, required=True)
+    live_validate.add_argument("--live-inputs", type=Path, required=True)
     replay = commands.add_parser("replay")
     replay.add_argument("--config", type=Path, required=True)
     replay.add_argument("--observations", type=Path, required=True)
@@ -70,8 +76,18 @@ def main(
 
     parser = _parser()
     args = parser.parse_args(argv)
-    config = _load_config(args.config)
     destination = output if output is not None else sys.stdout
+    automatic_live = args.command == "run" and execute is None
+    try:
+        config = _load_config(args.config)
+    except (OSError, ValueError):
+        if args.command == "validate-live-inputs":
+            _emit({"inputs_valid": False, "formal": False, "docker_checked": False}, destination)
+            return 2
+        if automatic_live:
+            _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
+            return 2
+        raise
     if args.command == "validate-config":
         _emit(
             {
@@ -83,6 +99,22 @@ def main(
             },
             destination,
         )
+        return 0
+    from . import live_benchmark
+
+    if args.command == "validate-live-inputs":
+        from .catalog import ProblemCatalog
+
+        try:
+            live_benchmark.validate_live_inputs(
+                config,
+                ProblemCatalog.from_directory(args.catalog_root),
+                live_benchmark.load_live_inputs(args.live_inputs),
+            )
+        except Exception:
+            _emit({"inputs_valid": False, "formal": False, "docker_checked": False}, destination)
+            return 2
+        _emit({"inputs_valid": True, "formal": False, "docker_checked": False}, destination)
         return 0
     replay_input: ObservationReplayInput | None = None
     execution_kind = BenchmarkExecutionKind.LIVE
@@ -102,25 +134,66 @@ def main(
                 raise ValueError("replay is missing a frozen observation") from error
 
         execute = replay_execute
-    elif execute is None:
-        parser.error("live run requires the trusted Task-7/Hy3 execution adapter and credentials")
+    elif execute is None and (args.catalog_root is None or args.live_inputs is None):
+        parser.error("live run requires --catalog-root and --live-inputs")
+    try:
+        artifacts = ArtifactStore(args.artifact_root)
+    except (OSError, ArtifactStoreError):
+        if not automatic_live:
+            raise
+        _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
+        return 2
+    if automatic_live:
+        try:
+            execute = live_benchmark.build_live_executor(
+                config=config,
+                catalog_root=args.catalog_root,
+                inputs_path=args.live_inputs,
+                artifacts=artifacts,
+            )
+        except Exception:
+            _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
+            return 2
     assert execute is not None
-    artifacts = ArtifactStore(args.artifact_root)
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id=config.benchmark_id)
     budget = RemoteAttemptBudget(
         limit=config.remote_attempt_budget,
         event_sink=ledger.record,
         benchmark_id=config.benchmark_id,
     )
-    report = BenchmarkRunner(
-        config=config,
-        artifacts=artifacts,
-        budget=budget,
-        ledger=ledger,
-        execution_kind=execution_kind,
-        replay_input=replay_input,
-        human_labels=human_labels,
-    ).run(execute)
+    try:
+        report = BenchmarkRunner(
+            config=config,
+            artifacts=artifacts,
+            budget=budget,
+            ledger=ledger,
+            execution_kind=execution_kind,
+            replay_input=replay_input,
+            human_labels=human_labels,
+        ).run(execute)
+    except live_benchmark.LiveExecutionError:
+        if not automatic_live:
+            raise
+        try:
+            ledger.finalize()
+            artifacts.write_json(
+                Path("benchmarks") / config.benchmark_id / "failure.json",
+                {
+                    "schema_version": "1.2",
+                    "status": "execution_failed",
+                    "formal_eligibility": False,
+                },
+            )
+        except (OSError, ArtifactStoreError):
+            _emit({"status": "artifact_failed", "formal_eligible": False}, destination)
+            return 2
+        _emit({"status": "execution_failed", "formal_eligible": False}, destination)
+        return 2
+    except (OSError, ArtifactStoreError):
+        if not automatic_live:
+            raise
+        _emit({"status": "artifact_failed", "formal_eligible": False}, destination)
+        return 2
     _emit(
         {
             "benchmark_id": report.benchmark_id,

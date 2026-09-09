@@ -264,8 +264,12 @@ def _map_codecontests_record(
     topic = determine_primary_topic(tags)
     time_limit_ms = _protobuf_duration_ms(raw.get("time_limit"))
     memory_bytes = _positive_int(raw.get("memory_limit_bytes"), "memory_limit_bytes")
-    if memory_bytes % (1024 * 1024) != 0:
-        raise ValueError("memory_limit_bytes must be a whole number of MiB")
+    # Official Parquet records include decimal-byte limits such as 256_000_000.
+    # The existing Judge contract uses integral MiB. Floor rather than round up:
+    # execution must never be granted more memory than the acquired byte limit.
+    memory_mib = memory_bytes // (1024 * 1024)
+    if memory_mib == 0:
+        raise ValueError("memory_limit_bytes must permit at least one MiB")
     public_tests = _map_tests(raw.get("public_tests", []), "public")
     hidden_tests = _map_tests(raw.get("private_tests"), "hidden")
     generated_tests = _map_tests(raw.get("generated_tests", []), "generated")
@@ -285,7 +289,7 @@ def _map_codecontests_record(
         topic=topic,
         rating=_positive_int(raw.get("cf_rating"), "cf_rating"),
         time_limit_ms=time_limit_ms,
-        memory_limit_mb=memory_bytes // (1024 * 1024),
+        memory_limit_mb=memory_mib,
         public_tests=public_tests,
         hidden_tests=hidden_tests,
         generated_tests=generated_tests,
