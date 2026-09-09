@@ -1,0 +1,69 @@
+# Agent 交接文档：Hy3 模型端点与版本决策
+
+决策时间：2026-09-09（Asia/Shanghai）｜性质：已确认的用户决策，后续所有 Agent 与正式运行必须遵守
+
+## 一、决策内容
+
+| 阶段 | 模型 | 端点 | 计费 |
+| --- | --- | --- | --- |
+| Smoke run（链路验证，formal=false） | `hy3-preview` | TokenHub `https://tokenhub.tencentmaas.com/v1` | 新人免费体验包 100 万 tokens（90 天有效） |
+| 正式基准（165 样本，formal=true） | `hy3`（GA 正式版） | TokenHub `https://tokenhub.tencentmaas.com/v1` | 按量付费，约 ¥25–50/全量 |
+
+背景：此前 smoke 配置按 OpenRouter `tencent/hy3:free`（$0）冻结，现判定失效，全部切换到 TokenHub。
+
+## 二、决策依据（已搜索核实，2026-09-09）
+
+1. OpenRouter `tencent/hy3:free` 免费窗口为 2026-07-06 至 2026-07-21 16:00 UTC，已过期近两个月；即使免费档仍存，<$10 余额账号限 50 请求/天，无法支撑 165 样本 × 约 3 请求 ≈ 500 次的正式基准。
+2. TokenHub 定价：`hy3` GA 为 1 元/百万输入、4 元/百万输出、0.25 元/百万缓存；`hy3-preview` 为 1.2 元/4 元，新人免费包仅覆盖 preview。
+3. `hy3-preview`（2026-04-23 发布）与 GA `hy3`（2026-07-06 发布）架构完全一致（295B/21B 激活/256K），GA 提升全部来自后训练：幻觉率 12.5%→5.4%，MathArena Apex 12.8→38.7（+202%），Agent/代码 +20~30%。
+4. 任务要求「模型能力调用通过 Hy3 完成」，参考仓库为 GA 版 Hy3，故正式结论必须出自 GA 模型；smoke 用 preview 只验证管道，结果不得外推。
+
+## 三、执行要求
+
+### 1. `.env` 变更（分两阶段）
+
+Smoke 阶段：
+
+```text
+HY3_PROVIDER=tokenhub
+HY3_API_BASE=https://tokenhub.tencentmaas.com/v1
+HY3_MODEL=hy3-preview
+HY3_ALLOW_PAID=false
+HY3_MAX_PRICE_PROMPT=0
+HY3_MAX_PRICE_COMPLETION=0
+```
+
+正式基准阶段（跑完 smoke 后切换）：
+
+```text
+HY3_MODEL=hy3
+HY3_ALLOW_PAID=true
+HY3_MAX_PRICE_PROMPT=1      # 元/百万输入，对齐 TokenHub 实价
+HY3_MAX_PRICE_COMPLETION=4   # 元/百万输出
+```
+
+注意：当前 `.env` 若为 `MODEL=hy3` 且 `ALLOW_PAID=false`、价格上限 0，客户端价格守卫会拦截全部请求，一个都发不出去——这是已知坑，勿重复排查。
+
+### 2. 运行前人工动作
+
+- 在 TokenHub 控制台 → 模型广场 → 右上角「新用户福利免费体验」领取 `hy3-preview` 100 万 tokens 免费包（每主账号一次，90 天有效）。
+- 免费额度仅够 smoke（约 3–12 次请求）；正式基准估算 5–10M tokens，必须走 GA 付费或 Hy Token Plan 套餐（套餐仅支持 preview，勿误订）。
+
+### 3. Smoke 配置必须重新生成
+
+- 旧 `config.runtime-v1.json`（含 `smoke-20260908-v1` 目录下所有 OpenRouter 身份工件）按 OpenRouter 冻结，**已失效，禁止直接使用**。
+- 按 `docs/LIVE_SMOKE_2026-09-08.md` 流程，用新 `.env` 值（model=hy3-preview、endpoint=tokenhub、TokenHub 定价 basis）重新生成运行时配置并重跑 `validate-live-inputs`。
+- benchmark 结果一次性创建：`smoke-runs-20260908-v1` 下已写入的 benchmark_id 不可复用，换新配置需新 benchmark_id 或新输出目录。
+- Judge 镜像、catalog、live-inputs 不受端点切换影响，无需重建。
+
+### 4. 真实性与报告约束
+
+- README 与结果报告必须明确标注所用模型版本（preview / GA）与端点；正式结论只能引用 GA `hy3` 的运行。
+- smoke 结果（preview）只用于验证链路，不得写入任何正式准确率/错误分布结论。
+- 正式资格链已将模型、端点、参数哈希绑定进冻结配置，同一次正式基准内禁止混用两个模型版本。
+
+## 四、当前项目位置（供接手 Agent 快速定位）
+
+- 集成代码树：`.worktrees/integrate-task6-8`（分支 `codex/integrate-task6-8`），非 Docker 质量门全过；该分支尚有未提交改动（benchmark_cli.py / codecontests.py / docs / data/README.md），接手后先复核提交。
+- 数据就绪：`/Users/odalys/Documents/hy4oi-data/codecontests-v1/raw/`（validation + test parquet，282 题，无需再下载）。
+- 下一步顺序：复核提交集成分支改动 → 领取 TokenHub 免费包 + 重生成 smoke 配置 → 执行 smoke（首次真实 Hy3 请求）→ 正式语料生命周期设计（执行意图冻结 vs 运行结果冻结）→ 30 题人工审核冻结 → 正式数据/基准（GA hy3）/报告/演示。
