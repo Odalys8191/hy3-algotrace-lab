@@ -34,6 +34,9 @@ Cross-field consistency rules for solution traces:
 - step_id and step_number values must be unique, and step dependencies must reference
   known step IDs without cycles.
 - code must be complete C++17 source with real newline characters between lines.
+- Required string fields are never empty: when the previous response left one empty,
+  write its full intended content instead of preserving the empty value, and keep at
+  least one reasoning step with a non-empty claim and rationale.
 """
 
 LOGIC_REVIEW_PROMPT_VERSION = "logic-dependency-review-v1"
