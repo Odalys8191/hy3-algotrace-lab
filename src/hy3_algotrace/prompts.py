@@ -26,6 +26,9 @@ Cross-field consistency rules for review verdicts:
   no step review may be both material and erroneous.
 - reviewer_id and trace_id must match the request, and every reviewed step_id must
   exist in the supplied trace.
+- per_step_reviews must contain one review for every step of the supplied trace; it is
+  never an empty list, even when no material error is found — mark each unremarkable
+  step as correct instead of omitting it.
 
 Cross-field consistency rules for solution traces:
 - step_id and step_number values must be unique, and step dependencies must reference

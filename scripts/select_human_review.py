@@ -18,16 +18,23 @@ import argparse
 import json
 import sys
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from hy3_algotrace.artifacts import ArtifactStore, ArtifactStoreError, sha256_json
 from hy3_algotrace.contracts import RatingBand, Topic
-from hy3_algotrace.data_preflight import assess_rows, assign_candidates
-from hy3_algotrace.data_preflight import canonical_raw_split_logical_id
-from hy3_algotrace.dataset_models import DatasetDataError, DatasetFormat, _load_rows
-from hy3_algotrace.dataset_models import read_trusted_file
+from hy3_algotrace.data_preflight import (
+    assess_rows,
+    assign_candidates,
+    canonical_raw_split_logical_id,
+)
+from hy3_algotrace.dataset_models import (
+    DatasetDataError,
+    DatasetFormat,
+    _load_rows,
+    read_trusted_file,
+)
 
 CHECKLIST_FILENAME = "human-review-checklist.json"
 MANIFEST_FILENAME = "selection-manifest.json"
@@ -290,7 +297,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         _reject_populated_root(args.output_root)
         checklist, manifest = build_checklist(
             rows,
-            recorded_at=datetime.now(timezone.utc).isoformat(),
+            recorded_at=datetime.now(UTC).isoformat(),
             source=origin,
         )
         store = ArtifactStore(args.output_root)

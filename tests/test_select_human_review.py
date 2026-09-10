@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
 from hy3_algotrace.artifacts import ArtifactStore, canonical_json_bytes, sha256_json
 from hy3_algotrace.contracts import RatingBand, Topic
 
@@ -55,7 +56,9 @@ def _pool(per_cell: int = 2, **kwargs: Any) -> list[dict[str, Any]]:
     return rows
 
 
-def _preflight_file(tmp_path: Path, rows: list[dict[str, Any]], kind: str = "codecontests_data_preflight") -> Path:
+def _preflight_file(
+    tmp_path: Path, rows: list[dict[str, Any]], kind: str = "codecontests_data_preflight"
+) -> Path:
     path = tmp_path / "data-preflight.json"
     path.write_text(json.dumps({"kind": kind, "rows": rows}), encoding="utf-8")
     return path
@@ -205,7 +208,8 @@ def test_publish_accepts_a_blocked_temp_cleanup_only_when_content_matches(
 
 def test_cli_rejects_a_non_preflight_input(tmp_path: Path) -> None:
     payload = _preflight_file(tmp_path, _pool(per_cell=2), kind="something_else")
-    assert selection.main(["--preflight", str(payload), "--output-root", str(tmp_path / "out")]) == 2
+    arguments = ["--preflight", str(payload), "--output-root", str(tmp_path / "out")]
+    assert selection.main(arguments) == 2
 
 
 def test_cli_refuses_a_populated_output_root(tmp_path: Path) -> None:
