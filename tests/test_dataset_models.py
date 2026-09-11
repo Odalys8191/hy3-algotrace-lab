@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 import hy3_algotrace.dataset_models as dataset_models
 from hy3_algotrace.artifacts import sha256_json
-from hy3_algotrace.contracts import RatingBand, Topic
+from hy3_algotrace.contracts import OutputComparison, RatingBand, Topic
 from hy3_algotrace.dataset_models import (
     AcquisitionAsset,
     AcquisitionManifest,
@@ -632,3 +632,34 @@ def test_quota_report_has_all_fifteen_cells_and_never_pads(tmp_path: Path) -> No
     assert greedy_foundation.required == 2
     assert greedy_foundation.fulfilled is False
     assert sum(cell.eligible_count for cell in quota.cells) == 1
+
+
+def test_candidate_review_output_comparison_is_optional_and_standard_only() -> None:
+    """Case-insensitive comparison rides along standard reviews; others reject it."""
+
+    plain = _review(3101)
+    assert plain.output_comparison is None
+
+    case_insensitive = CandidateReview(
+        problem_id="cf-3102-a",
+        checker_reviewed=True,
+        checker_kind=CheckerKind.STANDARD,
+        reviewer="dataset-curator",
+        reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
+        evidence_url="https://codeforces.com/problemset/problem/3102/A",
+        output_comparison=OutputComparison.CASE_INSENSITIVE,
+    )
+    assert case_insensitive.output_comparison is OutputComparison.CASE_INSENSITIVE
+    parsed = CandidateReview.model_validate_json(case_insensitive.model_dump_json())
+    assert parsed.output_comparison is OutputComparison.CASE_INSENSITIVE
+
+    with pytest.raises(ValueError, match="only defined for standard checkers"):
+        CandidateReview(
+            problem_id="cf-3103-a",
+            checker_reviewed=True,
+            checker_kind=CheckerKind.SPECIAL_JUDGE,
+            reviewer="dataset-curator",
+            reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
+            evidence_url="https://codeforces.com/problemset/problem/3103/A",
+            output_comparison=OutputComparison.CASE_INSENSITIVE,
+        )

@@ -22,6 +22,7 @@ from hy3_algotrace.contracts import (
     ErrorTaxonomy,
     JudgeEvidence,
     JudgeStatus,
+    OutputComparison,
     ProblemOracle,
     ProblemRecord,
     ReasoningStage,
@@ -162,7 +163,12 @@ class FakeJudge:
         self.verdict = verdict
         self.calls = 0
 
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison | None = None,
+    ) -> JudgeEvidence:
         self.calls += 1
         compile_status = (
             JudgeStatus.INFRASTRUCTURE_ERROR

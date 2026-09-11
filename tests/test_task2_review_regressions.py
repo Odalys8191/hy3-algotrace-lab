@@ -606,3 +606,86 @@ def test_cli_sanitizes_stdout_oserror(
         == 1
     )
     assert capsys.readouterr().err == "error: unable to validate and freeze selection\n"
+
+
+def _write_checker_json(directory: Path, problem_id: str, comparison: str) -> None:
+    payload = {
+        "schema_version": "1.2",
+        "problem_id": problem_id,
+        "output_comparison": comparison,
+    }
+    (directory / "checker.json").write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_catalog_loads_optional_checker_json_comparison_semantics(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    item = bundle()
+    directory = _write_formal_bundle(catalog_root, "bundle", item)
+    _write_checker_json(directory, item.record.problem_id, "case_insensitive")
+
+    catalog = ProblemCatalog.from_directory(catalog_root)
+
+    loaded = catalog.get_bundle(item.record.problem_id)
+    assert loaded.output_comparison.value == "case_insensitive"
+
+
+def test_catalog_without_checker_json_keeps_exact_default(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    item = bundle()
+    _write_formal_bundle(catalog_root, "bundle", item)
+
+    catalog = ProblemCatalog.from_directory(catalog_root)
+
+    assert catalog.get_bundle(item.record.problem_id).output_comparison.value == "exact"
+
+
+def test_catalog_hash_ignores_explicit_exact_but_binds_case_insensitive(
+    tmp_path: Path,
+) -> None:
+    from hy3_algotrace.live_benchmark import catalog_hash
+
+    def _catalog(checker: str | None) -> str:
+        root = tmp_path / f"catalog-{checker or 'none'}"
+        root.mkdir()
+        item = bundle()
+        directory = _write_formal_bundle(root, "bundle", item)
+        if checker is not None:
+            _write_checker_json(directory, item.record.problem_id, checker)
+        return catalog_hash(ProblemCatalog.from_directory(root))
+
+    no_checker = _catalog(None)
+    explicit_exact = _catalog("exact")
+    case_insensitive = _catalog("case_insensitive")
+
+    assert no_checker == explicit_exact
+    assert case_insensitive != no_checker
+
+
+def test_catalog_rejects_checker_json_problem_id_mismatch(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    item = bundle()
+    directory = _write_formal_bundle(catalog_root, "bundle", item)
+    _write_checker_json(directory, "cf-9999-z", "case_insensitive")
+
+    with pytest.raises(BundleValidationError, match="checker.json problem ID"):
+        ProblemCatalog.from_directory(catalog_root)
+
+
+def test_catalog_rejects_checker_json_with_unknown_field(tmp_path: Path) -> None:
+    catalog_root = tmp_path / "catalog"
+    catalog_root.mkdir()
+    item = bundle()
+    directory = _write_formal_bundle(catalog_root, "bundle", item)
+    payload = {
+        "schema_version": "1.2",
+        "problem_id": item.record.problem_id,
+        "output_comparison": "case_insensitive",
+        "bogus": True,
+    }
+    (directory / "checker.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(BundleValidationError, match="invalid bundle"):
+        ProblemCatalog.from_directory(catalog_root)

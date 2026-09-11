@@ -19,7 +19,14 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
-from .contracts import JudgeEvidence, JudgeStatus, PerTestEvidence, ProblemRecord, TestCase
+from .contracts import (
+    JudgeEvidence,
+    JudgeStatus,
+    OutputComparison,
+    PerTestEvidence,
+    ProblemRecord,
+    TestCase,
+)
 from .judge import Judge, sanitize_counterexample_input
 
 JUDGE_BUILD_TAG = "hy3-algotrace-cpp17-judge:1.0"
@@ -255,9 +262,14 @@ class DockerJudge(Judge):
         self._temp_root = temp_root
         self._output_limit_bytes = output_limit_bytes
 
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence:
         try:
-            return self._judge(problem, cpp_source)
+            return self._judge(problem, cpp_source, output_comparison=output_comparison)
         except ValidationError:
             return JudgeEvidence(
                 compile_status=JudgeStatus.INFRASTRUCTURE_ERROR,
@@ -265,7 +277,13 @@ class DockerJudge(Judge):
                 diagnostics=INVALID_RUNTIME_METADATA,
             )
 
-    def _judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def _judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        *,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence:
         final_tests = (*problem.hidden_tests, *problem.generated_tests)
         if not final_tests:
             return JudgeEvidence(
@@ -345,6 +363,7 @@ class DockerJudge(Judge):
                     hidden_expected_outputs=tuple(
                         final_test.expected_output for final_test in final_tests
                     ),
+                    output_comparison=output_comparison,
                 )
                 for index, test in enumerate(final_tests)
             )
@@ -401,6 +420,7 @@ class DockerJudge(Judge):
         index: int,
         workspace: Path,
         hidden_expected_outputs: tuple[str, ...],
+        output_comparison: OutputComparison = OutputComparison.EXACT,
     ) -> PerTestEvidence:
         case_directory = workspace / f"case-{index:04d}"
         input_dir = case_directory / "input"
@@ -446,7 +466,7 @@ class DockerJudge(Judge):
                 hidden_expected_outputs=hidden_expected_outputs,
             )
         if status is JudgeStatus.AC and not _outputs_match(
-            outcome.stdout, test.expected_output
+            outcome.stdout, test.expected_output, output_comparison
         ):
             status = JudgeStatus.WA
             diagnostics = "Program output did not match the expected output."
@@ -730,7 +750,15 @@ def release_build_command(
     )
 
 
-def _outputs_match(actual: str, expected: str) -> bool:
+def _outputs_match(
+    actual: str,
+    expected: str,
+    comparison: OutputComparison = OutputComparison.EXACT,
+) -> bool:
+    if comparison is OutputComparison.CASE_INSENSITIVE:
+        return [token.casefold() for token in actual.split()] == [
+            token.casefold() for token in expected.split()
+        ]
     return actual.split() == expected.split()
 
 

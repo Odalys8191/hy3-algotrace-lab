@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Protocol, runtime_checkable
 
-from .contracts import JudgeEvidence, ProblemRecord
+from .contracts import JudgeEvidence, OutputComparison, ProblemRecord
 
 MAX_COUNTEREXAMPLE_CHARACTERS = 2048
 
@@ -25,5 +25,10 @@ def sanitize_counterexample_input(input_data: str) -> str:
 class Judge(Protocol):
     """Evaluate C++17 source against a problem's private final tests."""
 
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence:
         """Compile and evaluate source without executing it on the host."""

@@ -13,6 +13,7 @@ from .config import AppConfig
 from .contracts import (
     JudgeEvidence,
     JudgeStatus,
+    OutputComparison,
     ProblemOracle,
     ProblemRecord,
     ReasoningStage,
@@ -35,8 +36,13 @@ class _FixtureGenerator:
 
 
 class _FixtureJudge:
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
-        del problem, cpp_source
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence:
+        del problem, cpp_source, output_comparison
         return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
 
 

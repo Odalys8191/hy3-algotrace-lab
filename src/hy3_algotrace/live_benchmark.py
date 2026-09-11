@@ -7,7 +7,7 @@ import re
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, Protocol, Self
+from typing import Any, Literal, Protocol, Self
 
 import httpx
 from pydantic import BaseModel, ConfigDict, model_validator
@@ -16,7 +16,13 @@ from .artifacts import ArtifactStore, sha256_json
 from .benchmark import BudgetExceededError
 from .benchmark_models import BenchmarkConfig, HumanConfirmedLabel, MetricObservation, SampleKind
 from .catalog import ProblemCatalog
-from .contracts import JudgeEvidence, JudgeStatus, ProblemRecord, SolutionTrace
+from .contracts import (
+    JudgeEvidence,
+    JudgeStatus,
+    OutputComparison,
+    ProblemRecord,
+    SolutionTrace,
+)
 from .dataset_models import read_trusted_file
 from .docker_judge import DockerCliBackend, DockerCommandFactory, DockerJudge
 from .evaluator import EvidenceFusion, InfrastructureEvidenceError, ReviewOrchestrator
@@ -57,7 +63,12 @@ class LiveInputs(BaseModel):
 
 
 class JudgeRunner(Protocol):
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence: ...
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence: ...
 
 
 class LiveExecutionError(RuntimeError):
@@ -68,15 +79,18 @@ def catalog_hash(catalog: ProblemCatalog) -> str:
     entries = []
     for summary in catalog.list_problems():
         bundle = catalog.get_bundle(summary.problem_id)
-        entries.append(
-            {
-                "problem_id": summary.problem_id,
-                "problem": bundle.record.content_hash,
-                "oracle": sha256_json(bundle.oracle.model_dump(mode="json")),
-                "reference": sha256_json(bundle.reference_cpp),
-                "gold_trace": sha256_json(bundle.gold_trace.model_dump(mode="json")),
-            }
-        )
+        entry: dict[str, Any] = {
+            "problem_id": summary.problem_id,
+            "problem": bundle.record.content_hash,
+            "oracle": sha256_json(bundle.oracle.model_dump(mode="json")),
+            "reference": sha256_json(bundle.reference_cpp),
+            "gold_trace": sha256_json(bundle.gold_trace.model_dump(mode="json")),
+        }
+        # Only non-default comparison semantics participate so historical
+        # exact-comparison catalog hashes stay byte-stable.
+        if bundle.output_comparison is not OutputComparison.EXACT:
+            entry["output_comparison"] = bundle.output_comparison.value
+        entries.append(entry)
     return sha256_json(entries)
 
 
@@ -190,7 +204,11 @@ class LiveExecutor:
             trace = client.generate(bundle.record) if sample.trace is None else sample.trace
             self._artifacts.write_json(root / "trace.json", trace.model_dump(mode="json"))
             phase = "judge"
-            judge = self._judge.judge(bundle.record, trace.code)
+            judge = self._judge.judge(
+                bundle.record,
+                trace.code,
+                output_comparison=bundle.output_comparison,
+            )
             # Keep raw execution evidence protected, including failed executions.
             self._artifacts.write_json(root / "judge.json", judge.model_dump(mode="json"))
             if judge.compile_status in {JudgeStatus.INFRASTRUCTURE_ERROR, JudgeStatus.NOT_RUN} or (

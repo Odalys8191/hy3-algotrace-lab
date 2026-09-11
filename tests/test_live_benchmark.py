@@ -100,7 +100,7 @@ def test_real_client_makes_two_uncached_generations_and_counts_all_requests(tmp_
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(result)}}]})
 
     class Judge:
-        def judge(self, problem, cpp_source):  # type: ignore[no-untyped-def]
+        def judge(self, problem, cpp_source, output_comparison=None):  # type: ignore[no-untyped-def]
             return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
 
     execute = live_benchmark.LiveExecutor(
@@ -169,7 +169,7 @@ def test_infrastructure_failure_stops_before_review_and_preserves_safe_marker(
         )
 
     class Judge:
-        def judge(self, problem, cpp_source):  # type: ignore[no-untyped-def]
+        def judge(self, problem, cpp_source, output_comparison=None):  # type: ignore[no-untyped-def]
             return JudgeEvidence(
                 compile_status=JudgeStatus.INFRASTRUCTURE_ERROR,
                 verdict=JudgeStatus.INFRASTRUCTURE_ERROR,

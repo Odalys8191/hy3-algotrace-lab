@@ -38,7 +38,7 @@ from pydantic import (
 from hy3_algotrace.artifacts import sha256_json
 from hy3_algotrace.catalog import problem_content_hash
 from hy3_algotrace.codecontests import _map_codecontests_record
-from hy3_algotrace.contracts import ProblemRecord, RatingBand, Topic
+from hy3_algotrace.contracts import OutputComparison, ProblemRecord, RatingBand, Topic
 
 DATASET_SCHEMA_VERSION: Final[Literal["1.2"]] = "1.2"
 _PROBLEM_ID_PATTERN = re.compile(r"^cf-(?P<contest>[1-9][0-9]*)-(?P<index>[a-z0-9]+)$")
@@ -234,6 +234,9 @@ class CandidateReview(DatasetModel):
     evidence_url: str = Field(min_length=1, max_length=2_048)
     primary_topic: Topic | None = None
     primary_topic_reviewed: bool = False
+    # Optional judge comparison semantics for standard checkers (e.g. problems
+    # whose statement accepts YES/yes/Yes).  None keeps the historical default.
+    output_comparison: OutputComparison | None = None
     notes: str = Field(default="", max_length=2_000)
 
     @field_validator("reviewer", "notes")
@@ -251,6 +254,8 @@ class CandidateReview(DatasetModel):
             raise ValueError("checker_reviewed must agree with checker_kind")
         if self.primary_topic_reviewed != (self.primary_topic is not None):
             raise ValueError("primary_topic_reviewed must agree with primary_topic")
+        if self.output_comparison is not None and self.checker_kind is not CheckerKind.STANDARD:
+            raise ValueError("output_comparison is only defined for standard checkers")
         match = _PROBLEM_ID_PATTERN.fullmatch(self.problem_id)
         assert match is not None
         expected_url = (

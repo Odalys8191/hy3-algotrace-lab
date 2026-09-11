@@ -14,7 +14,15 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from hy3_algotrace.artifacts import canonical_json_bytes, sha256_json
-from hy3_algotrace.contracts import ProblemOracle, ProblemRecord, SolutionTrace, TestCase, Topic
+from hy3_algotrace.contracts import (
+    CheckerSemantics,
+    OutputComparison,
+    ProblemOracle,
+    ProblemRecord,
+    SolutionTrace,
+    TestCase,
+    Topic,
+)
 
 
 class BundleValidationError(ValueError):
@@ -45,6 +53,7 @@ _CATALOG_ROOT_FILES = frozenset({"manifest.json"})
 _FORMAL_BUNDLE_FILES = frozenset(
     {"problem.json", "oracle.json", "gold_trace.json", "reference.cpp"}
 )
+_OPTIONAL_BUNDLE_FILES = frozenset({"checker.json"})
 _DIRECTORY_OPEN_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 _FILE_OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW
 
@@ -118,6 +127,7 @@ class ProblemBundle:
     oracle: ProblemOracle
     reference_cpp: str
     gold_trace: SolutionTrace
+    output_comparison: OutputComparison = OutputComparison.EXACT
     formal_selection_eligible: Literal[True] = True
 
     def __post_init__(self) -> None:
@@ -398,7 +408,12 @@ def _load_pilot_bundle_at(directory_fd: int, directory_name: str) -> PilotBundle
 
 def _load_formal_bundle_at(directory_fd: int, directory_name: str) -> ProblemBundle:
     try:
-        _validate_bundle_members(directory_fd, directory_name, "problem.json")
+        _validate_bundle_members(
+            directory_fd,
+            directory_name,
+            "problem.json",
+            optional_files=_OPTIONAL_BUNDLE_FILES,
+        )
         record = _strict_model_validate(
             ProblemRecord, _read_json_at(directory_fd, "problem.json")
         )
@@ -409,13 +424,27 @@ def _load_formal_bundle_at(directory_fd: int, directory_name: str) -> ProblemBun
             SolutionTrace, _read_json_at(directory_fd, "gold_trace.json")
         )
         reference_cpp = _read_text_at(directory_fd, "reference.cpp")
+        output_comparison = OutputComparison.EXACT
+        if "checker.json" in os.listdir(directory_fd):
+            semantics = _strict_model_validate(
+                CheckerSemantics, _read_json_at(directory_fd, "checker.json")
+            )
+            if semantics.problem_id != record.problem_id:
+                raise BundleValidationError(
+                    "checker.json problem ID does not match problem record"
+                )
+            output_comparison = semantics.output_comparison
     except (OSError, json.JSONDecodeError, ValueError) as error:
         raise BundleValidationError(f"invalid bundle in {directory_name}: {error}") from error
-    return ProblemBundle(record, oracle, reference_cpp, gold_trace)
+    return ProblemBundle(record, oracle, reference_cpp, gold_trace, output_comparison)
 
 
 def _validate_bundle_members(
-    directory_fd: int, directory_name: str, record_filename: str
+    directory_fd: int,
+    directory_name: str,
+    record_filename: str,
+    *,
+    optional_files: frozenset[str] = frozenset(),
 ) -> None:
     members = set(os.listdir(directory_fd))
     for member in members:
@@ -430,8 +459,12 @@ def _validate_bundle_members(
             )
     if record_filename not in members:
         raise BundleValidationError(f"unknown catalog entry: {directory_name}")
-    expected = (_FORMAL_BUNDLE_FILES - {"problem.json"}) | {record_filename}
-    if members != expected:
+    expected = (_FORMAL_BUNDLE_FILES - {"problem.json"}) | {record_filename} | optional_files
+    if not expected - optional_files <= members:
+        raise BundleValidationError(
+            f"bundle {directory_name} is missing required bundle members"
+        )
+    if not members <= expected:
         raise BundleValidationError(
             f"bundle {directory_name} must contain exactly the required bundle members"
         )

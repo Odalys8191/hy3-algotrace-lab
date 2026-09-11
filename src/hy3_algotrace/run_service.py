@@ -43,6 +43,7 @@ from .contracts import (
     JudgeEvidence,
     JudgeStatus,
     ModelParameter,
+    OutputComparison,
     ProblemOracle,
     ProblemRecord,
     RunManifest,
@@ -171,7 +172,12 @@ class Generator(Protocol):
 
 
 class JudgeRunner(Protocol):
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence: ...
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence: ...
 
 
 class ReviewRunner(Protocol):
@@ -505,7 +511,11 @@ class RunService:
             if not self._claim_is_current(run_id, running_claim.content_hash):
                 return
             phase = "judge"
-            judge_evidence = self._judge.judge(bundle.record, trace.code)
+            judge_evidence = self._judge.judge(
+                bundle.record,
+                trace.code,
+                output_comparison=bundle.output_comparison,
+            )
             if (
                 judge_evidence.compile_status is JudgeStatus.INFRASTRUCTURE_ERROR
                 or judge_evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR

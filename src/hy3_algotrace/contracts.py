@@ -100,6 +100,20 @@ class JudgeStatus(StrEnum):
     INFRASTRUCTURE_ERROR = "infrastructure_error"
 
 
+class OutputComparison(StrEnum):
+    """Per-problem expected-output comparison semantics.
+
+    ``exact`` compares whitespace-separated tokens case-sensitively (the
+    historical default).  ``case_insensitive`` additionally folds case on
+    every token, for problems whose statement accepts answers such as
+    YES/yes/Yes.  Comparison scope is always one specific problem; there is
+    no global case-folding mode.
+    """
+
+    EXACT = "exact"
+    CASE_INSENSITIVE = "case_insensitive"
+
+
 class TestCase(ContractModel):
     schema_version: SchemaVersion = SCHEMA_VERSION
     test_id: str = Field(min_length=1)
@@ -173,6 +187,19 @@ class ProblemOracle(ContractModel):
         if not _is_sha256(value):
             raise ValueError("reference_solution_hash must be a lowercase SHA-256 hex digest")
         return value
+
+
+class CheckerSemantics(ContractModel):
+    """Optional per-problem judge comparison semantics (checker.json).
+
+    Absent file means the historical default: whitespace-tokenized,
+    case-sensitive (``exact``) output comparison.  The file is advisory
+    metadata for the judge only; it never carries hidden test data.
+    """
+
+    schema_version: SchemaVersion = SCHEMA_VERSION
+    problem_id: str = Field(min_length=1)
+    output_comparison: OutputComparison = OutputComparison.EXACT
 
 
 class ReasoningStep(ContractModel):

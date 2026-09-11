@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from hy3_algotrace.contracts import JudgeStatus, ProblemRecord, Topic
+from hy3_algotrace.contracts import JudgeStatus, OutputComparison, ProblemRecord, Topic
 from hy3_algotrace.contracts import TestCase as ContractTestCase
 
 
@@ -510,3 +510,64 @@ def test_any_pydantic_judge_construction_failure_is_fixed_infrastructure_error(
     assert evidence.verdict is JudgeStatus.INFRASTRUCTURE_ERROR
     assert evidence.tests == ()
     assert evidence.diagnostics == "Trusted runtime metadata is invalid or missing."
+
+
+def _yes_no_problem() -> ProblemRecord:
+    hidden = ContractTestCase(test_id="hidden", input_data="1\n", expected_output="YES\n")
+    return _problem(hidden_tests=(hidden,))
+
+
+def _yes_backend(module: Any, stdout: str) -> _FakeBackend:
+    return _FakeBackend(
+        module,
+        outcomes={
+            "1\n": module.ExecutionOutcome(
+                status=JudgeStatus.AC,
+                stdout=stdout,
+                time_ms=1,
+                memory_kb=1024,
+            )
+        },
+    )
+
+
+def test_case_insensitive_comparison_accepts_mixed_case_tokens(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    backend = _yes_backend(module, "yes\n")
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _yes_no_problem(),
+        "int main() {}",
+        output_comparison=OutputComparison.CASE_INSENSITIVE,
+    )
+
+    assert evidence.compile_status is JudgeStatus.AC
+    assert evidence.verdict is JudgeStatus.AC
+    assert evidence.tests[0].status is JudgeStatus.AC
+
+
+def test_default_comparison_still_rejects_mixed_case_tokens(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    backend = _yes_backend(module, "yes\n")
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _yes_no_problem(),
+        "int main() {}",
+    )
+
+    assert evidence.verdict is JudgeStatus.WA
+    assert evidence.tests[0].status is JudgeStatus.WA
+    assert "expected output" in evidence.tests[0].diagnostics
+
+
+def test_case_insensitive_comparison_still_rejects_wrong_tokens(tmp_path: Path) -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    backend = _yes_backend(module, "NO\n")
+
+    evidence = module.DockerJudge(backend=backend, temp_root=tmp_path).judge(
+        _yes_no_problem(),
+        "int main() {}",
+        output_comparison=OutputComparison.CASE_INSENSITIVE,
+    )
+
+    assert evidence.verdict is JudgeStatus.WA

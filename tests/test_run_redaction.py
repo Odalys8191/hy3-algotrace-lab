@@ -14,6 +14,7 @@ from hy3_algotrace.catalog import ProblemCatalog
 from hy3_algotrace.contracts import (
     JudgeEvidence,
     JudgeStatus,
+    OutputComparison,
     ProblemOracle,
     ProblemRecord,
     ReviewerVerdict,
@@ -31,7 +32,12 @@ ABSOLUTE_PATH = "/private/tmp/judge workspace/solution.cpp"
 
 
 class EchoingJudge:
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        output_comparison: OutputComparison | None = None,
+    ) -> JudgeEvidence:
         return JudgeEvidence(
             compile_status=JudgeStatus.AC,
             verdict=JudgeStatus.WA,
