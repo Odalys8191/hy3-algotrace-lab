@@ -206,7 +206,9 @@ results, and audit templates in `docs/`; they intentionally contain no claimed o
   Optional `HY3_TIMEOUT_SECONDS` accepts finite positive seconds (default 60). For long
   non-streaming responses, export a larger value such as 300 into the CLI/API process.
   This changes HTTP waiting time, not model parameters or request budgets; the client does
-  not automatically load `.env`.
+  not automatically load `.env`. A frozen `config.runtime` may also pin the value in its
+  `timeout_seconds` field; any run whose config pins it must match the process environment
+  exactly, otherwise the live executor fails closed before spending a request.
 - The release validator rejects public Compose ports, hard-coded secret-like assignments, and
   missing disclosures. CI performs a full-history Gitleaks scan with a deliberately tiny
   placeholder-only allowlist.

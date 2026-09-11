@@ -45,6 +45,7 @@ def config(
     sample_specs: tuple[BenchmarkSampleSpec, ...] | None = None,
     verified_data_evidence: VerifiedDataEvidence | None = None,
     bootstrap_replicates: int = 10,
+    timeout_seconds: float | None = None,
 ) -> BenchmarkConfig:
     known_rows = {row.sample_id: row for row in literal_rows()}
     resolved_specs = sample_specs or tuple(
@@ -89,6 +90,7 @@ def config(
         remote_attempt_budget=budget,
         formal=formal,
         verified_data_evidence=verified_data_evidence,
+        timeout_seconds=timeout_seconds,
     )
 
 
@@ -182,6 +184,7 @@ def formal_profile(
             sample_specs=tuple(specs),
             verified_data_evidence=evidence,
             bootstrap_replicates=1,
+            timeout_seconds=600.0,
         ),
         tuple(observations),
     )
@@ -1245,4 +1248,29 @@ def test_complete_run_persists_metrics_intervals_breakpoint_chart_and_hashes(
         1.0,
         1,
         1.0,
+    )
+
+
+def test_frozen_timeout_is_optional_for_legacy_nonformal_configs() -> None:
+    assert config().timeout_seconds is None
+    assert config(timeout_seconds=600).timeout_seconds == 600.0
+
+
+def test_frozen_timeout_must_be_finite_and_positive() -> None:
+    for value in (0.0, -1.0, float("inf"), float("nan")):
+        with pytest.raises(ValueError):
+            config(timeout_seconds=value)
+
+
+def test_formal_profile_requires_a_frozen_timeout() -> None:
+    with pytest.raises(ValueError):
+        formal_profile_definition_without_timeout()
+
+
+def formal_profile_definition_without_timeout() -> BenchmarkConfig:
+    """Minimal formal config that omits the frozen read timeout."""
+
+    formal, _ = formal_profile(benchmark_id="formal-timeout")
+    return BenchmarkConfig.model_validate(
+        {**formal.model_dump(mode="json"), "timeout_seconds": None}
     )

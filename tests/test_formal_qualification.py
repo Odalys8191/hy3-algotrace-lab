@@ -494,6 +494,7 @@ def _build_fixture(
         bootstrap_replicates=1,
         remote_attempt_budget=390,
         formal=True,
+        timeout_seconds=600.0,
         verified_data_evidence=VerifiedDataEvidence(
             evidence_kind="verified-task7-replay",
             artifact_path="judge-report.json",

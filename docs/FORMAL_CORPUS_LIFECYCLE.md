@@ -26,6 +26,9 @@
 
 - ga-v5 单题 smoke（2026-09-09，GA `hy3`）只证明链路可跑通，**不可外推为正式性能或正式资格**。
 - 本轮产出的 30 题清单是**待人工审核的草案**：审核字段全空，未产生任何 `CandidateReview`。
+  更正（2026-09-11）：审核者 odalys 已于 2026-09-10 填毕七字段，终稿见
+  `review-output-20260910-v1/human-review-checklist.corrected.json`；「审核字段全空」只描述
+  2026-09-10 生成草案当时的状态，且该清单至今仍未被资格链消费。
 - 本文档定义规则，不声明任何正式基准已经完成；165 样本、`formal=true` 的运行尚未发生。
 
 ## 2. 执行意图冻结
@@ -33,7 +36,8 @@
 ### 2.1 冻结对象清单
 
 下表「代码强制」列指当前源码是否在运行时比对并 fail-closed；标注「仅 manifest」的项
-**不被代码校验**，靠人工核对，不得误当作已实现的保护。
+**不被代码校验**，靠人工核对，不得误当作已实现的保护。2026-09-11 起 #7 已补齐代码强制，
+不再是「仅 manifest」项。
 
 | # | 对象 | 载体 | 绑定方式 | 代码强制 |
 | --- | --- | --- | --- | --- |
@@ -43,44 +47,64 @@
 | 4 | 提示词版本 | 四个 `*prompt_version` 字段 | 与 `prompts.py` 常量逐一比对（`solution-trace-v1`、`logic-dependency-review-v1`、`adversarial-review-v1`、`material-disagreement-arbiter-v1`） | 是（`validate_live_inputs`） |
 | 5 | 代码版本 | `code_revision` | 运行前 `git rev-parse HEAD`，要求工作树干净（沿用 ga-v5 准备脚本的断言） | 部分（写入配置；生成时需人工保证干净） |
 | 6 | 判题镜像 | `judge_image_digest`（`sha256:…`） | 进程环境 `HY3_JUDGE_IMAGE` 引用中的 digest 必须相等，且运行前 `probe_docker` 校验 `docker info` + `docker image inspect` | 是（`LiveExecutor` + `probe_docker`） |
-| 7 | 读超时 | `HY3_TIMEOUT_SECONDS` | 只记录于 intent manifest（runtime-basis 的 `timeout_seconds` 与进程环境覆盖） | **仅 manifest**：`Hy3Config.from_env` 读默认 60，不与冻结值比对 |
+| 7 | 读超时 | `config.runtime.timeout_seconds` + intent manifest | 配置字段与运行时 `Hy3Config.timeout_seconds`（进程环境 `HY3_TIMEOUT_SECONDS`）全等；该值再参与 identity 哈希与 `intent_hash` | 是（`LiveExecutor` 发起调用前比对 + `BenchmarkConfig` 正式档必填；非正式历史配置可缺省） |
 | 8 | 模型身份 | `model` | 与运行时 `Hy3Config.model` 全等；正式基准固定 `hy3`（GA），禁止与 `hy3-preview` 混用 | 是（`LiveExecutor`） |
 | 9 | 端点身份 | `endpoint_identity` | 去凭据的绝对 URL（scheme+host+path），与运行时 `endpoint_identity(base_url)` 全等；正式基准固定 `https://tokenhub.tencentmaas.com/v1`；非 HTTPS 直接拒绝 | 是（`LiveExecutor`） |
 | 10 | 调用预算与随机性 | `remote_attempt_budget`（≤500）、`seed`、`bootstrap_replicates` | 包含在 #1 的 config SHA-256 内；预算低于静态下界（生成数 + 2×审查数）即校验失败 | 是（`BenchmarkConfig`） |
 
-第 7 项是已知缺口：超时值不在 `BenchmarkConfig` 内，代码不会拒绝一个与冻结值不同的
-`HY3_TIMEOUT_SECONDS`。冻结纪律要求：意图 manifest 写明数值，发起运行前人工核对进程环境；
-若数值不同，视同意图变更，必须换 `benchmark_id`。
+第 7 项原为已知缺口（超时值不在 `BenchmarkConfig` 内，代码不会拒绝与冻结值不同的
+`HY3_TIMEOUT_SECONDS`）。**2026-09-11 已实现**：`BenchmarkConfig.timeout_seconds` 为新增
+可选字段（历史非正式配置可缺省，正式档必填），`LiveExecutor` 在发起任何远程调用前要求
+冻结值与运行时环境全等，不一致即 fail-closed；`scripts/prepare_formal_intent.py` 在写出
+配置与 manifest 时要求 `--timeout-seconds` 与 `HY3_TIMEOUT_SECONDS` 相等，该数值随配置字节
+进入 `config_sha256` 与 `intent_hash`。仍按冻结纪律执行：冻结后改超时视同意图变更，必须换
+`benchmark_id`。
 
 ### 2.2 intent manifest 结构
 
-生成 `config.runtime` 的同一脚本必须同时写出 intent manifest（沿用 ga-v5 的
-`runtime-basis.json` 字段并补齐下列键）：
+生成 `config.runtime` 的同一脚本必须同时写出 intent manifest。2026-09-11 实现为
+`scripts/prepare_formal_intent.py`：模板提供选择/语料/提示词/样本/预算等非运行时字段，
+运行时身份（派生 `benchmark_id`、代码版本、工作树干净、读超时、Judge 镜像 digest、模型、
+端点）由脚本从 git 与进程环境取得且**不得由人工在模板里指定**；脚本一次性写出
+`config.runtime-<tag>.json` 与 `intent-manifest-<tag>.json`，写出后立即自校验；任一失败
+退出码 2，已存在的同名产物不得覆盖。
 
 ```json
 {
   "schema_version": "1.2",
   "kind": "formal_execution_intent",
-  "benchmark_id": "<id>",
   "recorded_at": "<tz-aware ISO-8601>",
   "formal": true,
-  "config_sha256": "<#1>",
   "selection_hash": "<#2>",
   "corpus_hash": "<#3>",
   "prompt_versions": {"generator": "...", "logic_review": "...", "adversarial_review": "...", "arbiter": "..."},
   "code_revision": "<#5>",
   "worktree_clean": true,
   "judge_image_digest": "sha256:...",
-  "timeout_seconds": 600,
+  "timeout_seconds": 600.0,
   "model": "hy3",
   "endpoint_identity": "https://tokenhub.tencentmaas.com/v1",
   "remote_attempt_budget": 500,
+  "benchmark_id": "<slug>-<intent_identity_hash[:12]>",
+  "config_sha256": "<#1>",
   "intent_hash": "<SHA-256 of the canonical JSON of all fields above except intent_hash>"
 }
 ```
 
-`intent_hash` = 上表 #1–#10 全部字段（不含自身）的规范 JSON SHA-256。`benchmark_id` 由
-`intent_hash` 派生（建议 `<slug>-<intent_hash[:12]>`），使「配置变了但 id 没变」在命名层就不可能。
+早期版本把 `benchmark_id` 与 `config_sha256` 一并放进 `intent_hash`，而 `benchmark_id` 又要由
+`intent_hash` 派生、配置里又嵌着 `benchmark_id`，三者无法在一次哈希里同时满足。2026-09-11
+起按 `src/hy3_algotrace/intent.py` 拆成三个职责分离的哈希：
+
+| 哈希 | 覆盖范围 | 用途 |
+| --- | --- | --- |
+| `intent_identity_hash` | manifest 中除 `benchmark_id` / `config_sha256` / `intent_hash` 外的全部字段 | 派生 `benchmark_id = <slug>-<intent_identity_hash[:12]>` |
+| `config_sha256` | `config.runtime` 文件字节 | 把「实际运行的配置」绑到意图上 |
+| `intent_hash` | manifest 除 `intent_hash` 外的全部字段（含前两者） | 运行结果引用它；内容变即换 `benchmark_id` |
+
+计算顺序：意图核心字段 → `intent_identity_hash` → 派生 `benchmark_id` 并写入配置 →
+对配置字节 `config_sha256` → 组装 manifest → `intent_hash`。`verify_intent_manifest` 复核
+manifest 自哈希、配置字节哈希、配置字段与 manifest 的逐项一致、`benchmark_id` 的派生后缀，
+以及（提供时）运行中的代码版本；测试见 `tests/test_intent.py`。
 
 ### 2.3 不可变性规则
 
@@ -213,8 +237,9 @@ Parquet 重新计算，交叉验证通过）。审核优先级建议沿用预检
 1. 人工审核 30 题（先审余量最小的三格），填写 §5.2 的七个字段，附真实审核者标识与带时区时间。
 2. 生成 `CandidateReview` 工件 → review set → pin manifest → `convert-formal → quota →
    freeze-selection → verify-selection-chain`。
-3. 语料/基准就绪后，按 §2 生成正式 intent manifest（GA `hy3`、TokenHub 端点、
-   `HY3_TIMEOUT_SECONDS=600`、预算 500），再发起 `formal=true` 运行。
+3. 语料/基准就绪后，用 `scripts/prepare_formal_intent.py` 按 §2 生成正式的
+   `config.runtime` 与 intent manifest（GA `hy3`、TokenHub 端点、`HY3_TIMEOUT_SECONDS=600`
+   并与 `--timeout-seconds` 相等、预算 500），再发起 `formal=true` 运行。
 
 ## 6. 执行环境注意（本轮实测）
 

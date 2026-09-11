@@ -138,6 +138,7 @@ def test_real_client_makes_two_uncached_generations_and_counts_all_requests(tmp_
         {"logic_review_prompt_version": "invented"},
         {"judge_image_digest": "sha256:" + "0" * 64},
         {"formal": True},
+        {"timeout_seconds": 600.0},
     ],
 )
 def test_frozen_mismatch_fails_before_network(tmp_path: Path, change: dict[str, object]) -> None:
@@ -154,6 +155,44 @@ def test_frozen_mismatch_fails_before_network(tmp_path: Path, change: dict[str, 
             judge=object(),
             image_reference="judge@" + cfg.judge_image_digest,
         )
+
+
+def runtime_hy3(cfg, **overrides):  # type: ignore[no-untyped-def]
+    """Build the runtime client settings used by the frozen-identity checks."""
+
+    return Hy3Config(
+        base_url=cfg.endpoint_identity, model=cfg.model, api_key="unit-only", **overrides
+    )
+
+
+def test_frozen_timeout_matching_runtime_environment_is_accepted(tmp_path: Path) -> None:
+    _, catalog, inputs, cfg, store = setup_live(tmp_path)
+    frozen = cfg.model_copy(update={"timeout_seconds": 600.0})
+    executor = live_benchmark.LiveExecutor(
+        config=frozen,
+        catalog=catalog,
+        inputs=inputs,
+        artifacts=store,
+        hy3_config=runtime_hy3(cfg, timeout_seconds=600.0),
+        judge=object(),
+        image_reference="judge@" + cfg.judge_image_digest,
+    )
+    assert executor is not None
+
+
+def test_frozen_timeout_absent_keeps_legacy_nonformal_runs_working(tmp_path: Path) -> None:
+    _, catalog, inputs, cfg, store = setup_live(tmp_path)
+    assert cfg.timeout_seconds is None
+    executor = live_benchmark.LiveExecutor(
+        config=cfg,
+        catalog=catalog,
+        inputs=inputs,
+        artifacts=store,
+        hy3_config=runtime_hy3(cfg),
+        judge=object(),
+        image_reference="judge@" + cfg.judge_image_digest,
+    )
+    assert executor is not None
 
 
 def test_infrastructure_failure_stops_before_review_and_preserves_safe_marker(

@@ -172,6 +172,11 @@ class LiveExecutor:
             hy3_config.base_url
         ):
             raise ValueError("frozen model or endpoint does not match runtime")
+        if (
+            config.timeout_seconds is not None
+            and config.timeout_seconds != hy3_config.timeout_seconds
+        ):
+            raise ValueError("frozen read timeout does not match runtime HY3_TIMEOUT_SECONDS")
         match = re.fullmatch(r"[^\s@]+@(sha256:[0-9a-f]{64})", image_reference)
         if match is None or match.group(1) != config.judge_image_digest:
             raise ValueError("frozen Judge digest does not match runtime")

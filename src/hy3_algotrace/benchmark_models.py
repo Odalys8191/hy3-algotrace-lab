@@ -269,6 +269,10 @@ class BenchmarkConfig(BenchmarkModel):
     model_parameters: tuple[BenchmarkParameter, ...]
     code_revision: str = Field(min_length=1, strict=True)
     judge_image_digest: str = Field(pattern=r"^sha256:[0-9a-f]{64}$")
+    # Additive optional field: legacy non-formal configs stay readable, while every
+    # run that declares it is checked against the runtime environment, and the
+    # formal profile refuses to start without it.
+    timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     metric_version: Literal["task6-metrics-v1"]
     chart_version: Literal["task6-chart-v1"]
     seed: int = Field(strict=True)
@@ -392,6 +396,8 @@ class BenchmarkConfig(BenchmarkModel):
                     )
         if self.verified_data_evidence is None:
             raise ValueError("formal profile requires hash-bound verified-data evidence")
+        if self.timeout_seconds is None:
+            raise ValueError("formal profile requires a frozen model read timeout")
 
 
 class BenchmarkStatus(StrEnum):
