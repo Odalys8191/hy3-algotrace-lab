@@ -243,6 +243,7 @@ def test_gitleaks_config_extends_defaults_with_anchored_placeholder_allowlist() 
         expression.startswith("^") and expression.endswith("$")
         for expression in allowlist["regexes"]
     )
+    assert '^API_KEY = "sk-live-123456789-secret"$' in allowlist["regexes"]
 
 
 def test_release_validation_fixture_allowlist_requires_exact_path_identifier_and_value() -> None:

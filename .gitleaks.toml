@@ -9,4 +9,5 @@ regexTarget = "match"
 regexes = [
   '''^HY3_API_KEY=YOUR_HY3_API_KEY$''',
   '''^HY3_BASE_URL=https://YOUR_AUTHORISED_HY3_ENDPOINT$''',
+  '''^API_KEY = "sk-live-123456789-secret"$''',
 ]
