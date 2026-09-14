@@ -18,6 +18,11 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.12"
+      - name: Install the C++17 compiler used by authored-corpus checks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends g++
+          c++ --version
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e '.[dev]'
       - run: python -m ruff format --check src/hy3_algotrace/formal_qualification.py src/hy3_algotrace/release_validation.py src/hy3_algotrace/demo_cli.py src/hy3_algotrace/local_app.py src/hy3_algotrace/ci_stub_app.py docker/verify-runtime-lock.py tests/test_formal_qualification.py tests/test_release_validation.py tests/test_demo_cli.py tests/test_local_release_wiring.py tests/test_runtime_lock.py tests/test_docker_judge_integration.py

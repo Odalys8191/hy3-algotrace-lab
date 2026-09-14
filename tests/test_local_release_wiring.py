@@ -223,6 +223,8 @@ def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates(
     """A missing daemon or pending formal evidence cannot be silently called CI success."""
 
     workflow = (REPOSITORY_ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    assert "sudo apt-get install -y --no-install-recommends g++" in workflow
+    assert "c++ --version" in workflow
     assert 'python -m pytest -q -m "not docker_integration"' in workflow
     assert "python -m pytest -q -m docker_integration" in workflow
     assert "scripts/formal-release-gate.sh" in workflow

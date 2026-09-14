@@ -314,7 +314,8 @@ def _assemble(
     files["bundle-manifest.json"] = canonical_json_bytes(manifest.model_dump(mode="json"))
     files["corpus-pending.json"] = canonical_json_bytes(corpus.model_dump(mode="json"))
     # Validate through production readers before the destination can become visible.
-    with tempfile.TemporaryDirectory(prefix="hy4oi-authored-", dir="/private/tmp") as temporary:
+    temporary_root = Path(tempfile.gettempdir()).resolve()
+    with tempfile.TemporaryDirectory(prefix="hy4oi-authored-", dir=temporary_root) as temporary:
         staging = Path(temporary)
         _write_files(staging, files)
         lint_project_bundles(manifest.model_dump(mode="json"), root=staging, selection=selection)

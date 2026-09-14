@@ -85,12 +85,23 @@ def _inputs(root: Path) -> dict[str, Any]:
 
 
 def test_builder_creates_hash_linked_105_controls_and_preserves_private_boundary(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inputs = _inputs(tmp_path)
     module = _load(REPO / "scripts/prepare_authored_corpus.py", "authored_builder")
+    real_temporary_directory = module.tempfile.TemporaryDirectory
+    temporary_roots: list[object] = []
+    expected_temporary_root = Path(module.tempfile.gettempdir()).resolve()
+
+    def portable_temporary_directory(*args, **kwargs):
+        temporary_roots.append(kwargs.get("dir"))
+        assert kwargs.get("dir") == expected_temporary_root
+        return real_temporary_directory(*args, **kwargs)
+
+    monkeypatch.setattr(module.tempfile, "TemporaryDirectory", portable_temporary_directory)
     output = tmp_path / "authored-v1"
     result = module.assemble_authored_corpus(out_dir=output, **inputs)
+    assert temporary_roots == [expected_temporary_root]
     corpus = CorpusManifest.model_validate_json((output / "corpus-pending.json").read_bytes())
     bundles = ProjectBundleManifest.model_validate_json(
         (output / "bundle-manifest.json").read_bytes()
