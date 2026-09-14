@@ -231,7 +231,8 @@ def test_ci_separates_no_docker_unit_checks_from_actual_docker_and_formal_gates(
     )
     assert "docker-release-not-ready" in workflow
     assert "--full-history --all --diff-filter=tuxdb" in workflow
-    assert "-path '/tmp/gitleaks-*/gitleaks'" in workflow
+    assert 'scanner="$(command -v gitleaks)"' in workflow
+    assert "find /tmp" not in workflow
     assert 'find "$RUNNER_TEMP"' not in workflow
 
 

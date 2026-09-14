@@ -95,6 +95,6 @@ jobs:
           GITLEAKS_CONFIG: .gitleaks.toml
       - name: Fail closed if the pinned action cannot provide a full-history scanner
         run: |
-          scanner="$(find /tmp -maxdepth 2 -type f -path '/tmp/gitleaks-*/gitleaks' -perm -u+x -print -quit)"
+          scanner="$(command -v gitleaks)"
           test -n "$scanner"
           "$scanner" detect --source . --log-opts="--full-history --all --diff-filter=tuxdb" --redact --config .gitleaks.toml --no-banner
