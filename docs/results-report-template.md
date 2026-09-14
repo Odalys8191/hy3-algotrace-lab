@@ -12,5 +12,6 @@ report file itself is create-only and links to its method report by hash.
 | Human-review agreement | | | | | |
 
 State exclusions and partial runs prominently. Do not replace a chart, CI, or report after
-inspection; append a new immutable artifact with a supersession note. No results are entered
-in this release because formal data and benchmark gates are not complete.
+inspection; append a new immutable artifact with a supersession note. The current non-formal,
+partial numerators and denominators are published separately in
+`evaluation/results/current-results.json`; they do not satisfy this formal template.

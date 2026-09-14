@@ -181,7 +181,7 @@ SHA-256，参数变更即换哈希）。
 ### 5.2 清单与留空字段
 
 - 位置（外部数据根，**不进 git**）：
-  `/Users/odalys/Documents/hy4oi-data/codecontests-v1/human-review-20260910-v1/`
+  `$HY3_DATA_HOME/codecontests-v1/human-review-20260910-v1/`
   - `human-review-checklist.json`（SHA-256 `bdd3612ba78a3e59b20b8cdb2df2cbc991b2b7a097aa1eb3894823c33a0aaf76`）
   - `selection-manifest.json`（SHA-256 `52419177bbb7fc5fa5abb4f291337f8da5c342c67b080ce4b0c0da3db043270c`）
   - `items_hash = 1c88bc6b594447ad4bede310dcb7af38a69d275449c1d1ac842ef23499942c54`（30 条选题的规范 JSON 哈希）

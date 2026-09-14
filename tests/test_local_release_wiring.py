@@ -167,6 +167,8 @@ def test_formal_readiness_invokes_only_the_same_process_qualification_boundary()
     assert "SELECTION_REPLAY_RECEIPT" not in script
     assert "CORPUS_AUDIT" not in script
     for required in (
+        "HY3_FORMAL_PRE_RUN_INTENT",
+        "HY3_FORMAL_MATERIALIZED_FREEZE",
         "HY3_FORMAL_NATURAL_MATERIALIZATION",
         "HY3_FORMAL_HUMAN_REVIEW_EXPORT",
         "HY3_FORMAL_HUMAN_REVIEW_MAPPING",
@@ -192,6 +194,10 @@ def test_formal_readiness_compose_profile_is_separate_from_http_only_streamlit()
     )[0]
     assert "HY3_FORMAL_INPUT_ROOT_HOST" in formal_block
     assert "HY3_FORMAL_OUTPUT_ROOT_HOST" in formal_block
+    assert "--pre-run-intent" in formal_block
+    assert "--materialized-freeze" in formal_block
+    assert "/formal-inputs/pre-run-intent.json" in formal_block
+    assert "/formal-inputs/materialized-freeze.json" in formal_block
     assert "--natural-materialization" in formal_block
     assert "--human-review-export" in formal_block
     assert "--human-review-mapping" in formal_block

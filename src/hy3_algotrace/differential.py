@@ -10,10 +10,17 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any, Literal, Never, Protocol, SupportsIndex, runtime_checkable
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from hy3_algotrace.artifacts import sha256_json
-from hy3_algotrace.contracts import JudgeEvidence, JudgeStatus, ProblemRecord
+from hy3_algotrace.contracts import JudgeEvidence, JudgeStatus, OutputComparison, ProblemRecord
 from hy3_algotrace.corpus import (
     CorpusManifest,
     CorpusSampleKind,
@@ -25,6 +32,7 @@ from hy3_algotrace.dataset_models import (
     DatasetModel,
     VerifiedSelectionChain,
 )
+from hy3_algotrace.docker_judge import _outputs_match
 from hy3_algotrace.judge import Judge, sanitize_counterexample_input
 
 
@@ -52,14 +60,25 @@ class DifferentialStatus(StrEnum):
     MISMATCH = "mismatch"
 
 
-class JudgeSourceCase(DatasetModel):
+class _ComparisonModel(DatasetModel):
+    output_comparison: OutputComparison = OutputComparison.EXACT
+
+    @model_serializer(mode="wrap")
+    def serialize_comparison(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        if self.output_comparison is OutputComparison.EXACT:
+            payload.pop("output_comparison", None)
+        return payload
+
+
+class JudgeSourceCase(_ComparisonModel):
     case_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,255}$")
     kind: JudgeCaseKind
     problem: ProblemRecord
     cpp_source: str = Field(min_length=1, max_length=1_000_000)
 
 
-class JudgeCaseResult(DatasetModel):
+class JudgeCaseResult(_ComparisonModel):
     case_id: str = Field(min_length=1)
     problem_id: str = Field(min_length=1)
     kind: JudgeCaseKind
@@ -82,7 +101,7 @@ class JudgeValidationReport(DatasetModel):
         return self
 
 
-class PersistedJudgeCaseEvidence(DatasetModel):
+class PersistedJudgeCaseEvidence(_ComparisonModel):
     """Replayable hashes for one controlled source and its raw JudgeEvidence."""
 
     case_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,255}$")
@@ -212,7 +231,7 @@ class DifferentialCaseResult(DatasetModel):
     matched: bool
 
 
-class DifferentialReport(DatasetModel):
+class DifferentialReport(_ComparisonModel):
     schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
     kind: Literal["authored_reference_differential_report"] = (
         "authored_reference_differential_report"
@@ -250,7 +269,9 @@ def validate_judge_cases(
     results: list[JudgeCaseResult] = []
     for case in materialized:
         try:
-            evidence = judge.judge(case.problem, case.cpp_source)
+            evidence = judge.judge(
+                case.problem, case.cpp_source, output_comparison=case.output_comparison
+            )
         except Exception as error:
             raise DifferentialDataError(
                 f"judge infrastructure raised for {case.case_id}"
@@ -282,7 +303,9 @@ def validate_formal_corpus_judge_cases(
     raw_evidence: dict[str, JudgeEvidence] = {}
     for case in materialized:
         try:
-            raw_evidence[case.case_id] = judge.judge(case.problem, case.cpp_source)
+            raw_evidence[case.case_id] = judge.judge(
+                case.problem, case.cpp_source, output_comparison=case.output_comparison
+            )
         except Exception as error:
             raise DifferentialDataError(
                 f"judge infrastructure raised for {case.case_id}"
@@ -295,6 +318,7 @@ def validate_formal_corpus_judge_cases(
             case_id=case.case_id,
             problem_id=case.problem.problem_id,
             kind=case.kind,
+            output_comparison=case.output_comparison,
             source_sha256=hashlib.sha256(case.cpp_source.encode("utf-8")).hexdigest(),
             problem_hash=sha256_json(case.problem.model_dump(mode="json")),
             judge_evidence_hash=sha256_json(raw_evidence[case.case_id].model_dump(mode="json")),
@@ -361,6 +385,7 @@ def validate_persisted_formal_judge_evidence(
             case_id=case.case_id,
             problem_id=case.problem.problem_id,
             kind=case.kind,
+            output_comparison=case.output_comparison,
             source_sha256=hashlib.sha256(case.cpp_source.encode("utf-8")).hexdigest(),
             problem_hash=sha256_json(case.problem.model_dump(mode="json")),
             judge_evidence_hash=sha256_json(evidence.model_dump(mode="json")),
@@ -548,6 +573,7 @@ def _validate_case_evidence(
         case_id=case.case_id,
         problem_id=case.problem.problem_id,
         kind=case.kind,
+        output_comparison=case.output_comparison,
         compile_status=evidence.compile_status,
         verdict=evidence.verdict,
         evidence_hash=sha256_json(evidence.model_dump(mode="json")),
@@ -562,6 +588,7 @@ def run_differential_tests(
     runner: DifferentialRunner,
     time_limit_ms: int,
     memory_limit_mb: int,
+    output_comparison: OutputComparison = OutputComparison.EXACT,
 ) -> DifferentialReport:
     """Run authored adversarial cases and persist hashes, never raw case material."""
 
@@ -588,7 +615,7 @@ def run_differential_tests(
             raise DifferentialDataError(f"differential runner raised for {case.test_id}") from error
         if execution.status is not DifferentialExecutionStatus.COMPLETED:
             raise DifferentialDataError(f"differential runner failed for {case.test_id}")
-        matched = execution.stdout.split() == case.expected_output.split()
+        matched = _outputs_match(execution.stdout, case.expected_output, output_comparison)
         results.append(
             DifferentialCaseResult(
                 test_id=case.test_id,
@@ -605,6 +632,7 @@ def run_differential_tests(
     )
     return DifferentialReport(
         problem_id=problem_id,
+        output_comparison=output_comparison,
         reference_cpp_hash=sha256_json(reference_cpp),
         status=status,
         results=tuple(results),

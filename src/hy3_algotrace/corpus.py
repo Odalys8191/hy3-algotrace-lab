@@ -13,11 +13,20 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Literal, Self, cast
 from urllib.parse import urlsplit
 
-from pydantic import Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from hy3_algotrace.artifacts import sha256_json
 from hy3_algotrace.contracts import (
+    CheckerSemantics,
     ErrorTaxonomy,
+    OutputComparison,
     ProblemOracle,
     SolutionTrace,
     StepStatus,
@@ -197,6 +206,63 @@ class AuthoringAttestation(DatasetModel):
         )
 
 
+class AgentAuthoringRecord(DatasetModel):
+    """Automated source provenance; this record never attests to human review."""
+
+    schema_version: Literal["1.2"] = DATASET_SCHEMA_VERSION
+    kind: Literal["project_agent_authoring_record"] = "project_agent_authoring_record"
+    author: Literal["Codex"] = "Codex"
+    provenance: Literal["automated_project_authoring"] = "automated_project_authoring"
+    generator_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_provenance: Literal["project_authored_no_submitted_code"] = (
+        "project_authored_no_submitted_code"
+    )
+    source_provenance_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    human_review_performed: Literal[False] = False
+    content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_validator(mode="after")
+    def validate_record(self) -> Self:
+        if "0" * 64 in (
+            self.generator_sha256,
+            self.evidence_sha256,
+            self.source_provenance_sha256,
+        ):
+            raise ValueError("agent authoring evidence hashes cannot be all-zero")
+        payload = self.model_dump(mode="json")
+        del payload["content_hash"]
+        if self.content_hash != sha256_json(payload):
+            raise ValueError("agent authoring record content_hash does not match")
+        return self
+
+    @classmethod
+    def create(
+        cls,
+        *,
+        generator_sha256: str,
+        evidence_sha256: str,
+        source_provenance_sha256: str,
+    ) -> AgentAuthoringRecord:
+        payload: dict[str, Any] = {
+            "schema_version": DATASET_SCHEMA_VERSION,
+            "kind": "project_agent_authoring_record",
+            "author": "Codex",
+            "provenance": "automated_project_authoring",
+            "generator_sha256": generator_sha256,
+            "evidence_sha256": evidence_sha256,
+            "source_provenance": "project_authored_no_submitted_code",
+            "source_provenance_sha256": source_provenance_sha256,
+            "human_review_performed": False,
+        }
+        return cls(
+            generator_sha256=generator_sha256,
+            evidence_sha256=evidence_sha256,
+            source_provenance_sha256=source_provenance_sha256,
+            content_hash=sha256_json(payload),
+        )
+
+
 class AuthoredBundleEntry(DatasetModel):
     """Project-authored material linked to one selected third-party statement."""
 
@@ -206,12 +272,29 @@ class AuthoredBundleEntry(DatasetModel):
     oracle: ArtifactRef
     gold_trace: ArtifactRef
     mutants: tuple[ArtifactRef, ...] = Field(min_length=2, max_length=2)
-    authoring_attestation: AuthoringAttestation
+    authoring_attestation: AuthoringAttestation | AgentAuthoringRecord
     third_party_submitted_code_included: Literal[False]
+    checker_json: ArtifactRef | None = None
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_checker(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload: dict[str, Any] = handler(self)
+        if self.checker_json is None:
+            payload.pop("checker_json", None)
+        return payload
+
+    def artifacts(self) -> tuple[ArtifactRef, ...]:
+        return (
+            self.reference_cpp,
+            self.oracle,
+            self.gold_trace,
+            *self.mutants,
+            *((self.checker_json,) if self.checker_json is not None else ()),
+        )
 
     @model_validator(mode="after")
     def validate_artifacts(self) -> Self:
-        artifacts = (self.reference_cpp, self.oracle, self.gold_trace, *self.mutants)
+        artifacts = self.artifacts()
         if any(
             artifact.provenance is not ArtifactProvenance.PROJECT_AUTHORED for artifact in artifacts
         ):
@@ -224,6 +307,11 @@ class AuthoredBundleEntry(DatasetModel):
             self.gold_trace.media_type is not ArtifactMediaType.JSON
         ):
             raise ValueError("oracle and gold trace artifacts must be JSON")
+        if (
+            self.checker_json is not None
+            and self.checker_json.media_type is not ArtifactMediaType.JSON
+        ):
+            raise ValueError("checker artifact must be JSON")
         expected_prefix = ("problems", self.problem_id)
         for artifact in artifacts:
             parts = PurePosixPath(artifact.path).parts
@@ -556,20 +644,31 @@ def lint_project_bundles(
         raise CorpusDataError("bundle manifest does not match frozen selection")
     artifact_bytes = _read_artifacts(
         root,
-        (
-            artifact
-            for bundle in manifest.bundles
-            for artifact in (
-                bundle.reference_cpp,
-                bundle.oracle,
-                bundle.gold_trace,
-                *bundle.mutants,
-            )
-        ),
+        (artifact for bundle in manifest.bundles for artifact in bundle.artifacts()),
     )
     for bundle in manifest.bundles:
         _lint_bundle_contents(artifact_bytes, bundle)
     return manifest
+
+
+def bundle_output_comparisons(
+    bundle_manifest: ProjectBundleManifest,
+    bundle_artifact_root: Path | str,
+) -> dict[str, OutputComparison]:
+    """Read hash-bound checker semantics; historical bundles retain exact comparison."""
+
+    contents = _read_artifacts(
+        bundle_artifact_root,
+        (
+            bundle.checker_json
+            for bundle in bundle_manifest.bundles
+            if bundle.checker_json is not None
+        ),
+    )
+    return {
+        bundle.problem_id: _bundle_output_comparison(contents, bundle)
+        for bundle in bundle_manifest.bundles
+    }
 
 
 def build_corpus_manifest(
@@ -764,6 +863,7 @@ def _read_artifacts(
 
 def _lint_bundle_contents(contents: Mapping[str, bytes], bundle: AuthoredBundleEntry) -> None:
     _scan_bundle_provenance_markers(contents, bundle)
+    _bundle_output_comparison(contents, bundle)
     reference_cpp = _read_utf8_artifact(contents, bundle.reference_cpp, "reference C++")
     if not reference_cpp.strip():
         raise CorpusDataError(f"reference C++ is empty: {bundle.problem_id}")
@@ -797,7 +897,7 @@ def _lint_bundle_contents(contents: Mapping[str, bytes], bundle: AuthoredBundleE
 def _scan_bundle_provenance_markers(
     contents: Mapping[str, bytes], bundle: AuthoredBundleEntry
 ) -> None:
-    artifacts = (bundle.reference_cpp, bundle.oracle, bundle.gold_trace, *bundle.mutants)
+    artifacts = bundle.artifacts()
     for artifact in artifacts:
         text = _read_utf8_artifact(contents, artifact, "bundle artifact").casefold()
         if _contains_forbidden_provenance_marker(text):
@@ -855,7 +955,23 @@ def _read_utf8_artifact(contents: Mapping[str, bytes], artifact: ArtifactRef, la
         raise CorpusDataError(f"{label} is not valid UTF-8: {artifact.path}") from error
 
 
-def _read_contract_artifact[ModelT: ProblemOracle | SolutionTrace](
+def _bundle_output_comparison(
+    contents: Mapping[str, bytes],
+    bundle: AuthoredBundleEntry,
+) -> OutputComparison:
+    if bundle.checker_json is None:
+        return OutputComparison.EXACT
+    checker = _read_contract_artifact(contents, bundle.checker_json, CheckerSemantics, "checker")
+    if checker.problem_id != bundle.problem_id:
+        raise CorpusDataError(f"checker problem ID mismatch: {bundle.problem_id}")
+    if "output_comparison" not in checker.model_fields_set:
+        raise CorpusDataError(
+            f"checker must explicitly specify output_comparison: {bundle.problem_id}"
+        )
+    return checker.output_comparison
+
+
+def _read_contract_artifact[ModelT: ProblemOracle | SolutionTrace | CheckerSemantics](
     contents: Mapping[str, bytes],
     artifact: ArtifactRef,
     model: type[ModelT],

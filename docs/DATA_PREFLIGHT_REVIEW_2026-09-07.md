@@ -155,7 +155,7 @@
 
 ## 本地机器可读工件
 
-本次最终预检目录：`/Users/odalys/Documents/hy4oi-data/codecontests-v1/preflight-20260907-v3`。早期 v1/v2 工件仅用于保留探索记录，不是本次最终审核草案。
+本次最终预检目录：`$HY3_DATA_HOME/codecontests-v1/preflight-20260907-v3`。早期 v1/v2 工件仅用于保留探索记录，不是本次最终审核草案。
 
 索引：`77a9b82f413fdfccb14e8172a31d8321f9c9a30e5840e28df4190385c79fd71d.json`
 

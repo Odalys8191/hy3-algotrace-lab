@@ -16,6 +16,7 @@ from hy3_algotrace.contracts import (
     ErrorTaxonomy,
     JudgeEvidence,
     JudgeStatus,
+    OutputComparison,
     PerTestEvidence,
     ProblemOracle,
     ProblemRecord,
@@ -182,6 +183,7 @@ def _verified_selection_chain(
     root: Path,
     *,
     hidden_input_data: str = "2\n",
+    comparisons: dict[str, OutputComparison] | None = None,
 ) -> tuple[VerifiedSelectionChain, dict[str, ProblemRecord]]:
     template = _selection(hidden_input_data=hidden_input_data)
     rows: dict[str, list[dict[str, object]]] = {"validation": [], "test": []}
@@ -228,6 +230,7 @@ def _verified_selection_chain(
                 problem_id=entry.problem_id,
                 checker_reviewed=True,
                 checker_kind=CheckerKind.STANDARD,
+                output_comparison=(comparisons or {}).get(entry.problem_id),
                 reviewer="formal-chain-curator",
                 reviewed_at=datetime(2026, 8, 23, tzinfo=UTC),
                 evidence_url=f"https://codeforces.com/problemset/problem/{contest_id}/A",
@@ -857,8 +860,10 @@ def test_natural_run_endpoint_rejects_query_credentials() -> None:
         )
 
 
+@pytest.mark.parametrize("comparison", list(OutputComparison))
 def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     tmp_path: Path,
+    comparison: OutputComparison,
 ) -> None:
     """Formal eligibility is emitted only for the exact hash-linked 105-case set."""
 
@@ -883,6 +888,7 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
             kind=controlled_kinds[sample.kind],
             problem=records[sample.problem_id],
             cpp_source=(tmp_path / sample.cpp_source.path).read_text(encoding="utf-8"),
+            output_comparison=comparison,
         )
         for sample in manifest.samples
     )
@@ -903,8 +909,17 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
             first_counterexample_input=final_tests[0].input_data if mutant else None,
         )
 
+    seen_comparisons: list[OutputComparison] = []
+
     class SemanticJudge:
-        def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+        def judge(
+            self,
+            problem: ProblemRecord,
+            cpp_source: str,
+            *,
+            output_comparison: OutputComparison = OutputComparison.EXACT,
+        ) -> JudgeEvidence:
+            seen_comparisons.append(output_comparison)
             return complete_evidence(problem, mutant="mutant" in cpp_source)
 
     result = validate_formal_corpus_judge_cases(
@@ -920,6 +935,10 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     serialized = report.model_dump_json()
     assert "formal_eligibility" not in serialized
     assert len(report.cases) == 105
+    assert seen_comparisons == [comparison] * 105
+    assert all(case.output_comparison is comparison for case in report.cases)
+    if comparison is OutputComparison.EXACT:
+        assert "output_comparison" not in serialized
     with pytest.raises(TypeError):
         FormalCorpusJudgeValidationResult(evidence_manifest=report)
     raw_evidence = {
@@ -939,6 +958,25 @@ def test_formal_judge_audit_requires_all_30_gold_60_mutant_15_paradox(
     )
     assert replayed.formal_eligibility is True
     assert replayed.evidence_manifest == report
+
+    replaced_comparison = report.model_dump(mode="json")
+    if comparison is OutputComparison.CASE_INSENSITIVE:
+        replaced_comparison["cases"][0].pop("output_comparison")
+    else:
+        replaced_comparison["cases"][0]["output_comparison"] = "case_insensitive"
+    replaced_comparison["content_hash"] = sha256_json(
+        {key: value for key, value in replaced_comparison.items() if key != "content_hash"}
+    )
+    assert replaced_comparison["content_hash"] != report.content_hash
+    with pytest.raises(DifferentialDataError, match="evidence hash mismatch"):
+        validate_persisted_formal_judge_evidence(
+            replaced_comparison,
+            corpus=manifest,
+            selection_chain=selection_chain,
+            bundle_manifest=bundle_manifest,
+            cases=cases,
+            raw_evidence=raw_evidence,
+        )
 
     forged = report.model_dump(mode="json")
     forged["cases"][0]["judge_evidence_hash"] = "0" * 64
@@ -1065,3 +1103,138 @@ def test_complete_corpus_requires_sixty_natural_outputs_and_primary_labels(tmp_p
             cpp_source=controlled[1].cpp_source,
             final_expected_correct=False,
         )
+
+
+def test_checker_ref_binds_bundle_hash_and_legacy_absence_means_exact(tmp_path: Path) -> None:
+    from hy3_algotrace.corpus import bundle_output_comparisons
+
+    selection = _selection()
+    entries = _bundle_entries(tmp_path, selection)
+    legacy = build_project_bundle_manifest(selection, entries)
+    assert all("checker_json" not in entry for entry in legacy.model_dump(mode="json")["bundles"])
+    assert set(bundle_output_comparisons(legacy, tmp_path).values()) == {OutputComparison.EXACT}
+    selected = entries[0]
+    checker = _write_ref(
+        tmp_path,
+        f"problems/{selected.problem_id}/checker.json",
+        canonical_json_bytes(
+            {"problem_id": selected.problem_id, "output_comparison": "case_insensitive"}
+        ),
+        ArtifactMediaType.JSON,
+    )
+    payload = selected.model_dump(mode="json")
+    payload["checker_json"] = checker.model_dump(mode="json")
+    updated = AuthoredBundleEntry.model_validate_json(json.dumps(payload))
+    manifest = build_project_bundle_manifest(selection, (updated, *entries[1:]))
+    assert manifest.content_hash != legacy.content_hash
+    assert (
+        lint_project_bundles(manifest.model_dump(mode="json"), root=tmp_path, selection=selection)
+        == manifest
+    )
+    comparisons = bundle_output_comparisons(manifest, tmp_path)
+    assert comparisons[selected.problem_id] is OutputComparison.CASE_INSENSITIVE
+    assert sum(value is OutputComparison.EXACT for value in comparisons.values()) == 29
+    (tmp_path / checker.path).write_text("{}", encoding="utf-8")
+    with pytest.raises(CorpusDataError, match="byte length|SHA-256"):
+        bundle_output_comparisons(manifest, tmp_path)
+
+
+@pytest.mark.parametrize(
+    "mutation", ["wrong_problem", "unknown_field", "invalid_mode", "missing_mode"]
+)
+def test_authored_checker_rejects_untrusted_semantics(tmp_path: Path, mutation: str) -> None:
+    selection = _selection()
+    entries = _bundle_entries(tmp_path, selection)
+    selected = entries[0]
+    value = {"problem_id": selected.problem_id, "output_comparison": "case_insensitive"}
+    if mutation == "wrong_problem":
+        value["problem_id"] = entries[1].problem_id
+    elif mutation == "unknown_field":
+        value["ignore_numbers"] = "true"
+    elif mutation == "invalid_mode":
+        value["output_comparison"] = "ignore_all"
+    else:
+        del value["output_comparison"]
+    checker = _write_ref(
+        tmp_path,
+        f"problems/{selected.problem_id}/checker.json",
+        canonical_json_bytes(value),
+        ArtifactMediaType.JSON,
+    )
+    payload = selected.model_dump(mode="json")
+    payload["checker_json"] = checker.model_dump(mode="json")
+    updated = AuthoredBundleEntry.model_validate_json(json.dumps(payload))
+    manifest = build_project_bundle_manifest(selection, (updated, *entries[1:]))
+    with pytest.raises(CorpusDataError, match="checker"):
+        lint_project_bundles(manifest.model_dump(mode="json"), root=tmp_path, selection=selection)
+
+
+@pytest.mark.parametrize("mutation", ["cpp", "foreign_path", "natural_provenance"])
+def test_checker_ref_requires_problem_scoped_authored_json(tmp_path: Path, mutation: str) -> None:
+    selection = _selection()
+    entry = _bundle_entries(tmp_path, selection)[0]
+    ref = entry.oracle.model_dump(mode="json")
+    ref["path"] = f"problems/{entry.problem_id}/checker.json"
+    if mutation == "cpp":
+        ref["path"] = f"problems/{entry.problem_id}/checker.cpp"
+        ref["media_type"] = "text/x-c++src"
+    elif mutation == "foreign_path":
+        ref["path"] = "problems/cf-1-a/checker.json"
+    else:
+        ref["provenance"] = "hy3_output"
+    payload = entry.model_dump(mode="json")
+    payload["checker_json"] = ref
+    with pytest.raises(ValidationError, match="JSON|scoped|project-authored"):
+        AuthoredBundleEntry.model_validate_json(json.dumps(payload))
+
+
+def test_codex_authoring_record_is_hash_bound_without_claiming_human_review(tmp_path: Path) -> None:
+    from hy3_algotrace.corpus import AgentAuthoringRecord
+
+    record = AgentAuthoringRecord.create(
+        generator_sha256="1" * 64,
+        evidence_sha256="2" * 64,
+        source_provenance_sha256="3" * 64,
+    )
+    assert record.author == "Codex"
+    assert record.human_review_performed is False
+    assert record.provenance == "automated_project_authoring"
+    selection = _selection()
+    entries = _bundle_entries(tmp_path, selection)
+    original = entries[0].model_dump(mode="json")
+    original["authoring_attestation"] = record.model_dump(mode="json")
+    entry = AuthoredBundleEntry.model_validate_json(json.dumps(original))
+    manifest = build_project_bundle_manifest(selection, (entry, *entries[1:]))
+    assert (
+        lint_project_bundles(
+            manifest.model_dump(mode="json"),
+            root=tmp_path,
+            selection=selection,
+        )
+        == manifest
+    )
+    forged = record.model_dump(mode="json")
+    forged["generator_sha256"] = "4" * 64
+    with pytest.raises(ValidationError, match="content_hash"):
+        AgentAuthoringRecord.model_validate_json(json.dumps(forged))
+    forged = record.model_dump(mode="json")
+    forged["human_review_performed"] = True
+    forged["content_hash"] = sha256_json({k: v for k, v in forged.items() if k != "content_hash"})
+    with pytest.raises(ValidationError, match="human_review_performed"):
+        AgentAuthoringRecord.model_validate_json(json.dumps(forged))
+
+
+@pytest.mark.parametrize(
+    "field", ["generator_sha256", "evidence_sha256", "source_provenance_sha256"]
+)
+def test_codex_authoring_record_rejects_placeholder_hashes(field: str) -> None:
+    from hy3_algotrace.corpus import AgentAuthoringRecord
+
+    values = {
+        "generator_sha256": "1" * 64,
+        "evidence_sha256": "2" * 64,
+        "source_provenance_sha256": "3" * 64,
+    }
+    values[field] = "0" * 64
+    with pytest.raises(ValueError, match="all-zero"):
+        AgentAuthoringRecord.create(**values)

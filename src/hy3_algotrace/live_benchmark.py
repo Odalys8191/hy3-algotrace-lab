@@ -6,27 +6,41 @@ import os
 import re
 import subprocess
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol, Self
 
 import httpx
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
-from .artifacts import ArtifactStore, sha256_json
+from .artifacts import ArtifactStore, ArtifactStoreError, sha256_json
 from .benchmark import BudgetExceededError
 from .benchmark_models import BenchmarkConfig, HumanConfirmedLabel, MetricObservation, SampleKind
-from .catalog import ProblemCatalog
+from .catalog import ProblemCatalog, ProblemSummary, problem_content_hash
 from .contracts import (
+    CheckerSemantics,
     JudgeEvidence,
     JudgeStatus,
     OutputComparison,
+    ProblemOracle,
     ProblemRecord,
     SolutionTrace,
 )
 from .dataset_models import read_trusted_file
 from .docker_judge import DockerCliBackend, DockerCommandFactory, DockerJudge
 from .evaluator import EvidenceFusion, InfrastructureEvidenceError, ReviewOrchestrator
-from .hy3_client import Hy3AttemptContext, Hy3Client, Hy3Config, endpoint_identity
+from .hy3_client import (
+    Hy3AttemptContext,
+    Hy3AttemptOutcome,
+    Hy3Client,
+    Hy3Config,
+    Hy3ResponseError,
+    Hy3SpendLimitError,
+    Hy3TokenLimitError,
+    RmbCostGuard,
+    TokenQuotaGuard,
+    endpoint_identity,
+)
 from .prompts import (
     ADVERSARIAL_REVIEW_PROMPT_VERSION,
     ARBITER_PROMPT_VERSION,
@@ -71,11 +85,106 @@ class JudgeRunner(Protocol):
     ) -> JudgeEvidence: ...
 
 
+def _safe_exception_category(error: Exception) -> str:
+    if isinstance(error, InfrastructureEvidenceError):
+        return "infrastructure_evidence_error"
+    if isinstance(error, ArtifactStoreError):
+        return "artifact_error"
+    if isinstance(error, ValidationError):
+        return "validation_error"
+    if isinstance(error, (OSError, subprocess.SubprocessError)):
+        return "local_transport_error"
+    return "unexpected_error"
+
+
 class LiveExecutionError(RuntimeError):
     """Safe execution failure that must not become a benchmark observation."""
 
 
-def catalog_hash(catalog: ProblemCatalog) -> str:
+@dataclass(frozen=True, slots=True)
+class NonformalProblemBundle:
+    """Hash-checked private bundle without formal tag-derived topic qualification."""
+
+    record: ProblemRecord
+    oracle: ProblemOracle
+    reference_cpp: str
+    gold_trace: SolutionTrace
+    output_comparison: OutputComparison = OutputComparison.EXACT
+
+
+class NonformalProblemCatalog:
+    """Strict live-only loader preserving the already reviewed primary topic."""
+
+    _REQUIRED = frozenset({"problem.json", "oracle.json", "gold_trace.json", "reference.cpp"})
+    _OPTIONAL = frozenset({"checker.json"})
+
+    def __init__(self, bundles: tuple[NonformalProblemBundle, ...]) -> None:
+        by_id = {bundle.record.problem_id: bundle for bundle in bundles}
+        if not by_id or len(by_id) != len(bundles):
+            raise ValueError("nonformal catalog needs unique nonempty problem IDs")
+        self._by_id = dict(sorted(by_id.items()))
+
+    @classmethod
+    def from_directory(cls, root: Path) -> NonformalProblemCatalog:
+        if not root.is_dir() or root.is_symlink():
+            raise ValueError("invalid nonformal catalog root")
+        bundles: list[NonformalProblemBundle] = []
+        for entry in sorted(root.iterdir(), key=lambda path: path.name):
+            if entry.is_symlink():
+                raise ValueError("nonformal catalog symlinks are forbidden")
+            if entry.is_file():
+                if entry.name != "manifest.json":
+                    raise ValueError("unknown nonformal catalog root file")
+                continue
+            if not entry.is_dir():
+                raise ValueError("unknown nonformal catalog entry")
+            members = {path.name for path in entry.iterdir()}
+            if members - cls._REQUIRED - cls._OPTIONAL or not cls._REQUIRED <= members:
+                raise ValueError("invalid nonformal bundle members")
+            if any(path.is_symlink() or not path.is_file() for path in entry.iterdir()):
+                raise ValueError("nonformal bundle members must be regular files")
+            record = ProblemRecord.model_validate_json((entry / "problem.json").read_bytes())
+            oracle = ProblemOracle.model_validate_json((entry / "oracle.json").read_bytes())
+            trace = SolutionTrace.model_validate_json((entry / "gold_trace.json").read_bytes())
+            reference = (entry / "reference.cpp").read_text(encoding="utf-8")
+            if (
+                record.problem_id != entry.name
+                or record.content_hash != problem_content_hash(record)
+                or oracle.problem_id != record.problem_id
+                or oracle.reference_solution_hash != sha256_json(reference)
+                or trace.problem_id != record.problem_id
+            ):
+                raise ValueError("nonformal bundle identity or content hash mismatch")
+            comparison = OutputComparison.EXACT
+            if "checker.json" in members:
+                checker = CheckerSemantics.model_validate_json(
+                    (entry / "checker.json").read_bytes()
+                )
+                if checker.problem_id != record.problem_id:
+                    raise ValueError("nonformal checker identity mismatch")
+                comparison = checker.output_comparison
+            bundles.append(NonformalProblemBundle(record, oracle, reference, trace, comparison))
+        return cls(tuple(bundles))
+
+    def list_problems(self) -> tuple[ProblemSummary, ...]:
+        return tuple(
+            ProblemSummary(
+                problem_id=bundle.record.problem_id,
+                title=bundle.record.title,
+                topic=bundle.record.topic,
+                rating=bundle.record.rating,
+            )
+            for bundle in self._by_id.values()
+        )
+
+    def get_bundle(self, problem_id: str) -> NonformalProblemBundle:
+        try:
+            return self._by_id[problem_id]
+        except KeyError as error:
+            raise KeyError(f"unknown nonformal problem ID: {problem_id}") from error
+
+
+def catalog_hash(catalog: ProblemCatalog | NonformalProblemCatalog) -> str:
     entries = []
     for summary in catalog.list_problems():
         bundle = catalog.get_bundle(summary.problem_id)
@@ -96,7 +205,7 @@ def catalog_hash(catalog: ProblemCatalog) -> str:
 
 def validate_live_inputs(
     config: BenchmarkConfig,
-    catalog: ProblemCatalog,
+    catalog: ProblemCatalog | NonformalProblemCatalog,
     inputs: LiveInputs,
 ) -> None:
     if config.formal or config.verified_data_evidence is not None:
@@ -121,8 +230,17 @@ def validate_live_inputs(
     )
     if actual_prompts != expected_prompts:
         raise ValueError("frozen prompt versions do not match repository prompts")
-    if [(p.name, p.value) for p in config.model_parameters] != [("reasoning_effort", "high")]:
-        raise ValueError("live Hy3 client only supports reasoning_effort=high")
+    parameters = {p.name: p.value for p in config.model_parameters}
+    if parameters.get("reasoning_effort") != "high" or set(parameters) not in (
+        {"reasoning_effort"},
+        {"max_tokens", "reasoning_effort"},
+    ):
+        raise ValueError("live Hy3 client requires reasoning_effort=high and optional max_tokens")
+    max_tokens = parameters.get("max_tokens")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1
+    ):
+        raise ValueError("live max_tokens must be a positive integer")
     for spec, sample in zip(config.sample_specs, inputs.samples, strict=True):
         bundle = catalog.get_bundle(spec.problem_id)
         if (bundle.record.topic, bundle.record.rating_band) != (spec.topic, spec.rating_band):
@@ -159,13 +277,15 @@ class LiveExecutor:
         self,
         *,
         config: BenchmarkConfig,
-        catalog: ProblemCatalog,
+        catalog: ProblemCatalog | NonformalProblemCatalog,
         inputs: LiveInputs,
         artifacts: ArtifactStore,
         hy3_config: Hy3Config,
         judge: JudgeRunner,
         image_reference: str,
         transport: httpx.BaseTransport | None = None,
+        cost_guard: RmbCostGuard | None = None,
+        token_guard: TokenQuotaGuard | None = None,
     ) -> None:
         validate_live_inputs(config, catalog, inputs)
         if config.model != hy3_config.model or config.endpoint_identity != endpoint_identity(
@@ -191,18 +311,108 @@ class LiveExecutor:
         self._hy3 = hy3_config
         self._judge = judge
         self._transport = transport
+        self._parameters = {
+            parameter.name: parameter.value for parameter in config.model_parameters
+        }
+        self._cost_guard = cost_guard
+        self._token_guard = token_guard
 
     def __call__(
         self,
         sample_id: str,
-        observer: Callable[[Hy3AttemptContext], None],
+        observer: Callable[[Hy3AttemptContext], int | None],
     ) -> MetricObservation:
         sample, spec = self._samples[sample_id], self._specs[sample_id]
         bundle = self._catalog.get_bundle(spec.problem_id)
         root = Path("benchmarks") / self._config.benchmark_id / "live-evidence" / sample_id
         phase = "generation"
+        local_sequence = 0
+
+        def observe_attempt(context: Hy3AttemptContext) -> int:
+            nonlocal local_sequence
+            observed_sequence = observer(context)
+            if (
+                isinstance(observed_sequence, bool)
+                or not isinstance(observed_sequence, int)
+                or observed_sequence < 1
+            ):
+                local_sequence += 1
+                sequence = local_sequence
+            else:
+                sequence = observed_sequence
+                local_sequence = max(local_sequence, sequence)
+            self._artifacts.write_json(
+                root / "attempts" / f"{sequence:06d}" / "reservation.json",
+                {
+                    "schema_version": "1.0",
+                    "kind": "nonformal_hy3_attempt_reservation",
+                    "formal_eligibility": False,
+                    "sample_id": sample_id,
+                    "attempt_sequence": sequence,
+                    "operation": context.operation,
+                    "phase": context.phase,
+                    "retry_number": context.retry_number,
+                    "reviewer": context.reviewer,
+                    "reservation_upper_bound_rmb": context.reservation_upper_bound_rmb,
+                    "charged_upper_bound_rmb": context.charged_upper_bound_rmb,
+                    "remaining_upper_bound_rmb": context.remaining_upper_bound_rmb,
+                    "reservation_upper_bound_tokens": context.reservation_upper_bound_tokens,
+                    "charged_upper_bound_tokens": context.charged_upper_bound_tokens,
+                    "remaining_upper_bound_tokens": context.remaining_upper_bound_tokens,
+                },
+            )
+            return sequence
+
+        def observe_outcome(outcome: Hy3AttemptOutcome) -> None:
+            sequence = outcome.sequence
+            if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+                raise ValueError("attempt outcome is missing its reserved sequence")
+            usage = (
+                {
+                    "prompt_tokens": outcome.usage.prompt_tokens,
+                    "completion_tokens": outcome.usage.completion_tokens,
+                    "total_tokens": outcome.usage.total_tokens,
+                }
+                if outcome.usage is not None
+                else None
+            )
+            self._artifacts.write_json(
+                root / "attempts" / f"{sequence:06d}" / "settlement.json",
+                {
+                    "schema_version": "1.0",
+                    "kind": "nonformal_hy3_attempt_settlement",
+                    "formal_eligibility": False,
+                    "sample_id": sample_id,
+                    "attempt_sequence": sequence,
+                    "category": outcome.category,
+                    "http_status": outcome.http_status,
+                    "finish_reason": outcome.finish_reason,
+                    "usage": usage,
+                    "usage_status": outcome.usage_status,
+                    "charged_attempt_upper_bound_rmb": (outcome.charged_attempt_upper_bound_rmb),
+                    "charged_upper_bound_rmb": outcome.charged_upper_bound_rmb,
+                    "remaining_upper_bound_rmb": outcome.remaining_upper_bound_rmb,
+                    "charged_attempt_upper_bound_tokens": (
+                        outcome.charged_attempt_upper_bound_tokens
+                    ),
+                    "charged_upper_bound_tokens": outcome.charged_upper_bound_tokens,
+                    "remaining_upper_bound_tokens": outcome.remaining_upper_bound_tokens,
+                    "validation_issues": [
+                        {"path": issue.path, "code": issue.code}
+                        for issue in outcome.validation_issues
+                    ],
+                },
+            )
+
         client = Hy3Client(
-            self._hy3, cache=None, transport=self._transport, attempt_observer=observer
+            self._hy3,
+            cache=None,
+            transport=self._transport,
+            attempt_observer=observe_attempt,
+            attempt_outcome_observer=observe_outcome,
+            parameters=self._parameters,
+            cost_guard=self._cost_guard,
+            token_guard=self._token_guard,
         )
         failed = False
         try:
@@ -268,9 +478,13 @@ class LiveExecutor:
                 primary_review_agreement=not reviews.material_disagreement,
                 arbitration_used=reviews.arbiter is not None,
             )
+        except (Hy3SpendLimitError, Hy3TokenLimitError) as error:
+            resource = "RMB spend cap" if isinstance(error, Hy3SpendLimitError) else "token quota"
+            raise BudgetExceededError(f"remote {resource} exhausted") from error
         except BudgetExceededError:
             raise
-        except Exception:
+        except Hy3ResponseError as error:
+            diagnostic = error.diagnostic
             self._artifacts.write_json(
                 root / "failure.json",
                 {
@@ -279,6 +493,31 @@ class LiveExecutor:
                     "sample_id": sample_id,
                     "phase": phase,
                     "formal_eligibility": False,
+                    "error_category": (
+                        diagnostic.category if diagnostic is not None else "response_error"
+                    ),
+                    "reviewer": diagnostic.reviewer if diagnostic is not None else None,
+                    "validation_issues": [
+                        {"path": issue.path, "code": issue.code}
+                        for issue in (
+                            diagnostic.validation_issues if diagnostic is not None else ()
+                        )
+                    ],
+                    "http_status": diagnostic.http_status if diagnostic is not None else None,
+                    "finish_reason": (diagnostic.finish_reason if diagnostic is not None else None),
+                },
+            )
+            failed = True
+        except Exception as error:
+            self._artifacts.write_json(
+                root / "failure.json",
+                {
+                    "schema_version": "1.2",
+                    "kind": "nonformal_live_failure",
+                    "sample_id": sample_id,
+                    "phase": phase,
+                    "formal_eligibility": False,
+                    "error_category": _safe_exception_category(error),
                 },
             )
             failed = True
@@ -300,11 +539,25 @@ def build_live_executor(
     catalog_root: Path,
     inputs_path: Path,
     artifacts: ArtifactStore,
+    cost_guard: RmbCostGuard | None = None,
+    token_guard: TokenQuotaGuard | None = None,
 ) -> LiveExecutor:
     image = os.environ.get("HY3_JUDGE_IMAGE", "")
+    parameters = {parameter.name: parameter.value for parameter in config.model_parameters}
+    max_tokens = parameters.get("max_tokens")
+    if max_tokens is not None:
+        if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+            raise ValueError("frozen max_tokens must be an integer")
+        if cost_guard is None:
+            spend_cap = os.environ.get("HY3_SPEND_CAP_RMB", "")
+            if not spend_cap:
+                raise ValueError("HY3_SPEND_CAP_RMB is required with frozen max_tokens")
+            cost_guard = RmbCostGuard(limit_rmb=spend_cap, max_output_tokens=max_tokens)
+    elif cost_guard is not None or token_guard is not None:
+        raise ValueError("resource guards require frozen max_tokens")
     executor = LiveExecutor(
         config=config,
-        catalog=ProblemCatalog.from_directory(catalog_root),
+        catalog=NonformalProblemCatalog.from_directory(catalog_root),
         inputs=load_live_inputs(inputs_path),
         artifacts=artifacts,
         hy3_config=Hy3Config.from_env(),
@@ -312,6 +565,8 @@ def build_live_executor(
         judge=DockerJudge(
             backend=DockerCliBackend(command_factory=DockerCommandFactory(image=image))
         ),
+        cost_guard=cost_guard,
+        token_guard=token_guard,
     )
     probe_docker(image)
     return executor

@@ -9,6 +9,7 @@ from hy3_algotrace.catalog import problem_content_hash
 from hy3_algotrace.contracts import (
     JudgeEvidence,
     JudgeStatus,
+    OutputComparison,
     ProblemRecord,
     Topic,
 )
@@ -23,6 +24,7 @@ from hy3_algotrace.differential import (
     DifferentialStatus,
     JudgeCaseKind,
     JudgeSourceCase,
+    PersistedJudgeCaseEvidence,
     run_differential_tests,
     validate_judge_cases,
 )
@@ -61,7 +63,13 @@ def _problem() -> ProblemRecord:
 class _SemanticJudge:
     calls: list[str]
 
-    def judge(self, problem: ProblemRecord, cpp_source: str) -> JudgeEvidence:
+    def judge(
+        self,
+        problem: ProblemRecord,
+        cpp_source: str,
+        *,
+        output_comparison: OutputComparison = OutputComparison.EXACT,
+    ) -> JudgeEvidence:
         self.calls.append(f"{problem.problem_id}:{cpp_source}")
         verdict = JudgeStatus.WA if "mutant" in cpp_source else JudgeStatus.AC
         return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=verdict)
@@ -120,7 +128,13 @@ def test_infrastructure_or_compile_only_mutant_is_not_dataset_evidence() -> None
     class BrokenJudge:
         evidence: JudgeEvidence
 
-        def judge(self, _problem: ProblemRecord, _cpp_source: str) -> JudgeEvidence:
+        def judge(
+            self,
+            _problem: ProblemRecord,
+            _cpp_source: str,
+            *,
+            output_comparison: OutputComparison = OutputComparison.EXACT,
+        ) -> JudgeEvidence:
             return self.evidence
 
     case = JudgeSourceCase(
@@ -238,3 +252,104 @@ def test_differential_interface_rejects_duplicate_cases_and_runner_failure() -> 
         )
     assert str(captured.value) == "differential runner failed for same"
     assert "RAW_RUNNER_SECRET_DO_NOT_PRINT" not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "comparison, matched",
+    [
+        (OutputComparison.EXACT, False),
+        (OutputComparison.CASE_INSENSITIVE, True),
+    ],
+)
+def test_differential_respects_per_problem_case_and_token_semantics(
+    comparison: OutputComparison,
+    matched: bool,
+) -> None:
+    report = run_differential_tests(
+        problem_id="cf-1551-d1",
+        reference_cpp="// reference",
+        cases=(DifferentialCase(test_id="case-1", input_data="1", expected_output="yes NO"),),
+        runner=_Runner(outputs={"1": "  YES\nno  "}),
+        time_limit_ms=1000,
+        memory_limit_mb=256,
+        output_comparison=comparison,
+    )
+    assert report.results[0].matched is matched
+    assert report.output_comparison is comparison
+
+
+def test_differential_report_hash_binds_comparison_even_when_outputs_are_identical() -> None:
+    reports = [
+        run_differential_tests(
+            problem_id="cf-1551-d1",
+            reference_cpp="// reference",
+            cases=(DifferentialCase(test_id="case-1", input_data="1", expected_output="YES"),),
+            runner=_Runner(outputs={"1": "YES"}),
+            time_limit_ms=1000,
+            memory_limit_mb=256,
+            output_comparison=comparison,
+        )
+        for comparison in OutputComparison
+    ]
+    assert all(report.results[0].matched for report in reports)
+    assert sha256_json(reports[0].model_dump(mode="json")) != sha256_json(
+        reports[1].model_dump(mode="json")
+    )
+    assert "output_comparison" not in reports[0].model_dump(mode="json")
+
+
+def test_injected_judge_receives_comparison_for_each_authored_kind() -> None:
+    seen: list[tuple[str, OutputComparison]] = []
+
+    class ComparisonJudge:
+        def judge(
+            self,
+            problem: ProblemRecord,
+            cpp_source: str,
+            *,
+            output_comparison: OutputComparison = OutputComparison.EXACT,
+        ) -> JudgeEvidence:
+            seen.append((cpp_source, output_comparison))
+            return JudgeEvidence(
+                compile_status=JudgeStatus.AC,
+                verdict=JudgeStatus.WA if cpp_source == "mutant" else JudgeStatus.AC,
+            )
+
+    cases = tuple(
+        JudgeSourceCase(
+            case_id=kind.value,
+            kind=kind,
+            problem=_problem(),
+            cpp_source=kind.value,
+            output_comparison=OutputComparison.CASE_INSENSITIVE,
+        )
+        for kind in JudgeCaseKind
+    )
+    report = validate_judge_cases(cases, judge=ComparisonJudge())
+    assert seen == [(kind.value, OutputComparison.CASE_INSENSITIVE) for kind in JudgeCaseKind]
+    assert report.counts == {"gold": 1, "mutant": 1, "paradox": 1}
+
+
+def test_legacy_source_case_and_persisted_evidence_keep_exact_json_bytes() -> None:
+    source_payload = {
+        "case_id": "gold",
+        "kind": "gold",
+        "problem": _problem().model_dump(mode="json"),
+        "cpp_source": "// gold",
+    }
+    import json
+
+    case = JudgeSourceCase.model_validate_json(json.dumps(source_payload))
+    evidence_payload = {
+        "case_id": "gold",
+        "problem_id": "cf-6000-a",
+        "kind": "gold",
+        "source_sha256": "1" * 64,
+        "problem_hash": "2" * 64,
+        "judge_evidence_hash": "3" * 64,
+    }
+    evidence = PersistedJudgeCaseEvidence.model_validate_json(json.dumps(evidence_payload))
+    assert case.output_comparison is OutputComparison.EXACT
+    assert evidence.output_comparison is OutputComparison.EXACT
+    assert case.model_dump(mode="json") == source_payload
+    assert evidence.model_dump(mode="json") == evidence_payload

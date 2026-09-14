@@ -1,6 +1,6 @@
 # 真实数据试运行：2026-09-08
 
-当前代码目录：`/Users/odalys/Documents/hy4oi/.worktrees/integrate-task6-8`。
+当前代码目录：`$HY3_PROJECT_ROOT`。
 本轮产物未提交；原始下载文件和本地 `.env` 未修改。
 
 ## 已完成
@@ -15,7 +15,7 @@ C++17 编译期检查覆盖 756 个独立枚举小例及三个边界/样例。
 这不是 Docker 判题通过或人工认可的证明。
 
 真实外部试运行输入已保存至：
-`/Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1`。
+`$HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1`。
 
 - `catalog/cf-1613-c/`：校验通过的单题完整题包，包含私有测试，仅本地使用。
 - `live-inputs.json`：一次自然生成请求，无预设人工真值。
@@ -42,7 +42,7 @@ from pathlib import Path
 from hy3_algotrace.artifacts import ArtifactStore
 from hy3_algotrace.benchmark_models import BenchmarkConfig
 from hy3_algotrace.hy3_client import endpoint_identity
-root = Path('/Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1')
+root = Path('$HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1')
 payload = json.loads((root / 'config.template.json').read_text())
 payload['model'] = os.environ['HY3_MODEL']
 payload['endpoint_identity'] = endpoint_identity(os.environ['HY3_BASE_URL'])
@@ -52,19 +52,19 @@ ArtifactStore(root).write_json('config.runtime-v1.json', config.model_dump(mode=
 PY
 
 .venv/bin/python -m hy3_algotrace.benchmark_cli validate-live-inputs \
-  --config /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/config.runtime-v1.json \
-  --catalog-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/catalog \
-  --live-inputs /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/live-inputs.json
+  --config $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/config.runtime-v1.json \
+  --catalog-root $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/catalog \
+  --live-inputs $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/live-inputs.json
 ```
 
 静态校验成功不代表 Docker 或 API 可用。确认本次模型请求费用后再执行：
 
 ```bash
 .venv/bin/python -m hy3_algotrace.benchmark_cli run \
-  --config /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/config.runtime-v1.json \
-  --catalog-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/catalog \
-  --live-inputs /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/live-inputs.json \
-  --artifact-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-runs-20260908-v1
+  --config $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/config.runtime-v1.json \
+  --catalog-root $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/catalog \
+  --live-inputs $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/live-inputs.json \
+  --artifact-root $HY3_DATA_HOME/codecontests-v1/smoke-runs-20260908-v1
 ```
 
 启动前检查环境身份和本地固定镜像，不自动拉取镜像。预检/执行失败返回 2；
@@ -142,14 +142,14 @@ AC，耗时 **41.297 秒**。这是参考解的容器预检；不等于模型生
   尚未验证带凭据的路由可用性；不切换到付费模型。
 - 真实模型 HTTP 请求数：**0**。没有请求账本、生成解 verdict 或模型审查结果；
   请求意图不是已执行账本。按用户要求，真实 HTTP 必须等其确认。
-- 计划输出：`/Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-runs-20260908-v1`。
+- 计划输出：`$HY3_DATA_HOME/codecontests-v1/smoke-runs-20260908-v1`。
   密钥仍只在已有本地文件和临时进程环境中读取，未复制到配置、日志或仓库。
   本次装配将已有 `HY3_API_BASE` 映射到进程内的 `HY3_BASE_URL`，未修改 `.env`。
 
 ### 外部 create-only 证据索引
 
 以下路径相对于
-`/Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/continuation-20260908-v1`，
+`$HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/continuation-20260908-v1`，
 每份 JSON 均由 ArtifactStore 创建，文件名即内容 SHA-256：
 
 - 质量门：`quality-gates/ea76f30a72c95306df68d10d26038c0071611fef9bb81bc9d6179de3d302f9f6.json`
@@ -207,7 +207,7 @@ AC，耗时 **41.297 秒**。这是参考解的容器预检；不等于模型生
 
 ### 需要改动的位置
 
-1. `/Users/odalys/Documents/hy4oi/.env`（不进仓库）：
+1. `$HY3_REPO_HOME/.env`（不进仓库）：
    `HY3_PROVIDER`、`HY3_API_BASE`、`HY3_API_KEY`、`HY3_MODEL` 四项。
    注意客户端实际读取的是 `HY3_BASE_URL` / `HY3_API_KEY` / `HY3_MODEL`
    （见 `hy3_client.Hy3Config.from_env`），`HY3_API_BASE` 需在进程内映射为

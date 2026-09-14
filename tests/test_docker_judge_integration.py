@@ -170,7 +170,7 @@ def test_direct_docker_build_cannot_bypass_pinned_inputs(
     validator_repository, validator_digest = validator_image.rsplit("@sha256:", maxsplit=1)
     exact_time = os.environ["HY3_JUDGE_TIME_PACKAGE"]
     exact_util_linux = os.environ["HY3_JUDGE_UTIL_LINUX_PACKAGE"]
-    mutable_base = f"hy3-algotrace-test-base:{uuid.uuid4().hex}"
+    mutable_base = f"localhost:15088/hy3-algotrace-test-base:{uuid.uuid4().hex}"
     tag = subprocess.run(
         ("docker", "tag", immutable_base, mutable_base),
         capture_output=True,
@@ -192,10 +192,14 @@ def test_direct_docker_build_cannot_bypass_pinned_inputs(
             ),
         )
         for base_image, time_package, util_linux_package in invalid_build_args:
+            # Exercise the actual validator stage without resolving an intentionally
+            # mutable final FROM through an external registry before validation.
             build = subprocess.run(
                 (
                     "docker",
                     "build",
+                    "--target",
+                    "input-validator",
                     "--build-arg",
                     f"JUDGE_VALIDATOR_REPOSITORY={validator_repository}",
                     "--build-arg",
@@ -214,6 +218,7 @@ def test_direct_docker_build_cannot_bypass_pinned_inputs(
                 timeout=120,
             )
             assert build.returncode != 0
+            assert "hy3-validate-build-args" in build.stderr + build.stdout
 
         for validator_arguments in (
             (),

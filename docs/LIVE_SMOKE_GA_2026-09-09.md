@@ -33,7 +33,7 @@ minLength 本应保证），客户端 pydantic 拒收 → schema repair 一次�
 
 ## 运行条件
 
-- 工作树：`/Users/odalys/Documents/hy4oi/.worktrees/integrate-task6-8`（分支
+- 工作树：`$HY3_PROJECT_ROOT`（分支
   `codex/integrate-task6-8`），被验证代码提交 `03c1366`（含 `1f20f0f`、`e825980`）。
 - `.env`（GA 值，密钥仅从环境读取，未落盘）：`HY3_PROVIDER=tokenhub`、
   `HY3_API_BASE=https://tokenhub.tencentmaas.com/v1`、`HY3_MODEL=hy3`、
@@ -48,17 +48,17 @@ minLength 本应保证），客户端 pydantic 拒收 → schema repair 一次�
 ## 命令（已执行，勿重跑已占用目录）
 
 ```bash
-cd /Users/odalys/Documents/hy4oi/.worktrees/integrate-task6-8
-set -a && source /Users/odalys/Documents/hy4oi/.env && set +a
+cd $HY3_PROJECT_ROOT
+set -a && source $HY3_REPO_HOME/.env && set +a
 
 # 1) 生成 v5 配置与 runtime-basis（脚本断言工作树干净、config 未占用）
 env -u PYTHONPATH HY3_BASE_URL="$HY3_API_BASE" .venv/bin/python /private/tmp/hy3_smoke_v5_prepare.py
 
 # 2) 静态校验（输出 inputs_valid=true, formal=false）
 env -u PYTHONPATH HY3_BASE_URL="$HY3_API_BASE" .venv/bin/python -m hy3_algotrace.benchmark_cli validate-live-inputs \
-  --config /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260909-tokenhub-ga-v5/config.runtime-tokenhub-ga-v5.json \
-  --catalog-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/catalog \
-  --live-inputs /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/live-inputs.json
+  --config $HY3_DATA_HOME/codecontests-v1/smoke-20260909-tokenhub-ga-v5/config.runtime-tokenhub-ga-v5.json \
+  --catalog-root $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/catalog \
+  --live-inputs $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/live-inputs.json
 
 # 3) 真实运行（诊断包装器经 subprocess 执行 benchmark_cli run，用户 Terminal 执行）
 env -u PYTHONPATH HY3_BASE_URL="$HY3_API_BASE" HY3_API_KEY="$HY3_API_KEY" HY3_MODEL="$HY3_MODEL" \

@@ -19,9 +19,13 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
   "mypy>=1.13",
+  "Pillow>=11",
   "pytest>=8.3",
   "pytest-asyncio>=0.24",
   "ruff>=0.7",
+]
+media = [
+  "Pillow>=11",
 ]
 
 [tool.hatch.build.targets.wheel]

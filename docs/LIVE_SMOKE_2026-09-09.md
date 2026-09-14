@@ -30,10 +30,10 @@ TokenHub 的 `hy3-preview` 自 **2026-08-31 00:00（北京时间）**起下线�
 
 ## 运行条件
 
-- 工作树：`/Users/odalys/Documents/hy4oi/.worktrees/integrate-task6-8`。
+- 工作树：`$HY3_PROJECT_ROOT`。
 - 分支：`codex/integrate-task6-8`；被验证代码提交：
   `6adbd0e43f7613a679587ec437f15a3b0b759643`。续作没有修改源码。
-- `/Users/odalys/Documents/hy4oi/.env` 的实际白名单值如下，密钥存在且未输出。
+- `$HY3_REPO_HOME/.env` 的实际白名单值如下，密钥存在且未输出。
   本次未修改 `.env`，未将其加入配置、工件或版本控制。
 
 ```text
@@ -74,7 +74,7 @@ localhost:15088/hy3-algotrace-judge@sha256:47c12489acef3ae4e6e386ae346fc4a830e39
 
 ## 配置、命令与不可变工件
 
-外部数据根为 `/Users/odalys/Documents/hy4oi-data/codecontests-v1`。
+外部数据根为 `$HY3_DATA_HOME/codecontests-v1`。
 两次 TokenHub 配置均独立于失效的 OpenRouter runtime，仍使用原始
 `smoke-20260908-v1/catalog` 与 `smoke-20260908-v1/live-inputs.json`。
 两份 runtime 的 model 均为 `hy3-preview`，reasoning_effort 为 `high`，
@@ -96,15 +96,15 @@ localhost:15088/hy3-algotrace-judge@sha256:47c12489acef3ae4e6e386ae346fc4a830e39
 
 ```bash
 .venv/bin/python -m hy3_algotrace.benchmark_cli validate-live-inputs \
-  --config /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260909-tokenhub-v1/config.runtime-tokenhub-v1.json \
-  --catalog-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/catalog \
-  --live-inputs /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/live-inputs.json
+  --config $HY3_DATA_HOME/codecontests-v1/smoke-20260909-tokenhub-v1/config.runtime-tokenhub-v1.json \
+  --catalog-root $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/catalog \
+  --live-inputs $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/live-inputs.json
 
 .venv/bin/python -m hy3_algotrace.benchmark_cli run \
-  --config /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260909-tokenhub-v1/config.runtime-tokenhub-v1.json \
-  --catalog-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/catalog \
-  --live-inputs /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-20260908-v1/live-inputs.json \
-  --artifact-root /Users/odalys/Documents/hy4oi-data/codecontests-v1/smoke-runs-20260909-tokenhub-v1
+  --config $HY3_DATA_HOME/codecontests-v1/smoke-20260909-tokenhub-v1/config.runtime-tokenhub-v1.json \
+  --catalog-root $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/catalog \
+  --live-inputs $HY3_DATA_HOME/codecontests-v1/smoke-20260908-v1/live-inputs.json \
+  --artifact-root $HY3_DATA_HOME/codecontests-v1/smoke-runs-20260909-tokenhub-v1
 ```
 
 v1 执行时间为 19:26:54–19:26:55，v2 为 19:28:54–19:28:55（北京时间）。

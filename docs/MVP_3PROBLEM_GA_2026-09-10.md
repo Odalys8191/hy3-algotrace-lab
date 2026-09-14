@@ -9,11 +9,11 @@
 - 三题 `raw_row_hash` 与人工审核清单（`review-output-20260910-v1/human-review-checklist.corrected.json`）经 Parquet 重算交叉验证一致。
 - 未扩充候选、未改正式门槛、未改通用 Judge。生成输入仅题面+公开测试，隐藏测试与 oracle 信息未传给生成模型。
 
-## 二、新增工件（外部数据根 `/Users/odalys/Documents/hy4oi-data/codecontests-v1/`）
+## 二、新增工件（外部数据根 `$HY3_DATA_HOME/codecontests-v1/`）
 
 - `mvp3-20260910-v1/`：三题 catalog（两道新题的 `reference.cpp` 为 AI-authored MVP 参考解，宿主与 Docker 各全量 AC 预检：407/407 与 203+202 全过，重复运行稳定）、`live-inputs.json`、`live-inputs-remaining.json`、三次运行的 `run-result*.json` 与 `http-diagnostic*.json`。
 - `mvp3-runs-20260910-v{1,2,3}/`：全部 create-only 保留（含失败轮的 partial、failure.json、ledger）。
-- 报告：`/Users/odalys/Documents/hy4oi/mvp-report-20260910-v1/MVP报告-非正式小样本.md`（含 cf-1556-b 完整样例与三次运行失败账本）。
+- 报告：`$HY3_REPO_HOME/mvp-report-20260910-v1/MVP报告-非正式小样本.md`（含 cf-1556-b 完整样例与三次运行失败账本）。
 
 ## 三、运行与结果（预算 20 次，实际 20/20，未超支）
 

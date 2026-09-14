@@ -83,5 +83,6 @@ human-review provenance hash enters the safe qualification report.
 
 Use the create-only [method](method-report-template.md),
 [results](results-report-template.md), and [audit](audit-record-template.md) templates. Never
-replace a report/chart after seeing results. The planned 30/60/15/60 composition, 500-attempt
-ceiling, and any breakpoint/metric result remain specifications rather than completed facts.
+replace a report/chart after seeing results. The 30/60/15 controlled composition has been
+authored and Judge-validated, but the additional 60 natural samples, 500-attempt formal run,
+human validity study, and any formal breakpoint/metric result remain incomplete.

@@ -39,23 +39,34 @@ Cross-field consistency rules for solution traces:
   least one reasoning step with a non-empty claim and rationale.
 """
 
-LOGIC_REVIEW_PROMPT_VERSION = "logic-dependency-review-v1"
-LOGIC_REVIEW_SYSTEM_PROMPT = """\
-Act as an isolated logic and dependency reviewer. Check every numbered step against the
-problem oracle, verify dependency order and proof support, and return only a ReviewerVerdict
-JSON object. Do not assume another reviewer will correct omissions.
+_REVIEW_CROSS_FIELD_RULES = """\
+Keep reviewer_id and trace_id identical to the request. per_step_reviews must contain
+exactly one review for every supplied trace step and must not reference any other step_id.
+When material_error is false, error_taxonomy and first_error_step_id must be null and no
+step review may be both material and erroneous. When material_error is true, the verdict
+taxonomy and first_error_step_id must match the first material erroneous step review.
 """
 
-ADVERSARIAL_REVIEW_PROMPT_VERSION = "adversarial-review-v1"
-ADVERSARIAL_REVIEW_SYSTEM_PROMPT = """\
+LOGIC_REVIEW_PROMPT_VERSION = "logic-dependency-review-v3"
+LOGIC_REVIEW_SYSTEM_PROMPT = f"""\
+Act as an isolated logic and dependency reviewer. Check every numbered step against the
+public problem statement and supplied trace, verify dependency order and proof support, and
+return only a ReviewerVerdict JSON object. Do not assume another reviewer will correct omissions.
+{_REVIEW_CROSS_FIELD_RULES}
+"""
+
+ADVERSARIAL_REVIEW_PROMPT_VERSION = "adversarial-review-v3"
+ADVERSARIAL_REVIEW_SYSTEM_PROMPT = f"""\
 Act as an isolated adversarial reviewer. Seek counterexamples, omitted constraints, boundary
 failures, and code/explanation inconsistencies. Return only a ReviewerVerdict JSON object.
 Do not assume another reviewer will correct omissions.
+{_REVIEW_CROSS_FIELD_RULES}
 """
 
-ARBITER_PROMPT_VERSION = "material-disagreement-arbiter-v1"
-ARBITER_SYSTEM_PROMPT = """\
-Resolve a material disagreement between two independent reviews using the problem, oracle,
-and trace. Return only a ReviewerVerdict JSON object. Select the earliest independent
-material root error when one exists; do not decide by confidence alone.
+ARBITER_PROMPT_VERSION = "material-disagreement-arbiter-v3"
+ARBITER_SYSTEM_PROMPT = f"""\
+Resolve a material disagreement between two independent reviews using the public problem,
+supplied trace, and primary verdicts. Return only a ReviewerVerdict JSON object. Select the
+earliest independent material root error when one exists; do not decide by confidence alone.
+{_REVIEW_CROSS_FIELD_RULES}
 """

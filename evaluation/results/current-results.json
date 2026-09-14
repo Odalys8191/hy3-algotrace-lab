@@ -1,0 +1,122 @@
+{
+  "as_of": "2026-09-14",
+  "controlled_corpus_validation": {
+    "by_rating_band": {
+      "1200-1500": {
+        "accepted_by_expected_semantics": 35,
+        "samples": 35
+      },
+      "1600-1900": {
+        "accepted_by_expected_semantics": 35,
+        "samples": 35
+      },
+      "2000-2400": {
+        "accepted_by_expected_semantics": 35,
+        "samples": 35
+      }
+    },
+    "counts": {
+      "controlled_wrong": 60,
+      "gold": 30,
+      "paradox": 15
+    },
+    "evidence_file_sha256": "357c53b20bf94d6756a6afba70716429a64b7412ac3185ce78488c7786c348d6",
+    "evidence_internal_content_hash": "f133e15e06e6198185f1144a0c515c4c706f2aaccee970e2475a78301a8ca902",
+    "formal_eligibility": false,
+    "impact_bounded_reuse": {
+      "new_executions": 4,
+      "reused_and_reverified": 101
+    },
+    "meaning": "All authored samples satisfy their class-specific Judge expectations; this is not model accuracy.",
+    "observed_tests": 22839,
+    "passed_by_expected_semantics": 105,
+    "samples": 105,
+    "taxonomy_distribution": {
+      "algorithm_logic": 22,
+      "boundary_error": 20,
+      "constraint_omission": 9,
+      "implementation_error": 1,
+      "problem_misread": 8,
+      "proof_gap_circularity": 15
+    },
+    "validation_passed": true
+  },
+  "formal": false,
+  "live_natural_mvp": {
+    "completed_samples": 2,
+    "difficulty_breakdown": {
+      "1200-1500": {
+        "completed": 2,
+        "final_correct": 2,
+        "process_valid": 2
+      },
+      "1600-1900": {
+        "completed": 0,
+        "judge_ac_without_completed_process_review": 1
+      },
+      "2000-2400": {
+        "completed": 0
+      }
+    },
+    "final_answer_accuracy_completed_only": {
+      "denominator": 2,
+      "numerator": 2,
+      "value": 1.0
+    },
+    "incomplete_samples": 1,
+    "notes": [
+      "The third sample compiled and passed 202/202 Judge tests but exhausted the shared attempt budget before process review completed.",
+      "The denominator is completion-selected and far too small for generalization."
+    ],
+    "process_valid_rate_completed_only": {
+      "denominator": 2,
+      "numerator": 2,
+      "value": 1.0
+    },
+    "result_file_sha256": {
+      "cf-1556-b": "0f20d9c1344d2eb0ad57eb432d2679380a93aa53b32f912541f4c90520108a40",
+      "cf-1613-c": "8b84ef0f77898fcc096122da1697b3c37c09f95597802aa8e3753abe223f5369"
+    },
+    "third_sample_judge_file_sha256": "277b3f08206f86b6161a641cc8715f96ca68ac4c2cc7e8699d89fd9ce1637c46"
+  },
+  "partial_balanced_pilot": {
+    "completed_results": 1,
+    "failure_class": "validation_error",
+    "failure_file_sha256": "d8dbe55ded03a2530ce1477eac6438f9d16d5f6b012ce3c6d71469266c750c9e",
+    "failed_samples": 1,
+    "formal": false,
+    "new_attempts": 5,
+    "new_token_usage": 42251,
+    "planned_samples": 75,
+    "reason": "logic-reviewer schema repair still referenced an unknown trace step ID",
+    "result_file_sha256": "dc34cda8c97ad7a0453128a3756a05b1a3b4f4db25ab3a3445d89520fc1accfe",
+    "status": "execution_failed",
+    "total_attempts_including_carryover": 9
+  },
+  "schema_version": "1.0",
+  "validity_metrics": {
+    "delayed_blind_rereview": {
+      "denominator": 0,
+      "not_evaluable": true
+    },
+    "exact_localization_accuracy": {
+      "denominator": 0,
+      "not_evaluable": true,
+      "numerator": null,
+      "value": null
+    },
+    "flagged_false_positive_rate": {
+      "denominator": 0,
+      "not_evaluable": true,
+      "numerator": null,
+      "value": null
+    },
+    "human_audit_records": 0,
+    "within_one_step_localization_accuracy": {
+      "denominator": 0,
+      "not_evaluable": true,
+      "numerator": null,
+      "value": null
+    }
+  }
+}

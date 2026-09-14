@@ -11,6 +11,11 @@ protected provenance chain. Do not commit raw external records without rights re
 redistribute third-party submitted code. Project-authored reference bundles require their own
 source/author attestation.
 
+The repository's `evaluation/materials/` tree contains only project-authored C++17 source and
+reasoning traces. Its manifest links to the original Codeforces problem pages instead of copying
+their statements or tests. These authored files are distributed under the repository MIT
+License; the linked problems and their metadata remain subject to their original terms.
+
 Hy3 is only an activity-task model integration target. This personal project is neither a
 Tencent product nor an official Tencent release. A future formal result must disclose the
 single-reviewer limit, same-model-review bias, 20% delayed blind re-review, historic data/prompt

@@ -16,8 +16,10 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     ValidationError,
     field_validator,
+    model_serializer,
     model_validator,
 )
 
@@ -41,19 +43,21 @@ from .benchmark_models import (
     MetricObservation,
     SampleKind,
 )
-from .contracts import JudgeEvidence, ProblemRecord, SolutionTrace
+from .contracts import JudgeEvidence, OutputComparison, ProblemRecord, SolutionTrace
 from .corpus import (
     CorpusManifest,
     CorpusSample,
     CorpusSampleKind,
     CorpusStatus,
     ProjectBundleManifest,
+    bundle_output_comparisons,
     lint_corpus_manifest,
     lint_project_bundles,
 )
 from .dataset_models import (
     AcquisitionManifest,
     AcquisitionValidationReport,
+    CandidateReviewSet,
     DatasetFormat,
     FrozenSelectionManifest,
     ReviewArtifactManifest,
@@ -64,6 +68,12 @@ from .differential import (
     FormalCorpusJudgeValidationResult,
     JudgeSourceCase,
     validate_persisted_formal_judge_evidence,
+)
+from .formal_lifecycle import (
+    MaterializedCorpusFreeze,
+    PreRunIntent,
+    verify_materialized_corpus,
+    verify_pre_run_intent,
 )
 from .human_review import build_blind_batch
 from .hy3_client import build_cache_key, generation_input
@@ -105,6 +115,8 @@ class FormalQualificationInputs:
     human_review_replay_path: Path
     benchmark_artifact_root: Path
     output_root: Path
+    pre_run_intent_path: Path | None = None
+    materialized_freeze_path: Path | None = None
 
 
 type JsonScalar = str | int | float | bool | None
@@ -177,8 +189,20 @@ class NaturalMaterializationManifest(BaseModel):
     schema_version: Literal["1.2"] = "1.2"
     kind: Literal["natural_hy3_materialization_manifest"] = "natural_hy3_materialization_manifest"
     selection_manifest_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    benchmark_id: str | None = None
+    intent_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     entries: tuple[NaturalMaterializationEntry, ...] = Field(min_length=60, max_length=60)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @model_serializer(mode="wrap")
+    def serialize_optional_lifecycle(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        payload = handler(self)
+        for field in ("benchmark_id", "intent_hash"):
+            if payload.get(field) is None:
+                payload.pop(field, None)
+        return cast(dict[str, Any], payload)
 
     @model_validator(mode="after")
     def validate_manifest(self) -> Self:
@@ -218,7 +242,7 @@ class FormalQualificationReport(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["1.2"] = "1.2"
+    schema_version: Literal["1.2", "formal-qualification-v2"] = "formal-qualification-v2"
     kind: Literal["formal_qualification_report"] = "formal_qualification_report"
     benchmark_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     selection_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -227,6 +251,8 @@ class FormalQualificationReport(BaseModel):
     natural_materialization_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     judge_evidence_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     candidate_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
+    intent_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    materialized_freeze_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     config_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     observations_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
     human_labels_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
@@ -237,8 +263,21 @@ class FormalQualificationReport(BaseModel):
     remote_attempts_used: int = Field(ge=390, le=500, strict=True)
     content_hash: str = Field(pattern=r"^[0-9a-f]{64}$")
 
+    @model_serializer(mode="wrap")
+    def serialize_legacy_report(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        payload = cast(dict[str, Any], handler(self))
+        if self.schema_version == "1.2":
+            payload.pop("intent_hash", None)
+            payload.pop("materialized_freeze_hash", None)
+        return payload
+
     @model_validator(mode="after")
     def validate_content_hash(self) -> Self:
+        if self.schema_version == "formal-qualification-v2":
+            if self.intent_hash is None or self.materialized_freeze_hash is None:
+                raise ValueError("qualification v2 requires both lifecycle hashes")
+        elif self.intent_hash is not None or self.materialized_freeze_hash is not None:
+            raise ValueError("legacy qualification report cannot contain lifecycle hashes")
         payload = self.model_dump(mode="json")
         del payload["content_hash"]
         if self.content_hash != sha256_json(payload):
@@ -256,6 +295,8 @@ class FormalQualificationReport(BaseModel):
         natural_materialization_hash: str,
         judge_evidence_hash: str,
         candidate_hash: str,
+        intent_hash: str,
+        materialized_freeze_hash: str,
         config_hash: str,
         observation_hashes: tuple[str, ...],
         human_label_hashes: tuple[str, ...],
@@ -264,7 +305,7 @@ class FormalQualificationReport(BaseModel):
         remote_attempts_used: int,
     ) -> FormalQualificationReport:
         payload: dict[str, Any] = {
-            "schema_version": "1.2",
+            "schema_version": "formal-qualification-v2",
             "kind": "formal_qualification_report",
             "benchmark_hash": sha256_json(benchmark_id),
             "selection_hash": selection_hash,
@@ -273,6 +314,8 @@ class FormalQualificationReport(BaseModel):
             "natural_materialization_hash": natural_materialization_hash,
             "judge_evidence_hash": judge_evidence_hash,
             "candidate_hash": candidate_hash,
+            "intent_hash": intent_hash,
+            "materialized_freeze_hash": materialized_freeze_hash,
             "config_hash": config_hash,
             "observations_hash": sha256_json(list(observation_hashes)),
             "human_labels_hash": sha256_json(list(human_label_hashes)),
@@ -306,6 +349,8 @@ def qualify_formal_run(inputs: FormalQualificationInputs) -> Path:
 
 
 def _qualify_formal_run(inputs: FormalQualificationInputs) -> FormalQualificationReport:
+    if inputs.pre_run_intent_path is None or inputs.materialized_freeze_path is None:
+        raise FormalQualificationError("formal qualification requires pre-run A and materialized B")
     acquisition = _read_model(AcquisitionManifest, inputs.acquisition_path)
     acquisition_validation = _read_model(
         AcquisitionValidationReport, inputs.acquisition_validation_path
@@ -351,6 +396,36 @@ def _qualify_formal_run(inputs: FormalQualificationInputs) -> FormalQualificatio
     if len(raw_cases) != 105:
         raise FormalQualificationError("formal Judge case count must be exactly 105")
     cases = tuple(_validate_model(JudgeSourceCase, value) for value in raw_cases)
+    selected_entries = {entry.problem_id: entry for entry in selection.entries}
+    expected_comparisons: dict[str, OutputComparison] = {}
+    for path in inputs.review_artifact_paths.values():
+        review_set = _read_model(CandidateReviewSet, path)
+        for artifact in review_set.artifacts:
+            review = artifact.review
+            selected = selected_entries.get(review.problem_id)
+            if selected is None:
+                continue
+            if (artifact.content_hash, artifact.raw_row_hash) != (
+                selected.review_hash,
+                selected.raw_row_hash,
+            ):
+                raise FormalQualificationError(
+                    "comparison pinned review changed after verification"
+                )
+            if review.problem_id in expected_comparisons:
+                raise FormalQualificationError("duplicate comparison review identity")
+            expected_comparisons[review.problem_id] = (
+                review.output_comparison or OutputComparison.EXACT
+            )
+    bundle_comparisons = bundle_output_comparisons(bundle_manifest, inputs.data_root)
+    for case in cases:
+        expected = expected_comparisons.get(case.problem.problem_id)
+        if (
+            expected is None
+            or case.output_comparison != expected
+            or bundle_comparisons.get(case.problem.problem_id) != expected
+        ):
+            raise FormalQualificationError("pinned review, case and checker comparison disagree")
     raw_evidence_payload = _read_mapping(inputs.raw_judge_evidence_path)
     raw_evidence = {
         case_id: _validate_model(JudgeEvidence, value)
@@ -551,7 +626,26 @@ def _qualify_benchmark_chain(
         event_hashes=ledger.event_hashes,
         data_root=inputs.data_root,
     )
+    assert inputs.pre_run_intent_path is not None and inputs.materialized_freeze_path is not None
+    pre_run = _read_model(PreRunIntent, inputs.pre_run_intent_path)
+    materialized_freeze = _read_model(MaterializedCorpusFreeze, inputs.materialized_freeze_path)
+    verify_pre_run_intent(pre_run, repo_root=Path(__file__).resolve().parents[2])
+    if pre_run.bundle_manifest_hash != bundle_manifest.content_hash:
+        raise FormalQualificationError("pre-run bundle hash does not match materialized corpus")
+    verify_materialized_corpus(
+        materialized_freeze,
+        intent=pre_run,
+        corpus=corpus,
+        materialization=materialization,
+        config=config,
+        events=events,
+        ledger=ledger,
+        selected_records=selected_records,
+        data_root=inputs.data_root,
+    )
     return FormalQualificationReport.create(
+        intent_hash=pre_run.intent_hash,
+        materialized_freeze_hash=materialized_freeze.content_hash,
         benchmark_id=config.benchmark_id,
         selection_hash=config.selection_hash,
         bundle_manifest_hash=bundle_manifest.content_hash,
@@ -701,6 +795,8 @@ def _validate_natural_materialization(
         trace = SolutionTrace.model_validate_json(trace_snapshot.contents)
         source = source_snapshot.contents.decode("utf-8")
         visible_input = generation_input(record)
+        if manifest.intent_hash is not None:
+            visible_input = visible_input | {"trace_id": sample.sample_id}
         expected_event_hashes = tuple(
             event_hash
             for event, event_hash in hashed_events
@@ -1019,6 +1115,8 @@ def _parser() -> argparse.ArgumentParser:
         description=_NONOFFICIAL_DISCLOSURE,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    parser.add_argument("--pre-run-intent", type=Path, required=True)
+    parser.add_argument("--materialized-freeze", type=Path, required=True)
     parser.add_argument("--selection", type=Path, required=True)
     parser.add_argument("--acquisition", type=Path, required=True)
     parser.add_argument("--acquisition-validation", type=Path, required=True)
@@ -1051,6 +1149,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         output = qualify_formal_run(
             FormalQualificationInputs(
+                pre_run_intent_path=arguments.pre_run_intent,
+                materialized_freeze_path=arguments.materialized_freeze,
                 selection_path=arguments.selection,
                 acquisition_path=arguments.acquisition,
                 acquisition_validation_path=arguments.acquisition_validation,

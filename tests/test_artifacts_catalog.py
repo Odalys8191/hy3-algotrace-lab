@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -36,6 +37,30 @@ from hy3_algotrace.contracts import (
     StepStatus,
     Topic,
 )
+
+
+@pytest.mark.parametrize("vanishing_name", [".pending.json.writer.tmp", "vanished.json"])
+def test_json_listing_handles_concurrent_temporary_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, vanishing_name: str
+) -> None:
+    store = ArtifactStore(tmp_path / "artifacts")
+    store.write_json("entries/published.json", {"complete": True})
+    (store.root / "entries" / vanishing_name).write_text("{}")
+    original_stat = os.stat
+
+    def disappearing_stat(path, *args, **kwargs):
+        # Simulate an unlink after listdir returned the directory entry.
+        if path == vanishing_name:
+            raise FileNotFoundError(vanishing_name)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr("hy3_algotrace.artifacts.os.stat", disappearing_stat)
+    if vanishing_name.endswith(".tmp"):
+        assert store.list_json("entries") == (Path("entries/published.json"),)
+    else:
+        # A disappearing published JSON must remain a visible integrity failure.
+        with pytest.raises(FileNotFoundError):
+            store.list_json("entries")
 
 
 def record_payload(

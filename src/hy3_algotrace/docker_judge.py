@@ -1069,7 +1069,7 @@ def _capture_bounded_process(
 
     while selector.get_map():
         now = time.monotonic()
-        if stopped_at is None and now >= deadline:
+        if stopped_at is None and now >= deadline and process.poll() is None:
             timed_out = True
             stop_process()
         wait_seconds = 0.05

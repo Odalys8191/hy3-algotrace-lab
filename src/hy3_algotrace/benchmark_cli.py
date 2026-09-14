@@ -22,9 +22,13 @@ from .benchmark_models import (
     MetricObservation,
     ObservationReplayInput,
 )
-from .hy3_client import Hy3AttemptContext
+from .formal_lifecycle import current_code_identity
+from .hy3_client import Hy3AttemptContext, RmbCostGuard, TokenQuotaGuard
 
-type BenchmarkExecute = Callable[[str, Callable[[Hy3AttemptContext], None]], MetricObservation]
+type BenchmarkExecute = Callable[
+    [str, Callable[[Hy3AttemptContext], int | None]],
+    MetricObservation,
+]
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -37,6 +41,8 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--artifact-root", type=Path, required=True)
     run.add_argument("--catalog-root", type=Path)
     run.add_argument("--live-inputs", type=Path)
+    run.add_argument("--continuation-package", type=Path)
+    run.add_argument("--predecessor-artifact-root", type=Path)
     live_validate = commands.add_parser("validate-live-inputs")
     live_validate.add_argument("--config", type=Path, required=True)
     live_validate.add_argument("--catalog-root", type=Path, required=True)
@@ -103,12 +109,10 @@ def main(
     from . import live_benchmark
 
     if args.command == "validate-live-inputs":
-        from .catalog import ProblemCatalog
-
         try:
             live_benchmark.validate_live_inputs(
                 config,
-                ProblemCatalog.from_directory(args.catalog_root),
+                live_benchmark.NonformalProblemCatalog.from_directory(args.catalog_root),
                 live_benchmark.load_live_inputs(args.live_inputs),
             )
         except Exception:
@@ -126,7 +130,7 @@ def main(
         by_sample = {row.sample_id: row for row in replay_input.observations}
 
         def replay_execute(
-            sample_id: str, _observer: Callable[[Hy3AttemptContext], None]
+            sample_id: str, _observer: Callable[[Hy3AttemptContext], int | None]
         ) -> MetricObservation:
             try:
                 return by_sample[sample_id]
@@ -136,6 +140,42 @@ def main(
         execute = replay_execute
     elif execute is None and (args.catalog_root is None or args.live_inputs is None):
         parser.error("live run requires --catalog-root and --live-inputs")
+    continuation_preflight = None
+    cost_guard = None
+    token_guard = None
+    if automatic_live:
+        continuation_package = args.continuation_package
+        predecessor_root = args.predecessor_artifact_root
+        if (continuation_package is None) != (predecessor_root is None):
+            _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
+            return 2
+        if continuation_package is not None and predecessor_root is not None:
+            try:
+                from .nonformal_continuation import verify_authorized_successor_package
+
+                continuation_preflight = verify_authorized_successor_package(
+                    package_root=continuation_package,
+                    predecessor_artifacts=ArtifactStore(predecessor_root),
+                    successor_config=config,
+                    current_source_identity=current_code_identity(Path.cwd()),
+                )
+                parameters = {
+                    parameter.name: parameter.value for parameter in config.model_parameters
+                }
+                max_tokens = parameters.get("max_tokens")
+                if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+                    raise ValueError("authorized continuation requires frozen max_tokens")
+                cost_guard = RmbCostGuard(
+                    limit_rmb=continuation_preflight.additional_spend_limit_rmb,
+                    max_output_tokens=max_tokens,
+                )
+                token_guard = TokenQuotaGuard(
+                    limit_tokens=continuation_preflight.free_token_limit,
+                    max_output_tokens=max_tokens,
+                )
+            except Exception:
+                _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
+                return 2
     try:
         artifacts = ArtifactStore(args.artifact_root)
     except (OSError, ArtifactStoreError):
@@ -145,12 +185,22 @@ def main(
         return 2
     if automatic_live:
         try:
-            execute = live_benchmark.build_live_executor(
-                config=config,
-                catalog_root=args.catalog_root,
-                inputs_path=args.live_inputs,
-                artifacts=artifacts,
-            )
+            if continuation_preflight is not None:
+                execute = live_benchmark.build_live_executor(
+                    config=config,
+                    catalog_root=args.catalog_root,
+                    inputs_path=args.live_inputs,
+                    artifacts=artifacts,
+                    cost_guard=cost_guard,
+                    token_guard=token_guard,
+                )
+            else:
+                execute = live_benchmark.build_live_executor(
+                    config=config,
+                    catalog_root=args.catalog_root,
+                    inputs_path=args.live_inputs,
+                    artifacts=artifacts,
+                )
         except Exception:
             _emit({"status": "preflight_failed", "formal_eligible": False}, destination)
             return 2
@@ -158,6 +208,9 @@ def main(
     ledger = ArtifactAttemptLedger(artifacts, benchmark_id=config.benchmark_id)
     budget = RemoteAttemptBudget(
         limit=config.remote_attempt_budget,
+        consumed_attempts=(
+            continuation_preflight.consumed_attempts if continuation_preflight is not None else 0
+        ),
         event_sink=ledger.record,
         benchmark_id=config.benchmark_id,
     )

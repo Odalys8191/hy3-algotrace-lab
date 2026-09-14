@@ -174,9 +174,9 @@ class ArtifactStore:
         try:
             paths: list[Path] = []
             for name in sorted(os.listdir(directory_fd)):
-                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if not name.endswith(".json"):
                     continue
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
                 if not stat.S_ISREG(metadata.st_mode):
                     raise UnsafeArtifactPathError(
                         f"unsafe artifact enumeration entry: {normalized / name}"

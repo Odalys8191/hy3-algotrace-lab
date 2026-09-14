@@ -36,7 +36,13 @@ from hy3_algotrace.benchmark_models import (
     SampleKind,
     VerifiedDataEvidence,
 )
-from hy3_algotrace.contracts import JudgeEvidence, JudgeStatus, PerTestEvidence, SolutionTrace
+from hy3_algotrace.contracts import (
+    JudgeEvidence,
+    JudgeStatus,
+    OutputComparison,
+    PerTestEvidence,
+    SolutionTrace,
+)
 from hy3_algotrace.corpus import (
     CorpusSampleKind,
     CorpusStatus,
@@ -63,6 +69,7 @@ from hy3_algotrace.differential import (
     JudgeSourceCase,
     validate_formal_corpus_judge_cases,
 )
+from hy3_algotrace.formal_lifecycle import freeze_materialized_corpus, freeze_pre_run_intent
 from hy3_algotrace.human_review import (
     build_blind_batch,
     persist_blind_batch,
@@ -72,7 +79,13 @@ from hy3_algotrace.human_review import (
 )
 from hy3_algotrace.hy3_client import build_cache_key, generation_input
 from hy3_algotrace.judge import sanitize_counterexample_input
-from hy3_algotrace.prompts import GENERATOR_PROMPT_VERSION, GENERATOR_SYSTEM_PROMPT
+from hy3_algotrace.prompts import (
+    ADVERSARIAL_REVIEW_PROMPT_VERSION,
+    ARBITER_PROMPT_VERSION,
+    GENERATOR_PROMPT_VERSION,
+    GENERATOR_SYSTEM_PROMPT,
+    LOGIC_REVIEW_PROMPT_VERSION,
+)
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
@@ -110,6 +123,10 @@ def _formal_cli_command(environment: dict[str, str]) -> list[str]:
         sys.executable,
         "-m",
         "hy3_algotrace.formal_qualification",
+        "--pre-run-intent",
+        environment["HY3_FORMAL_PRE_RUN_INTENT"],
+        "--materialized-freeze",
+        environment["HY3_FORMAL_MATERIALIZED_FREEZE"],
         "--selection",
         environment["HY3_FORMAL_SELECTION"],
         "--acquisition",
@@ -166,6 +183,7 @@ def _build_fixture(
     *,
     benchmark_id: str = "formal-integration",
     final_test_input: str = "2\n",
+    case_insensitive: bool = False,
 ) -> FormalFixture:
     support = _corpus_support()
     data_root = root / "formal-data"
@@ -173,6 +191,7 @@ def _build_fixture(
     selection_chain, records = support._verified_selection_chain(
         data_root,
         hidden_input_data=final_test_input,
+        comparisons={"cf-5000-a": OutputComparison.CASE_INSENSITIVE} if case_insensitive else None,
     )
     selection = selection_chain.selection
 
@@ -210,9 +229,21 @@ def _build_fixture(
             for split in ("validation", "test")
         )
     )
-    bundle_manifest = build_project_bundle_manifest(
-        selection, support._bundle_entries(data_root, selection)
-    )
+    bundle_entries = support._bundle_entries(data_root, selection)
+    if case_insensitive:
+        from hy3_algotrace.corpus import ArtifactMediaType
+
+        first = bundle_entries[0]
+        checker = support._write_ref(
+            data_root,
+            f"problems/{first.problem_id}/checker.json",
+            canonical_json_bytes(
+                {"problem_id": first.problem_id, "output_comparison": "case_insensitive"}
+            ),
+            ArtifactMediaType.JSON,
+        )
+        bundle_entries = (first.model_copy(update={"checker_json": checker}), *bundle_entries[1:])
+    bundle_manifest = build_project_bundle_manifest(selection, bundle_entries)
     baseline_controlled = support._controlled_samples(data_root, selection, bundle_manifest)
     bundles_by_id = {bundle.problem_id: bundle for bundle in bundle_manifest.bundles}
     controlled = tuple(
@@ -244,6 +275,41 @@ def _build_fixture(
         FrozenModelParameter(name="temperature", value=0.2),
         FrozenModelParameter(name="top_k", value=1),
     )
+    pending_config = NaturalRunConfig.create(
+        selection_manifest_hash=selection.content_hash,
+        problem_ids=tuple(entry.problem_id for entry in selection.entries),
+        prompt_version=GENERATOR_PROMPT_VERSION,
+        prompt_hash=hashlib.sha256(GENERATOR_SYSTEM_PROMPT.encode()).hexdigest(),
+        model_name="hy3",
+        endpoint_url="https://tokenhub.tencentmaas.com/v1",
+        model_parameters=natural_parameters,
+        credential_env_var="HY3_API_KEY",
+        status=NaturalRunStatus.PENDING_CREDENTIALS,
+        pending_reason="Fixture generation has not begun.",
+    )
+    pending_corpus = build_corpus_manifest(
+        selection=selection,
+        bundle_manifest=bundle_manifest,
+        samples=controlled,
+        natural_run_config=pending_config,
+        status=CorpusStatus.PENDING_CREDENTIALS,
+    )
+    pre_run = freeze_pre_run_intent(
+        selection=selection,
+        pending_corpus=pending_corpus,
+        bundle_manifest=bundle_manifest,
+        data_root=data_root,
+        repo_root=REPOSITORY_ROOT,
+        recorded_at=datetime(2026, 9, 11, tzinfo=UTC),
+        slug=benchmark_id,
+        judge_image_digest=f"sha256:{'2' * 64}",
+        seed=41,
+        bootstrap_replicates=1,
+        natural_sample_ids=tuple(sample.sample_id for sample in natural),
+    )
+    benchmark_id = pre_run.benchmark_id
+    pre_run_path = data_root / "pre-run-intent.json"
+    _write_json(pre_run_path, pre_run.model_dump(mode="json"))
     ordered_samples = tuple(
         sorted(
             (*controlled, *natural),
@@ -270,7 +336,7 @@ def _build_fixture(
             generation_event_hashes[sample.sample_id] = (
                 sha256_json(generation_event.model_dump(mode="json")),
             )
-        for operation in ("logic-review-v1", "adversarial-review-v1"):
+        for operation in (LOGIC_REVIEW_PROMPT_VERSION, ADVERSARIAL_REVIEW_PROMPT_VERSION):
             planned_events.append(
                 LedgerEvent(
                     benchmark_id=benchmark_id,
@@ -295,7 +361,9 @@ def _build_fixture(
             continue
         trace_path = data_root / sample.trace.path
         trace = SolutionTrace.model_validate_json(trace_path.read_text(encoding="utf-8"))
-        visible_input = generation_input(records[sample.problem_id])
+        visible_input = generation_input(records[sample.problem_id]) | {
+            "trace_id": sample.sample_id
+        }
         natural_entries.append(
             {
                 "sample_id": sample.sample_id,
@@ -310,8 +378,8 @@ def _build_fixture(
                 "problem_record_hash": sha256_json(
                     records[sample.problem_id].model_dump(mode="json")
                 ),
-                "model_name": "hy3-formal-model",
-                "endpoint_identity": "https://api.example.invalid/v1",
+                "model_name": "hy3",
+                "endpoint_identity": "https://tokenhub.tencentmaas.com/v1",
                 "generator_prompt_version": GENERATOR_PROMPT_VERSION,
                 "generator_prompt_hash": hashlib.sha256(
                     GENERATOR_SYSTEM_PROMPT.encode("utf-8")
@@ -319,8 +387,8 @@ def _build_fixture(
                 "model_parameters": parameter_payload,
                 "model_visible_input_hash": sha256_json(visible_input),
                 "request_cache_key": build_cache_key(
-                    model="hy3-formal-model",
-                    endpoint="https://api.example.invalid/v1",
+                    model="hy3",
+                    endpoint="https://tokenhub.tencentmaas.com/v1",
                     prompt_version=GENERATOR_PROMPT_VERSION,
                     parameters={
                         parameter.name: parameter.value for parameter in natural_parameters
@@ -333,6 +401,8 @@ def _build_fixture(
     materialization_payload = {
         "schema_version": "1.2",
         "kind": "natural_hy3_materialization_manifest",
+        "benchmark_id": benchmark_id,
+        "intent_hash": pre_run.intent_hash,
         "selection_manifest_hash": selection.content_hash,
         "entries": natural_entries,
     }
@@ -345,8 +415,8 @@ def _build_fixture(
         problem_ids=tuple(entry.problem_id for entry in selection.entries),
         prompt_version=GENERATOR_PROMPT_VERSION,
         prompt_hash=hashlib.sha256(GENERATOR_SYSTEM_PROMPT.encode("utf-8")).hexdigest(),
-        model_name="hy3-formal-model",
-        endpoint_url="https://api.example.invalid/v1",
+        model_name="hy3",
+        endpoint_url="https://tokenhub.tencentmaas.com/v1",
         model_parameters=natural_parameters,
         credential_env_var="HY3_API_KEY",
         status=NaturalRunStatus.COMPLETE,
@@ -368,6 +438,11 @@ def _build_fixture(
         JudgeSourceCase(
             case_id=sample.sample_id,
             kind=controlled_kinds[sample.kind],
+            output_comparison=(
+                OutputComparison.CASE_INSENSITIVE
+                if case_insensitive and sample.problem_id == "cf-5000-a"
+                else OutputComparison.EXACT
+            ),
             problem=records[sample.problem_id],
             cpp_source=(data_root / sample.cpp_source.path).read_text(encoding="utf-8"),
         )
@@ -408,7 +483,13 @@ def _build_fixture(
     }
 
     class PersistedEvidenceJudge:
-        def judge(self, _problem: object, cpp_source: str) -> JudgeEvidence:
+        def judge(
+            self,
+            _problem: object,
+            cpp_source: str,
+            *,
+            output_comparison: OutputComparison = OutputComparison.EXACT,
+        ) -> JudgeEvidence:
             matching = next(case for case in cases if case.cpp_source == cpp_source)
             return raw_evidence[matching.case_id]
 
@@ -475,24 +556,24 @@ def _build_fixture(
             spec.sample_id for spec in specs if spec.sample_kind is SampleKind.NATURAL
         ),
         audit_sample_ids=tuple(spec.sample_id for spec in specs),
-        model="hy3-formal-model",
-        endpoint_identity="https://api.example.invalid/v1",
+        model="hy3",
+        endpoint_identity="https://tokenhub.tencentmaas.com/v1",
         generator_prompt_version=GENERATOR_PROMPT_VERSION,
-        logic_review_prompt_version="logic-review-v1",
-        adversarial_review_prompt_version="adversarial-review-v1",
-        arbiter_prompt_version="arbiter-v1",
+        logic_review_prompt_version=LOGIC_REVIEW_PROMPT_VERSION,
+        adversarial_review_prompt_version=ADVERSARIAL_REVIEW_PROMPT_VERSION,
+        arbiter_prompt_version=ARBITER_PROMPT_VERSION,
         model_parameters=(
             BenchmarkParameter(name="max_tokens", value=4096),
             BenchmarkParameter(name="temperature", value=0.2),
             BenchmarkParameter(name="top_k", value=1),
         ),
-        code_revision="formal-revision",
+        code_revision=pre_run.code_identity.head_revision,
         judge_image_digest=f"sha256:{'2' * 64}",
         metric_version="task6-metrics-v1",
         chart_version="task6-chart-v1",
         seed=41,
         bootstrap_replicates=1,
-        remote_attempt_budget=390,
+        remote_attempt_budget=500,
         formal=True,
         timeout_seconds=600.0,
         verified_data_evidence=VerifiedDataEvidence(
@@ -643,6 +724,22 @@ def _build_fixture(
         event_hashes=tuple(ref.content_hash for ref in event_refs),
     )
     ledger_ref = artifacts.write_json(base / "ledger-index.json", ledger.model_dump(mode="json"))
+    from hy3_algotrace.formal_qualification import NaturalMaterializationManifest
+
+    materialized = freeze_materialized_corpus(
+        intent=pre_run,
+        corpus=corpus,
+        materialization=NaturalMaterializationManifest.model_validate_json(
+            json.dumps(materialization_payload)
+        ),
+        config=config,
+        events=tuple(events),
+        ledger=ledger,
+        selected_records=records,
+        data_root=data_root,
+    )
+    materialized_path = data_root / "materialized-freeze.json"
+    _write_json(materialized_path, materialized.model_dump(mode="json"))
     candidate = FormalIntegrationCandidate(
         benchmark_id=config.benchmark_id,
         config_hash=config_ref.content_hash,
@@ -660,6 +757,8 @@ def _build_fixture(
     output_root = root / "qualification-output"
     output_root.mkdir()
     inputs = {
+        "pre_run_intent_path": pre_run_path,
+        "materialized_freeze_path": materialized_path,
         "selection_path": selection_path,
         "acquisition_path": acquisition_path,
         "acquisition_validation_path": acquisition_validation_path,
@@ -685,6 +784,8 @@ def _build_fixture(
     script_environment = {
         "PATH": f"{Path(sys.executable).parent}:{os.environ['PATH']}",
         "PYTHONPATH": str(REPOSITORY_ROOT / "src"),
+        "HY3_FORMAL_PRE_RUN_INTENT": str(pre_run_path),
+        "HY3_FORMAL_MATERIALIZED_FREEZE": str(materialized_path),
         "HY3_FORMAL_SELECTION": str(selection_path),
         "HY3_FORMAL_ACQUISITION": str(acquisition_path),
         "HY3_FORMAL_ACQUISITION_VALIDATION": str(acquisition_validation_path),
@@ -738,6 +839,15 @@ def _rehash_judge_chain(fixture: FormalFixture, raw_evidence: dict[str, Any]) ->
     _write_json(config_path, config)
     candidate["config_hash"] = sha256_json(config)
     _write_json(fixture.candidate_path, candidate)
+    # This helper simulates replacing raw Judge evidence before B is frozen.
+    # B binds config (including the Judge evidence hash), so refresh that link too.
+    freeze_path = Path(fixture.inputs["materialized_freeze_path"])
+    frozen = json.loads(freeze_path.read_text())
+    frozen["config_hash"] = sha256_json(config)
+    frozen["content_hash"] = sha256_json(
+        {key: value for key, value in frozen.items() if key != "content_hash"}
+    )
+    _write_json(freeze_path, frozen)
 
 
 def _replace_materialization_hash(fixture: FormalFixture, digest: str) -> None:
@@ -1211,7 +1321,10 @@ def test_complete_same_process_chain_creates_one_nonleaking_content_addressed_re
     report_path = module.qualify_formal_run(fixture.bridge_inputs())
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["benchmark_hash"] == sha256_json("formal-integration")
+    candidate = json.loads(fixture.candidate_path.read_text())
+    intent = json.loads(Path(fixture.inputs["pre_run_intent_path"]).read_text())
+    assert candidate["benchmark_id"] == intent["benchmark_id"]
+    assert report["benchmark_hash"] == sha256_json(intent["benchmark_id"])
     assert "benchmark_id" not in report
     assert report["sample_count"] == 165
     assert report["controlled_judge_case_count"] == 105
@@ -1255,7 +1368,9 @@ def test_report_hashes_credential_shaped_outward_benchmark_identity(tmp_path: Pa
     report_path = module.qualify_formal_run(fixture.bridge_inputs())
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["benchmark_hash"] == sha256_json(benchmark_id)
+    intent = json.loads(Path(fixture.inputs["pre_run_intent_path"]).read_text())
+    assert intent["benchmark_id"].startswith(benchmark_id + "-")
+    assert report["benchmark_hash"] == sha256_json(intent["benchmark_id"])
     assert benchmark_id not in report_path.read_text(encoding="utf-8")
     assert "benchmark_id" not in report
 
@@ -1445,7 +1560,10 @@ def test_formal_bridge_rejects_raw_evidence_mismatch_and_incomplete_benchmark_ch
         module.qualify_formal_run(fixture.bridge_inputs())
 
     incomplete = _build_fixture(tmp_path / "incomplete")
-    ledger_path = incomplete.benchmark_root / "benchmarks/formal-integration/ledger-index.json"
+    candidate = json.loads(incomplete.candidate_path.read_text())
+    ledger_path = (
+        incomplete.benchmark_root / "benchmarks" / candidate["benchmark_id"] / "ledger-index.json"
+    )
     ledger = json.loads(ledger_path.read_text(encoding="utf-8"))
     ledger["event_paths"].pop()
     ledger["event_hashes"].pop()
@@ -1472,7 +1590,7 @@ def test_formal_bridge_rejects_independent_benchmark_chain_mutations(
 ) -> None:
     module = importlib.import_module("hy3_algotrace.formal_qualification")
     fixture = _build_fixture(tmp_path / name)
-    base = fixture.benchmark_root / "benchmarks/formal-integration"
+    base = fixture.candidate_path.parent
     if name == "observation":
         next((base / "observations").iterdir()).unlink()
     elif name == "labels":
@@ -1721,3 +1839,104 @@ def test_public_formal_cli_help_contains_required_nonofficial_disclosure() -> No
 
     assert result.returncode == 0
     assert "personal activity project and not an official Tencent release" in result.stdout
+
+
+@pytest.mark.parametrize("stage", ["pre_run_intent_path", "materialized_freeze_path"])
+def test_shell_missing_lifecycle_input_is_not_ready(tmp_path, stage):
+    fixture = _build_fixture(tmp_path)
+    environment = dict(fixture.script_environment)
+    name = (
+        "HY3_FORMAL_PRE_RUN_INTENT"
+        if stage == "pre_run_intent_path"
+        else "HY3_FORMAL_MATERIALIZED_FREEZE"
+    )
+    environment.pop(name)
+    result = subprocess.run(
+        ["sh", "scripts/formal-readiness.sh"],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 3
+    assert "not ready" in result.stderr
+
+
+@pytest.mark.parametrize("field", ["config_hash", "generation_ledger_hash", "intent_hash"])
+def test_rehashed_b_tampering_is_rejected(tmp_path, field):
+    fixture = _build_fixture(tmp_path)
+    path = Path(fixture.inputs["materialized_freeze_path"])
+    frozen = json.loads(path.read_bytes())
+    frozen[field] = "0" * 64
+    frozen["content_hash"] = sha256_json({k: v for k, v in frozen.items() if k != "content_hash"})
+    _write_json(path, frozen)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    with pytest.raises(module.FormalQualificationError):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
+def test_old_qualification_report_json_and_hash_remain_readable(tmp_path):
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    path = module.qualify_formal_run(fixture.bridge_inputs())
+    current = json.loads(path.read_bytes())
+    assert current["schema_version"] == "formal-qualification-v2"
+    legacy = {
+        k: v
+        for k, v in current.items()
+        if k not in {"intent_hash", "materialized_freeze_hash", "content_hash"}
+    }
+    legacy["schema_version"] = "1.2"
+    legacy["content_hash"] = sha256_json(legacy)
+    parsed = module.FormalQualificationReport.model_validate_json(json.dumps(legacy))
+    assert canonical_json_bytes(parsed.model_dump(mode="json")) == canonical_json_bytes(legacy)
+    assert parsed.content_hash == legacy["content_hash"]
+
+
+def test_comparison_chain_accepts_one_pinned_case_insensitive_problem(tmp_path):
+    fixture = _build_fixture(tmp_path, case_insensitive=True)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    assert module.qualify_formal_run(fixture.bridge_inputs()).is_file()
+    evidence = json.loads(Path(fixture.inputs["judge_report_path"]).read_bytes())
+    for case in evidence["cases"]:
+        assert case.get("output_comparison", "exact") == (
+            "case_insensitive" if case["problem_id"] == "cf-5000-a" else "exact"
+        )
+
+
+def test_comparison_chain_rejects_case_disagreeing_with_pinned_checker(tmp_path):
+    fixture = _build_fixture(tmp_path, case_insensitive=True)
+    path = Path(fixture.inputs["judge_cases_path"])
+    cases = json.loads(path.read_bytes())
+    cases[0].pop("output_comparison")
+    _write_json(path, cases)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    with pytest.raises(module.FormalQualificationError, match="comparison disagree"):
+        module.qualify_formal_run(fixture.bridge_inputs())
+
+
+def test_comparison_reread_cannot_substitute_rehashed_pinned_review(tmp_path, monkeypatch):
+    fixture = _build_fixture(tmp_path)
+    module = importlib.import_module("hy3_algotrace.formal_qualification")
+    from hy3_algotrace.dataset_models import CandidateReviewArtifact, CandidateReviewSet
+
+    original = module._read_model
+
+    def replaced(model, path):
+        result = original(model, path)
+        if model is CandidateReviewSet:
+            first = result.artifacts[0]
+            forged = CandidateReviewArtifact.create(
+                raw_row_hash=first.raw_row_hash,
+                review=first.review.model_copy(
+                    update={"reviewer": "substituted-after-verification"}
+                ),
+            )
+            return CandidateReviewSet.create(
+                split=result.split, artifacts=(forged, *result.artifacts[1:])
+            )
+        return result
+
+    monkeypatch.setattr(module, "_read_model", replaced)
+    with pytest.raises(module.FormalQualificationError, match="pinned review"):
+        module.qualify_formal_run(fixture.bridge_inputs())

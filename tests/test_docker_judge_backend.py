@@ -4,6 +4,9 @@ import base64
 import importlib
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -586,6 +589,37 @@ esac
     assert "kill " + "a" * 64 in log
     assert "inspect --format={{json .State}} " + "a" * 64 in log
     assert "rm --force " + "a" * 64 in log
+
+
+def test_completed_attach_is_not_reclassified_as_timeout_after_scheduler_delay() -> None:
+    module = importlib.import_module("hy3_algotrace.docker_judge")
+    process = subprocess.Popen(
+        (sys.executable, "-c", "print('complete')"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    process.wait(timeout=5)
+    stop_calls = 0
+
+    def stop() -> bool:
+        nonlocal stop_calls
+        stop_calls += 1
+        return True
+
+    capture = module._capture_bounded_process(
+        process,
+        timeout_seconds=0.001,
+        stdout_limit_bytes=4096,
+        stderr_limit_bytes=4096,
+        started=time.monotonic() - 1,
+        stop=stop,
+    )
+
+    assert capture.return_code == 0
+    assert capture.stdout == b"complete\n"
+    assert capture.timed_out is False
+    assert capture.stop_succeeded is None
+    assert stop_calls == 0
 
 
 @pytest.mark.parametrize("failure", ["missing-cid", "kill", "inspect", "rm"])

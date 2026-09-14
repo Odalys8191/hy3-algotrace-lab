@@ -89,9 +89,9 @@ class RemoteAttemptBudget:
             self._used = sequence
             return sequence
 
-    def for_sample(self, sample_id: str) -> Callable[[Hy3AttemptContext], None]:
-        def observe(context: Hy3AttemptContext) -> None:
-            self.reserve(context, sample_id=sample_id)
+    def for_sample(self, sample_id: str) -> Callable[[Hy3AttemptContext], int]:
+        def observe(context: Hy3AttemptContext) -> int:
+            return self.reserve(context, sample_id=sample_id)
 
         return observe
 
@@ -249,7 +249,10 @@ class BenchmarkRunner:
 
     def run(
         self,
-        execute: Callable[[str, Callable[[Hy3AttemptContext], None]], MetricObservation],
+        execute: Callable[
+            [str, Callable[[Hy3AttemptContext], int | None]],
+            MetricObservation,
+        ],
     ) -> BenchmarkRunReport:
         root = Path("benchmarks") / self._config.benchmark_id
         refs: list[ArtifactHashEntry] = []

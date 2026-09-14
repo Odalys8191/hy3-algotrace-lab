@@ -37,6 +37,9 @@ from typing import Any
 
 from hy3_algotrace.artifacts import canonical_json_bytes
 from hy3_algotrace.benchmark_models import BenchmarkConfig
+from hy3_algotrace.corpus import CorpusManifest, ProjectBundleManifest
+from hy3_algotrace.dataset_models import FrozenSelectionManifest
+from hy3_algotrace.formal_lifecycle import freeze_pre_run_intent, verify_pre_run_intent
 from hy3_algotrace.hy3_client import endpoint_identity
 from hy3_algotrace.intent import (
     IntentIdentity,
@@ -198,13 +201,69 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Hy3 AlgoTrace Lab: personal activity project, not an official "
         "Tencent release. Freeze a formal execution intent (config.runtime + manifest)."
     )
-    parser.add_argument("--template", type=Path, required=True)
+    parser.add_argument("--stage", choices=("legacy", "pre-run"), default="legacy")
+    parser.add_argument("--template", type=Path)
+    parser.add_argument("--selection", type=Path)
+    parser.add_argument("--bundles", type=Path)
+    parser.add_argument("--pending-corpus", type=Path)
+    parser.add_argument("--data-root", type=Path)
+    parser.add_argument("--seed", type=int, default=20260911)
+    parser.add_argument("--bootstrap-replicates", type=int, default=10000)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--slug", required=True)
     parser.add_argument("--timeout-seconds", type=float, required=True)
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     args = parser.parse_args(argv)
+    if args.stage == "pre-run":
+        try:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.tag):
+                raise IntentFreezeError("tag must be a safe identifier")
+            if any(
+                value is None
+                for value in (args.selection, args.bundles, args.pending_corpus, args.data_root)
+            ):
+                raise IntentFreezeError(
+                    "pre-run requires selection, bundles, pending-corpus and data-root"
+                )
+            runtime = _runtime_identity(args.timeout_seconds)
+            pre_run = freeze_pre_run_intent(
+                selection=FrozenSelectionManifest.model_validate_json(args.selection.read_bytes()),
+                bundle_manifest=ProjectBundleManifest.model_validate_json(
+                    args.bundles.read_bytes()
+                ),
+                pending_corpus=CorpusManifest.model_validate_json(args.pending_corpus.read_bytes()),
+                data_root=args.data_root,
+                repo_root=args.repo_root,
+                recorded_at=datetime.now(UTC),
+                slug=args.slug,
+                judge_image_digest=runtime["judge_image_digest"],
+                timeout_seconds=args.timeout_seconds,
+                seed=args.seed,
+                bootstrap_replicates=args.bootstrap_replicates,
+            )
+            verify_pre_run_intent(pre_run, repo_root=args.repo_root)
+            args.out_dir.mkdir(parents=True, exist_ok=True)
+            output = args.out_dir / f"pre-run-intent-{args.tag}.json"
+            _write_once(output, canonical_json_bytes(pre_run.model_dump(mode="json")))
+        except (OSError, ValueError, RuntimeError) as error:
+            print(f"intent freeze failed: {error}", file=sys.stderr)
+            return 2
+        print(
+            json.dumps(
+                {
+                    "stage": "A",
+                    "benchmark_id": pre_run.benchmark_id,
+                    "intent_hash": pre_run.intent_hash,
+                    "path": str(output),
+                    "materialized_samples": 105,
+                    "reserved_natural_samples": 60,
+                }
+            )
+        )
+        return 0
+    if args.template is None:
+        parser.error("legacy freeze requires --template")
     try:
         config, manifest, config_sha256 = freeze(
             template=args.template,

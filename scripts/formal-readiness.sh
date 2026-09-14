@@ -5,6 +5,8 @@ set -eu
 printf '%s\n' 'Hy3 AlgoTrace Lab is a personal activity project and not an official Tencent release.' >&2
 
 for required_file in \
+    "${HY3_FORMAL_PRE_RUN_INTENT:-}" \
+    "${HY3_FORMAL_MATERIALIZED_FREEZE:-}" \
     "${HY3_FORMAL_SELECTION:-}" \
     "${HY3_FORMAL_ACQUISITION:-}" \
     "${HY3_FORMAL_ACQUISITION_VALIDATION:-}" \
@@ -49,7 +51,9 @@ case "${HY3_FORMAL_TEST_FORMAT:-}" in json|jsonl|parquet|riegeli) ;; *)
     exit 3
 esac
 
-python -m hy3_algotrace.formal_qualification \
+env -u PYTHONPATH python -m hy3_algotrace.formal_qualification \
+    --pre-run-intent "$HY3_FORMAL_PRE_RUN_INTENT" \
+    --materialized-freeze "$HY3_FORMAL_MATERIALIZED_FREEZE" \
     --selection "$HY3_FORMAL_SELECTION" \
     --acquisition "$HY3_FORMAL_ACQUISITION" \
     --acquisition-validation "$HY3_FORMAL_ACQUISITION_VALIDATION" \

@@ -1,0 +1,29 @@
+{
+  "as_of": "2026-09-14",
+  "delayed_blind_rereview": {
+    "completed": 0,
+    "required_fraction": 0.2
+  },
+  "exact_localization_accuracy": {
+    "denominator": 0,
+    "not_evaluable": true,
+    "numerator": null,
+    "value": null
+  },
+  "flagged_false_positive_rate": {
+    "denominator": 0,
+    "not_evaluable": true,
+    "numerator": null,
+    "value": null
+  },
+  "human_audit_records": 0,
+  "reason": "No human-confirmed outcome labels or delayed blind re-review records exist.",
+  "schema_version": "1.0",
+  "status": "not_evaluable",
+  "within_one_step_localization_accuracy": {
+    "denominator": 0,
+    "not_evaluable": true,
+    "numerator": null,
+    "value": null
+  }
+}

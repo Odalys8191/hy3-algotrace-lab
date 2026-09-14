@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,13 +10,18 @@ from test_artifacts_catalog import bundle
 from test_benchmark import config as benchmark_config
 
 from hy3_algotrace import live_benchmark
-from hy3_algotrace.artifacts import ArtifactStore
+from hy3_algotrace.artifacts import ArtifactExistsError, ArtifactStore
 from hy3_algotrace.benchmark import ArtifactAttemptLedger, BenchmarkRunner, RemoteAttemptBudget
 from hy3_algotrace.benchmark_cli import main as cli_main
-from hy3_algotrace.benchmark_models import BenchmarkSampleSpec, SampleKind
-from hy3_algotrace.catalog import ProblemCatalog
-from hy3_algotrace.contracts import JudgeEvidence, JudgeStatus
-from hy3_algotrace.hy3_client import Hy3Config
+from hy3_algotrace.benchmark_models import BenchmarkParameter, BenchmarkSampleSpec, SampleKind
+from hy3_algotrace.catalog import ProblemCatalog, problem_content_hash
+from hy3_algotrace.contracts import JudgeEvidence, JudgeStatus, Topic
+from hy3_algotrace.hy3_client import (
+    Hy3AttemptContext,
+    Hy3Config,
+    RmbCostGuard,
+    TokenQuotaGuard,
+)
 from hy3_algotrace.prompts import (
     ADVERSARIAL_REVIEW_PROMPT_VERSION,
     ARBITER_PROMPT_VERSION,
@@ -24,19 +30,22 @@ from hy3_algotrace.prompts import (
 )
 
 
-def setup_live(tmp_path: Path, *, budget: int = 6):  # type: ignore[no-untyped-def]
+def setup_live(
+    tmp_path: Path,
+    *,
+    budget: int = 6,
+    sample_ids: tuple[str, ...] = ("natural-1", "natural-2"),
+):  # type: ignore[no-untyped-def]
     problem_bundle = bundle()
     catalog = ProblemCatalog([problem_bundle])
     inputs = live_benchmark.LiveInputs(
-        samples=tuple(
-            live_benchmark.LiveSampleInput(sample_id=sid) for sid in ("natural-1", "natural-2")
-        )
+        samples=tuple(live_benchmark.LiveSampleInput(sample_id=sid) for sid in sample_ids)
     )
     record = problem_bundle.record
     cfg = benchmark_config(
-        sample_ids=("natural-1", "natural-2"),
-        generation_ids=("natural-1", "natural-2"),
-        audit_ids=("natural-1", "natural-2"),
+        sample_ids=sample_ids,
+        generation_ids=sample_ids,
+        audit_ids=sample_ids,
         sample_specs=tuple(
             BenchmarkSampleSpec(
                 sample_id=sid,
@@ -45,7 +54,7 @@ def setup_live(tmp_path: Path, *, budget: int = 6):  # type: ignore[no-untyped-d
                 topic=record.topic,
                 rating_band=record.rating_band,
             )
-            for sid in ("natural-1", "natural-2")
+            for sid in sample_ids
         ),
         budget=budget,
     ).model_copy(
@@ -62,8 +71,12 @@ def setup_live(tmp_path: Path, *, budget: int = 6):  # type: ignore[no-untyped-d
     return problem_bundle, catalog, inputs, cfg, store
 
 
-def test_real_client_makes_two_uncached_generations_and_counts_all_requests(tmp_path: Path) -> None:
-    b, catalog, inputs, cfg, store = setup_live(tmp_path)
+def test_one_natural_sample_has_three_static_operations_and_attempts(tmp_path: Path) -> None:
+    b, catalog, inputs, cfg, store = setup_live(
+        tmp_path,
+        budget=3,
+        sample_ids=("natural-1",),
+    )
     requests = []
 
     def handle(request: httpx.Request) -> httpx.Response:
@@ -114,12 +127,17 @@ def test_real_client_makes_two_uncached_generations_and_counts_all_requests(tmp_
         transport=httpx.MockTransport(handle),
     )
     ledger = ArtifactAttemptLedger(store, benchmark_id=cfg.benchmark_id)
-    budget = RemoteAttemptBudget(limit=6, event_sink=ledger.record, benchmark_id=cfg.benchmark_id)
+    budget = RemoteAttemptBudget(limit=3, event_sink=ledger.record, benchmark_id=cfg.benchmark_id)
     report = BenchmarkRunner(config=cfg, artifacts=store, budget=budget, ledger=ledger).run(execute)
-    assert report.complete and report.remote_attempts_used == 6
+    assert report.complete and report.remote_attempts_used == 3
     assert report.formal_eligible is False
-    assert len(requests) == 6
-    assert [e.sample_id for e in ledger.events] == ["natural-1"] * 3 + ["natural-2"] * 3
+    assert len(requests) == 3
+    assert [event.operation for event in ledger.events] == [
+        GENERATOR_PROMPT_VERSION,
+        LOGIC_REVIEW_PROMPT_VERSION,
+        ADVERSARIAL_REVIEW_PROMPT_VERSION,
+    ]
+    assert [event.sample_id for event in ledger.events] == ["natural-1"] * 3
     for sid in cfg.ordered_sample_ids:
         evidence = store.read_json(
             Path("benchmarks") / cfg.benchmark_id / "live-evidence" / sid / "result.json"
@@ -127,6 +145,356 @@ def test_real_client_makes_two_uncached_generations_and_counts_all_requests(tmp_
         assert evidence["judge"]["verdict"] == JudgeStatus.AC.value
         assert evidence["trace"]["problem_id"] == b.record.problem_id
         assert evidence["formal_eligibility"] is False
+
+
+def test_logic_repair_then_adversarial_repair_failure_persists_only_safe_diagnostics(
+    tmp_path: Path,
+) -> None:
+    b, catalog, inputs, cfg, store = setup_live(
+        tmp_path,
+        budget=5,
+        sample_ids=("natural-1",),
+    )
+    private_marker = "provider-private-payload"
+    requests: list[dict[str, object]] = []
+
+    def verdict(reviewer_id: str) -> dict[str, object]:
+        return {
+            "schema_version": "1.2",
+            "reviewer_id": reviewer_id,
+            "trace_id": b.gold_trace.trace_id,
+            "material_error": False,
+            "explanation": "No material error found.",
+            "per_step_reviews": [
+                {
+                    "schema_version": "1.2",
+                    "step_id": step.step_id,
+                    "status": "correct",
+                    "material": False,
+                    "taxonomy": None,
+                    "evidence": "Checked.",
+                    "confidence": 1.0,
+                }
+                for step in b.gold_trace.steps
+            ],
+            "error_taxonomy": None,
+            "first_error_step_id": None,
+            "confidence": 1.0,
+        }
+
+    logic_calls = 0
+    adversarial_calls = 0
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        nonlocal logic_calls, adversarial_calls
+        payload = json.loads(request.content)
+        requests.append(payload)
+        user = json.loads(payload["messages"][1]["content"])
+        if payload["response_format"]["json_schema"]["name"] == "SolutionTrace":
+            result = b.gold_trace.model_dump(mode="json")
+        elif user["reviewer_id"] == "logic-reviewer":
+            logic_calls += 1
+            result = verdict("adversarial-reviewer" if logic_calls == 1 else "logic-reviewer")
+        else:
+            adversarial_calls += 1
+            result = verdict("logic-reviewer" if adversarial_calls == 1 else user["reviewer_id"])
+            if adversarial_calls == 2:
+                result["per_step_reviews"] = result["per_step_reviews"] * 2
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {"content": json.dumps(result)},
+                        "finish_reason": "length" if adversarial_calls == 2 else "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 100,
+                    "total_tokens": 200,
+                    "provider_debug": private_marker,
+                },
+                "provider_debug": private_marker,
+            },
+        )
+
+    class Judge:
+        def judge(self, problem, cpp_source, output_comparison=None):  # type: ignore[no-untyped-def]
+            return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
+
+    guard = RmbCostGuard(limit_rmb="15", max_output_tokens=1_000)
+    execute = live_benchmark.LiveExecutor(
+        config=cfg.model_copy(
+            update={
+                "model_parameters": (
+                    BenchmarkParameter(name="max_tokens", value=1_000),
+                    BenchmarkParameter(name="reasoning_effort", value="high"),
+                )
+            }
+        ),
+        catalog=catalog,
+        inputs=inputs,
+        artifacts=store,
+        hy3_config=Hy3Config(base_url=cfg.endpoint_identity, model=cfg.model, api_key="unit-only"),
+        judge=Judge(),
+        image_reference="judge@" + cfg.judge_image_digest,
+        transport=httpx.MockTransport(handle),
+        cost_guard=guard,
+    )
+    contexts = []
+
+    def observe(context):  # type: ignore[no-untyped-def]
+        contexts.append(context)
+        return len(contexts)
+
+    with pytest.raises(live_benchmark.LiveExecutionError, match="review"):
+        execute("natural-1", observe)
+
+    assert len(requests) == 5
+    assert [context.phase for context in contexts] == [
+        "request",
+        "request",
+        "schema_repair",
+        "request",
+        "schema_repair",
+    ]
+    attempt_root = (
+        Path("benchmarks") / cfg.benchmark_id / "live-evidence" / "natural-1" / "attempts"
+    )
+    reservations = [
+        store.read_json(attempt_root / f"{sequence:06d}" / "reservation.json")
+        for sequence in range(1, 6)
+    ]
+    settlements = [
+        store.read_json(attempt_root / f"{sequence:06d}" / "settlement.json")
+        for sequence in range(1, 6)
+    ]
+    assert set(reservations[0]) == {
+        "schema_version",
+        "kind",
+        "formal_eligibility",
+        "sample_id",
+        "attempt_sequence",
+        "operation",
+        "phase",
+        "retry_number",
+        "reviewer",
+        "reservation_upper_bound_rmb",
+        "charged_upper_bound_rmb",
+        "remaining_upper_bound_rmb",
+        "reservation_upper_bound_tokens",
+        "charged_upper_bound_tokens",
+        "remaining_upper_bound_tokens",
+    }
+    assert set(settlements[0]) == {
+        "schema_version",
+        "kind",
+        "formal_eligibility",
+        "sample_id",
+        "attempt_sequence",
+        "category",
+        "http_status",
+        "finish_reason",
+        "usage",
+        "usage_status",
+        "charged_attempt_upper_bound_rmb",
+        "charged_upper_bound_rmb",
+        "remaining_upper_bound_rmb",
+        "charged_attempt_upper_bound_tokens",
+        "charged_upper_bound_tokens",
+        "remaining_upper_bound_tokens",
+        "validation_issues",
+    }
+    assert [settlement["category"] for settlement in settlements] == [
+        "accepted",
+        "validation_error",
+        "accepted",
+        "validation_error",
+        "validation_error",
+    ]
+    assert settlements[-1]["finish_reason"] == "length"
+    assert settlements[-1]["validation_issues"] == [
+        {"path": "per_step_reviews", "code": "step_coverage_mismatch"}
+    ]
+    failure = store.read_json(
+        Path("benchmarks") / cfg.benchmark_id / "live-evidence" / "natural-1" / "failure.json"
+    )
+    assert failure == {
+        "schema_version": "1.2",
+        "kind": "nonformal_live_failure",
+        "sample_id": "natural-1",
+        "phase": "review",
+        "formal_eligibility": False,
+        "error_category": "validation_error",
+        "reviewer": "adversarial-reviewer",
+        "validation_issues": [{"path": "per_step_reviews", "code": "step_coverage_mismatch"}],
+        "http_status": 200,
+        "finish_reason": "length",
+    }
+    serialized = json.dumps({"reservations": reservations, "settlements": settlements, **failure})
+    assert private_marker not in serialized
+    assert b.record.hidden_tests[0].input_data not in serialized
+
+    with pytest.raises(ArtifactExistsError):
+        execute("natural-1", lambda context: 1)
+    assert len(requests) == 5
+
+
+def test_capped_nonformal_live_run_freezes_output_limit_and_rmb_guard(tmp_path: Path) -> None:
+    b, catalog, inputs, cfg, store = setup_live(tmp_path)
+    capped = cfg.model_copy(
+        update={
+            "model_parameters": (
+                BenchmarkParameter(name="max_tokens", value=12_000),
+                BenchmarkParameter(name="reasoning_effort", value="high"),
+            )
+        }
+    )
+    requests: list[dict[str, object]] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        requests.append(payload)
+        user = json.loads(payload["messages"][1]["content"])
+        if payload["response_format"]["json_schema"]["name"] == "SolutionTrace":
+            result = b.gold_trace.model_copy(update={"trace_id": user.get("trace_id", "generated")})
+            content = result.model_dump_json()
+        else:
+            content = json.dumps(
+                {
+                    "schema_version": "1.2",
+                    "reviewer_id": user["reviewer_id"],
+                    "trace_id": user["trace"]["trace_id"],
+                    "material_error": False,
+                    "explanation": "No material error found.",
+                    "per_step_reviews": [
+                        {
+                            "schema_version": "1.2",
+                            "step_id": step["step_id"],
+                            "status": "correct",
+                            "material": False,
+                            "taxonomy": None,
+                            "evidence": "Checked.",
+                            "confidence": 1.0,
+                        }
+                        for step in user["trace"]["steps"]
+                    ],
+                    "error_taxonomy": None,
+                    "first_error_step_id": None,
+                    "confidence": 1.0,
+                }
+            )
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"content": content}}],
+                "usage": {"prompt_tokens": 100, "completion_tokens": 100},
+            },
+        )
+
+    class Judge:
+        def judge(self, problem, cpp_source, output_comparison=None):  # type: ignore[no-untyped-def]
+            return JudgeEvidence(compile_status=JudgeStatus.AC, verdict=JudgeStatus.AC)
+
+    guard = RmbCostGuard(limit_rmb="15", max_output_tokens=12_000)
+    token_guard = TokenQuotaGuard(limit_tokens=5_000_000, max_output_tokens=12_000)
+    execute = live_benchmark.LiveExecutor(
+        config=capped,
+        catalog=catalog,
+        inputs=inputs,
+        artifacts=store,
+        hy3_config=Hy3Config(base_url=cfg.endpoint_identity, model=cfg.model, api_key="unit-only"),
+        judge=Judge(),
+        image_reference="judge@" + cfg.judge_image_digest,
+        transport=httpx.MockTransport(handle),
+        cost_guard=guard,
+        token_guard=token_guard,
+    )
+    execute("natural-1", lambda context: None)
+
+    assert len(requests) == 3
+    assert all(request["max_tokens"] == 12_000 for request in requests)
+    assert guard.charged_upper_bound_rmb == pytest.approx(0.0015)
+    assert token_guard.charged_upper_bound_tokens == 600
+    attempt = (
+        Path("benchmarks")
+        / capped.benchmark_id
+        / "live-evidence"
+        / "natural-1"
+        / "attempts"
+        / "000001"
+    )
+    reservation = store.read_json(attempt / "reservation.json")
+    settlement = store.read_json(attempt / "settlement.json")
+    assert reservation["reservation_upper_bound_tokens"] > 12_000
+    assert reservation["charged_upper_bound_tokens"] > 12_000
+    assert reservation["remaining_upper_bound_tokens"] < 5_000_000
+    assert settlement["charged_attempt_upper_bound_tokens"] == 200
+    assert settlement["charged_upper_bound_tokens"] == 200
+    assert settlement["remaining_upper_bound_tokens"] == 4_999_800
+
+
+def test_token_quota_exhaustion_is_a_partial_budget_stop_before_network(tmp_path: Path) -> None:
+    _, catalog, inputs, cfg, store = setup_live(tmp_path, sample_ids=("natural-1",))
+    capped = cfg.model_copy(
+        update={
+            "model_parameters": (
+                BenchmarkParameter(name="max_tokens", value=12_000),
+                BenchmarkParameter(name="reasoning_effort", value="high"),
+            )
+        }
+    )
+    requests: list[httpx.Request] = []
+    execute = live_benchmark.LiveExecutor(
+        config=capped,
+        catalog=catalog,
+        inputs=inputs,
+        artifacts=store,
+        hy3_config=Hy3Config(base_url=cfg.endpoint_identity, model=cfg.model, api_key="unit-only"),
+        judge=object(),
+        image_reference="judge@" + cfg.judge_image_digest,
+        transport=httpx.MockTransport(lambda request: requests.append(request)),
+        cost_guard=RmbCostGuard(limit_rmb="15", max_output_tokens=12_000),
+        token_guard=TokenQuotaGuard(limit_tokens=1, max_output_tokens=12_000),
+    )
+
+    from hy3_algotrace.benchmark import BudgetExceededError
+
+    with pytest.raises(BudgetExceededError, match="token quota"):
+        execute("natural-1", lambda context: 1)
+
+    assert requests == []
+    assert not (
+        store.root
+        / "benchmarks"
+        / capped.benchmark_id
+        / "live-evidence"
+        / "natural-1"
+        / "failure.json"
+    ).exists()
+
+
+def test_nonformal_catalog_preserves_reviewed_topic_when_cf_tags_are_ambiguous(
+    tmp_path: Path,
+) -> None:
+    source = bundle()
+    ambiguous = source.record.model_copy(
+        update={"cf_tags": ("graphs", "greedy"), "topic": Topic.GRAPH}
+    )
+    ambiguous = ambiguous.model_copy(update={"content_hash": problem_content_hash(ambiguous)})
+    root = tmp_path / "catalog"
+    directory = root / ambiguous.problem_id
+    directory.mkdir(parents=True)
+    (directory / "problem.json").write_text(ambiguous.model_dump_json())
+    (directory / "oracle.json").write_text(source.oracle.model_dump_json())
+    (directory / "gold_trace.json").write_text(source.gold_trace.model_dump_json())
+    (directory / "reference.cpp").write_text(source.reference_cpp)
+
+    catalog = live_benchmark.NonformalProblemCatalog.from_directory(root)
+
+    assert catalog.get_bundle(ambiguous.problem_id).record == ambiguous
+    assert catalog.list_problems()[0].topic.value == "graph"
 
 
 @pytest.mark.parametrize(
@@ -232,6 +600,7 @@ def test_infrastructure_failure_stops_before_review_and_preserves_safe_marker(
         Path("benchmarks") / cfg.benchmark_id / "live-evidence" / "natural-1" / "failure.json"
     )
     assert failure["phase"] == "judge"
+    assert failure["error_category"] == "infrastructure_evidence_error"
     assert "PRIVATE_RUNTIME_DIAGNOSTIC" not in json.dumps(failure)
 
 
@@ -282,6 +651,137 @@ def test_cli_assembles_adapter_without_python_executor_injection(
     )
     assert result == 0 and len(called) == 1
     assert json.loads(capsys.readouterr().out)["formal_eligible"] is False
+
+
+def test_cli_authorized_continuation_carries_attempts_and_builds_both_guards(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    from hy3_algotrace import benchmark_cli, nonformal_continuation
+    from hy3_algotrace.benchmark_models import MetricObservation
+
+    b, _, _, cfg, store = setup_live(tmp_path, sample_ids=("natural-1",))
+    cfg = cfg.model_copy(
+        update={
+            "model_parameters": (
+                BenchmarkParameter(name="max_tokens", value=12_000),
+                BenchmarkParameter(name="reasoning_effort", value="high"),
+            )
+        }
+    )
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(cfg.model_dump_json())
+    package = tmp_path / "package"
+    predecessor = tmp_path / "predecessor"
+    package.mkdir()
+    predecessor.mkdir()
+    source_identity = object()
+    verified = SimpleNamespace(
+        consumed_attempts=4,
+        free_token_limit=5_000_000,
+        additional_spend_limit_rmb="15",
+    )
+    monkeypatch.setattr(benchmark_cli, "current_code_identity", lambda path: source_identity)
+    monkeypatch.setattr(
+        nonformal_continuation,
+        "verify_authorized_successor_package",
+        lambda **kwargs: verified,
+    )
+    called = []
+
+    def build(**kwargs):  # type: ignore[no-untyped-def]
+        called.append(kwargs)
+        assert kwargs["cost_guard"].limit_rmb == 15
+        assert kwargs["token_guard"].limit_tokens == 5_000_000
+
+        def execute(sid, observer):  # type: ignore[no-untyped-def]
+            observer(
+                Hy3AttemptContext(
+                    operation=GENERATOR_PROMPT_VERSION,
+                    phase="request",
+                    retry_number=1,
+                )
+            )
+            return MetricObservation(
+                sample_id=sid,
+                problem_id=b.record.problem_id,
+                sample_kind=SampleKind.NATURAL,
+                topic=b.record.topic,
+                rating_band=b.record.rating_band,
+                predicted_final_correct=True,
+                predicted_process_valid=True,
+                needs_human_review=False,
+                primary_review_agreement=True,
+                arbitration_used=False,
+            )
+
+        return execute
+
+    monkeypatch.setattr(live_benchmark, "build_live_executor", build)
+    result = cli_main(
+        [
+            "run",
+            "--config",
+            str(cfg_path),
+            "--artifact-root",
+            str(store.root),
+            "--catalog-root",
+            str(tmp_path / "catalog"),
+            "--live-inputs",
+            str(tmp_path / "inputs.json"),
+            "--continuation-package",
+            str(package),
+            "--predecessor-artifact-root",
+            str(predecessor),
+        ]
+    )
+
+    assert result == 0 and len(called) == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["remote_attempts_used"] == 5
+    ledger = Path("benchmarks") / cfg.benchmark_id / "ledger"
+    assert not (store.root / ledger / "000001.json").exists()
+    assert (store.root / ledger / "000005.json").is_file()
+
+
+@pytest.mark.parametrize(
+    "option",
+    ["--continuation-package", "--predecessor-artifact-root"],
+)
+def test_cli_rejects_unpaired_continuation_inputs_before_live_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    option: str,
+) -> None:
+    _, _, _, cfg, store = setup_live(tmp_path, sample_ids=("natural-1",))
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(cfg.model_dump_json())
+    monkeypatch.setattr(
+        live_benchmark,
+        "build_live_executor",
+        lambda **kwargs: pytest.fail("unpaired continuation reached live build"),
+    )
+
+    result = cli_main(
+        [
+            "run",
+            "--config",
+            str(cfg_path),
+            "--artifact-root",
+            str(store.root),
+            "--catalog-root",
+            str(tmp_path / "catalog"),
+            "--live-inputs",
+            str(tmp_path / "inputs.json"),
+            option,
+            str(tmp_path / "only-one"),
+        ]
+    )
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().out)["status"] == "preflight_failed"
 
 
 def test_cli_live_failure_finalizes_ledger_and_returns_nonzero(
@@ -367,7 +867,7 @@ def test_static_validation_does_not_print_private_validation_errors(
     def invalid_catalog(path):  # type: ignore[no-untyped-def]
         raise ValueError("PRIVATE_ORACLE_SENTINEL")
 
-    monkeypatch.setattr(ProblemCatalog, "from_directory", invalid_catalog)
+    monkeypatch.setattr(live_benchmark.NonformalProblemCatalog, "from_directory", invalid_catalog)
     result = cli_main(
         [
             "validate-live-inputs",
@@ -435,8 +935,15 @@ def test_live_config_failure_is_safe_before_adapter_or_network(
         pytest.fail("invalid config reached the live adapter")
 
     monkeypatch.setattr(live_benchmark, "build_live_executor", unexpected_build)
-    args = [command, "--config", str(config_path), "--catalog-root", str(tmp_path),
-            "--live-inputs", str(tmp_path / "inputs.json")]
+    args = [
+        command,
+        "--config",
+        str(config_path),
+        "--catalog-root",
+        str(tmp_path),
+        "--live-inputs",
+        str(tmp_path / "inputs.json"),
+    ]
     if command == "run":
         args.extend(["--artifact-root", str(tmp_path / "artifacts")])
     result = cli_main(args)
@@ -481,10 +988,19 @@ def test_live_artifact_failure_is_safe_and_preserves_existing_bytes(
         return execute
 
     monkeypatch.setattr(live_benchmark, "build_live_executor", build)
-    result = cli_main([
-        "run", "--config", str(config_path), "--artifact-root", str(artifact_root),
-        "--catalog-root", str(tmp_path), "--live-inputs", str(tmp_path / "inputs.json"),
-    ])
+    result = cli_main(
+        [
+            "run",
+            "--config",
+            str(config_path),
+            "--artifact-root",
+            str(artifact_root),
+            "--catalog-root",
+            str(tmp_path),
+            "--live-inputs",
+            str(tmp_path / "inputs.json"),
+        ]
+    )
     captured = capsys.readouterr()
     assert result == 2
     assert "PRIVATE_" not in captured.out + captured.err

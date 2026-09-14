@@ -67,6 +67,10 @@ services:
       - python
       - -m
       - hy3_algotrace.formal_qualification
+      - --pre-run-intent
+      - /formal-inputs/pre-run-intent.json
+      - --materialized-freeze
+      - /formal-inputs/materialized-freeze.json
       - --selection
       - /formal-inputs/selection.json
       - --acquisition

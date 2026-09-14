@@ -2,6 +2,16 @@
 
 Hy3 AlgoTrace Lab is a personal activity project and not an official Tencent release.
 
+## Persistent project status (explicit user requirement)
+
+- Read `../../TODO.md` (the repository checkout's canonical TODO) at the start of every turn and
+  update its current objective.
+- Before every final response, actually update that same TODO with progress, verification evidence,
+  blockers, the next-round prompt, and model/reasoning recommendations; append a dated round entry.
+  This applies to question-only turns too: record no code change or no tests rerun when applicable.
+- Keep one canonical TODO and preserve its history. Reconcile older handover claims against current
+  files and evidence; do not promote fixtures, receipts, or informal smoke results to formal completion.
+
 ## Non-negotiable rules
 
 - Use Python 3.12 and generate/judge C++17 only.

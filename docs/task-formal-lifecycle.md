@@ -48,7 +48,7 @@ self-contained: pasting it into a fresh session must be enough to start.
 
 ```text
 You are working in the git worktree
-/Users/odalys/Documents/hy4oi/.worktrees/integrate-task6-8 on branch
+$HY3_PROJECT_ROOT on branch
 codex/integrate-task6-8. Read AGENTS.md, docs/task-live-smoke.md,
 docs/LIVE_SMOKE_2026-09-08.md and docs/DATA_PREFLIGHT_REVIEW_2026-09-07.md
 before writing anything.
