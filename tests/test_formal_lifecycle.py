@@ -89,7 +89,7 @@ def test_a_freezes_actual_105_plus_reserved_60_without_placeholder_traces(tmp_pa
     assert len(intent.planned_samples) == 165
     assert len(intent.natural_sample_ids) == 60
     assert intent.pending_corpus_hash == corpus.content_hash
-    assert intent.code_identity.worktree_clean is False
+    assert intent.code_identity == lifecycle.current_code_identity(ROOT)
     assert '"trace":' not in intent.model_dump_json()
     assert intent.selection_manifest_hash == selection.content_hash
     lifecycle.verify_pre_run_intent(intent, repo_root=ROOT)
